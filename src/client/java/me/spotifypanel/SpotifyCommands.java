@@ -16,7 +16,7 @@ public final class SpotifyCommands {
                             Config c = SpotifyPanelMod.config;
                             c.visible = !c.visible;
                             c.save();
-                            SpotifyPanelMod.say(c.visible ? "Панель показана." : "Панель скрыта.");
+                            SpotifyPanelMod.say(c.visible ? "Панель показана. Открой чат (T) — появится курсор, кликай по панели." : "Панель скрыта.");
                             return 1;
                         })
                         .then(ClientCommandManager.literal("setup")
