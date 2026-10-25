@@ -14,6 +14,9 @@ public final class Config {
     public String clientId = "";
     public String refreshToken = "";
     public boolean visible = true;
+    public boolean fixed = false;
+    /** Угол справа от направления взгляда (градусы) в режиме Follow. */
+    public double angle = 60.0;
 
     private static Path file() {
         return FabricLoader.getInstance().getConfigDir().resolve("spotifypanel.json");
@@ -34,6 +37,7 @@ public final class Config {
     private Config fix() {
         if (clientId == null) clientId = "";
         if (refreshToken == null) refreshToken = "";
+        if (angle < 0 || angle > 120) angle = 60.0;
         return this;
     }
 

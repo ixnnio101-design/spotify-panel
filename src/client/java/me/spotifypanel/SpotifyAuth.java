@@ -35,7 +35,7 @@ public final class SpotifyAuth {
     private static final String SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative";
 
     private final Config config;
-    private final HttpClient http = HttpClient.newHttpClient();
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(8)).build();
     private final SecureRandom random = new SecureRandom();
 
     private volatile String accessToken;
@@ -97,7 +97,7 @@ public final class SpotifyAuth {
 
     private JsonObject tokenRequest(Map<String, String> form) throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder(URI.create("https://accounts.spotify.com/api/token"))
-                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Content-Type", "application/x-www-form-urlencoded").timeout(java.time.Duration.ofSeconds(8))
                 .POST(HttpRequest.BodyPublishers.ofString(encode(form)))
                 .build();
         HttpResponse<String> r = http.send(req, HttpResponse.BodyHandlers.ofString());

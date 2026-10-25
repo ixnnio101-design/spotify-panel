@@ -17,10 +17,12 @@ public class SpotifyPanelMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         config = Config.load();
+        PanelState.init();
         auth = new SpotifyAuth(config);
         spotify = new SpotifyClient(auth);
         spotify.start();
 
+        PanelInput.register();
         SpotifyCommands.register();
         HudElementRegistry.attachElementBefore(VanillaHudElements.CHAT, Identifier.of(ID, "panel"), PanelRenderer::render);
     }
