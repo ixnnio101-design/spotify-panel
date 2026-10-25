@@ -1,0 +1,27 @@
+{
+	"schemaVersion": 1,
+	"id": "spotify-panel",
+	"version": "${version}",
+	"name": "Spotify Panel",
+	"description": "Панель Spotify в стиле приложения, парящая рядом с игроком. Управление мышью и командами.",
+	"authors": [
+		"Me!"
+	],
+	"license": "CC0-1.0",
+	"icon": "assets/spotify-panel/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"me.spotifypanel.SpotifyPanel"
+		],
+		"client": [
+			"me.spotifypanel.client.SpotifyPanelClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.20.1",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}
