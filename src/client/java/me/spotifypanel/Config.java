@@ -13,10 +13,19 @@ public final class Config {
 
     public String clientId = "";
     public String refreshToken = "";
+    public String scope = "";
     public boolean visible = true;
-    public boolean fixed = false;
-    /** Угол справа от направления взгляда (градусы) в режиме Follow. */
-    public double angle = 60.0;
+
+    // положение панели
+    public double angle = 60;     // градусов вправо от направления взгляда
+    public double distance = 1.5; // блоков от игрока
+    public double width = 1.4;    // ширина панели в блоках
+    public double tilt = 20;      // доворот панели (даёт перспективу/объём)
+
+    // клавиши (коды GLFW): H, J, K
+    public int keyToggle = 72;
+    public int keyLock = 74;
+    public int keyCursor = 75;
 
     private static Path file() {
         return FabricLoader.getInstance().getConfigDir().resolve("spotifypanel.json");
@@ -37,7 +46,7 @@ public final class Config {
     private Config fix() {
         if (clientId == null) clientId = "";
         if (refreshToken == null) refreshToken = "";
-        if (angle < 0 || angle > 120) angle = 60.0;
+        if (scope == null) scope = "";
         return this;
     }
 

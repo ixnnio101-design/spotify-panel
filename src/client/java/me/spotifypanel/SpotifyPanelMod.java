@@ -3,6 +3,7 @@ package me.spotifypanel;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+import net.fabricmc.fabric.api.event.client.player.ClientPreAttackCallback;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
@@ -17,14 +18,15 @@ public class SpotifyPanelMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         config = Config.load();
-        PanelState.init();
         auth = new SpotifyAuth(config);
         spotify = new SpotifyClient(auth);
         spotify.start();
 
-        PanelInput.register();
         SpotifyCommands.register();
         HudElementRegistry.attachElementBefore(VanillaHudElements.CHAT, Identifier.of(ID, "panel"), PanelRenderer::render);
+
+        // клик прицелом по панели не должен ломать блоки / бить мобов
+        ClientPreAttackCallback.EVENT.register((client, player, clickCount) -> PanelRenderer.aimHover);
     }
 
     /** Сообщение игроку в чат (безопасно вызывать из любого потока). */

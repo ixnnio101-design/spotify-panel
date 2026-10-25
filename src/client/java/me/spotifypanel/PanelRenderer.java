@@ -2,12 +2,16 @@ package me.spotifypanel;
 
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.font.TextRenderer;
+import net.minecraft.client.gl.RenderPipelines;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix3x2f;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.HashMap;
@@ -15,572 +19,700 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Отрисовка панели и обработка её элементов (кнопки, ползунки, списки).
- * Положение в мире считает PanelSpace, клавиши — PanelInput, сеть — SpotifyClient.
+ * Голографическая панель Spotify в мире: стоит рядом с игроком, повёрнута к нему, имеет перспективу.
+ * Рисуется полосами (каждая полоса — своё аффинное преобразование), поэтому выглядит объёмной.
+ * Управление: курсор (чат или режим курсора) либо прицел.
  */
 public final class PanelRenderer {
-    private static final int W = 340, H = 204;
-    private static final double WORLD_W = 2.0; // ширина панели в блоках
+    // ---------------------------------------------------------------- размеры
+    private static final int W = 400, H = 240;
 
-    private static final int BASE = 0xF20A0A0A;
-    private static final int EDGE = 0xFF2C2C2C;
-    private static final int CARD = 0xFF161616;
-    private static final int ROW_HOVER = 0xFF262626;
+    // слайдеры (используются и для рисования, и для перетаскивания)
+    private static final int PB_X = 190, PB_W = 120, PB_Y = 226;
+    private static final int VOL_X = 356, VOL_W = 36, VOL_Y = 210;
+
+    // ---------------------------------------------------------------- цвета
+    private static final int BG = 0xD0060B10;
+    private static final int PANEL = 0xC80F1820;
+    private static final int ROW_HOVER = 0xD01E2E3A;
+    private static final int ROW_SEL = 0xD02A3C4A;
     private static final int GREEN = 0xFF1ED760;
     private static final int WHITE = 0xFFFFFFFF;
-    private static final int GRAY = 0xFFB3B3B3;
-    private static final int DIM = 0xFF727272;
-    private static final int OFF = 0xFF4A4A4A;
-    private static final int BAR_BG = 0xFF4D4D4D;
-    private static final int RED = 0xFFFF6B6B;
-    private static final int BLACK = 0xFF000000;
+    private static final int GRAY = 0xFFB7C2CC;
+    private static final int DIM = 0xFF73828E;
+    private static final int BAR_BG = 0xFF3A4652;
+    private static final int CYAN = 0xFF5CE1E6;
 
-    private static final PanelSpace space = new PanelSpace();
+    private static final String[] HEX = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"};
 
-    // кадр
+    // ---------------------------------------------------------------- состояние
+    public static volatile boolean aimHover;
+
+    private static boolean smInit;
+    private static double smYaw;
     private static long lastNs;
-    private static double dt = 0.016;
-    private static float alpha = 1f;
+    private static double anim;          // 0 = скрыта, 1 = показана
+    private static double cursorBlend;   // 0..1: панель подъезжает ближе при управлении курсором
+
+    private static boolean frozen, hasLast;
+    private static double frozenX, frozenY, frozenZ, lastX, lastY, lastZ;
+
+    private static boolean pKt, pKl, pKc;
+
+    private static String selected = "";
+    private static int sideScroll, trackScroll;
+    private static boolean prevDown, down, clicked, inputOn;
+    private static double lmx, lmy;
+    private static int dragId;
+    private static double dragFrac;
+    private static long lastVolSend;
+
+    // камера / плоскость панели (на кадр)
+    private static double camX, camY, camZ, fX, fY, fZ, rX, rZ, uX, uY, uZ, focal, sw2, sh2;
+    private static double pcx, pcy, pcz, nX, nZ, pRX, pRZ, kS;
+
     private static TextRenderer tr;
     private static DrawContext g;
     private static SpotifyClient sp;
-
-    // ввод
-    private static boolean interactive, prevDown, downNow, pressedEdge, releasedEdge, cancelRelease;
-    private static double lmx, lmy;
-    private static String pressId, releasedPress, dragId, releasedDragId;
-    private static double dragFrac;
-    private static final Map<String, Float> hoverAnim = new HashMap<>();
-    private static long lastVolSend;
-
-    // интерфейс
-    private static int view; // 0 - плейлисты, 1 - треки
-    private static String selected = "";
-    private static int listScroll, trackScroll;
-    private static String lastUri = "";
-    private static long changeAt;
+    private static SpotifyClient.Snapshot snap;
+    private static final Map<String, String> fitCache = new HashMap<>();
 
     private PanelRenderer() {}
 
-    // =================================================================== кадр
+    // ================================================================ публичные действия
+
+    public static void setVisible(boolean v) {
+        Config c = SpotifyPanelMod.config;
+        c.visible = v;
+        c.save();
+    }
+
+    public static void toggleFrozen() {
+        if (!frozen) {
+            if (!hasLast) {
+                SpotifyPanelMod.say("Панель ещё не показана.");
+                return;
+            }
+            frozen = true;
+            frozenX = lastX;
+            frozenY = lastY;
+            frozenZ = lastZ;
+            SpotifyPanelMod.say("Панель закреплена в мире и всегда повёрнута к тебе.");
+        } else {
+            frozen = false;
+            SpotifyPanelMod.say("Панель снова следует за тобой.");
+        }
+    }
+
+    public static void toggleCursor() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (!SpotifyPanelMod.config.visible) setVisible(true);
+        mc.execute(() -> {
+            if (mc.currentScreen instanceof CursorScreen) {
+                mc.setScreen(null);
+            } else if (mc.currentScreen == null) {
+                mc.setScreen(new CursorScreen());
+            }
+        });
+    }
+
+    // ================================================================ кадр
 
     public static void render(DrawContext ctx, RenderTickCounter tick) {
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientPlayerEntity player = mc.player;
         if (player == null || mc.world == null) return;
+        Config cfg = SpotifyPanelMod.config;
 
         long nowNs = System.nanoTime();
-        dt = lastNs == 0 ? 0.016 : Math.min(0.1, (nowNs - lastNs) / 1e9);
+        double dt = lastNs == 0 ? 0.016 : Math.min(0.1, (nowNs - lastNs) / 1e9);
         lastNs = nowNs;
 
-        PanelInput.update(mc);
+        boolean mouseMode = mc.currentScreen instanceof ChatScreen || mc.currentScreen instanceof CursorScreen;
+        boolean crosshair = mc.currentScreen == null;
+        handleKeys(mc, cfg);
 
-        // анимация появления / исчезновения (~280 мс)
-        PanelState.vis = approach(PanelState.vis, PanelState.visible ? 1f : 0f, (float) (dt / 0.28));
-        if (PanelState.vis <= 0.002f) {
+        // анимация появления / исчезновения
+        double target = cfg.visible ? 1.0 : 0.0;
+        if (anim < target) anim = Math.min(target, anim + dt / 0.9);
+        else if (anim > target) anim = Math.max(target, anim - dt / 0.9);
+        cursorBlend = Math.max(0, Math.min(1, cursorBlend + (mouseMode ? 1 : -1) * dt / 0.35));
+        if (anim <= 0.001) {
+            aimHover = false;
             prevDown = false;
             return;
         }
-        float e = ease(PanelState.vis);
 
-        // --- положение в мире (yaw без pitch) и проекция на экран
         float pt = tick.getTickProgress(false);
-        Vec3d cam = player.getCameraPosVec(pt);
-        double yaw = player.getYaw(pt), pitch = player.getPitch(pt);
-        double ang = SpotifyPanelMod.config.angle;
-        if (PanelState.interacting && !PanelState.fixed) ang = Math.min(ang, 28.0); // «подплывает» в зону видимости
-        space.update(dt, cam, yaw, PanelState.fixed, ang);
-        Vec3d p = space.world();
-
         int sw = ctx.getScaledWindowWidth(), sh = ctx.getScaledWindowHeight();
-        double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch);
+        Vec3d cam = player.getCameraPosVec(pt);
+        Vec3d pos = player.getLerpedPos(pt);
+        double yawDeg = player.getYaw(pt), pitchDeg = player.getPitch(pt);
+        double yr = Math.toRadians(yawDeg), pr = Math.toRadians(pitchDeg);
         double sinY = Math.sin(yr), cosY = Math.cos(yr), sinP = Math.sin(pr), cosP = Math.cos(pr);
-        double vx = p.x - cam.x, vy = p.y - cam.y, vz = p.z - cam.z;
-        double fx = -sinY * cosP, fy = -sinP, fz = cosY * cosP;
-        double rx = -cosY, rz = -sinY;
-        double ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
-        double zc = vx * fx + vy * fy + vz * fz;
-        double dist = Math.sqrt(vx * vx + vy * vy + vz * vz);
-        if (zc < 0.3 || dist > 24) { // панель за спиной или слишком далеко
-            prevDown = false;
-            return;
-        }
-        double xc = vx * rx + vz * rz;
-        double yc = vx * ux + vy * uy + vz * uz;
-        double fov = Math.toRadians(mc.options.getFov().getValue());
-        double focal = (sh / 2.0) / Math.tan(fov / 2.0);
-        double scx = sw / 2.0 + xc / zc * focal;
-        double scy = sh / 2.0 - yc / zc * focal;
-        // размер зависит от расстояния до панели, а не от направления камеры: стабилен при повороте
-        double s = Math.max(0.4, Math.min(1.6, focal / dist * WORLD_W / W * (0.9 + 0.1 * e)));
-        double ox = scx - W * s / 2.0;
-        double oy = scy - H * s / 2.0 + (1 - e) * 14 * s;
-        if (ox > sw || oy > sh || ox + W * s < 0 || oy + H * s < 0) {
-            prevDown = false;
-            return;
-        }
 
-        // --- мышь: курсор свободен только в режиме взаимодействия (экран SpotifyScreen)
-        interactive = PanelState.interacting && mc.currentScreen instanceof SpotifyScreen && PanelState.vis > 0.95f;
-        downNow = false;
-        double mxs = 0, mys = 0;
-        if (interactive) {
-            long handle = mc.getWindow().getHandle();
-            downNow = GLFW.glfwGetMouseButton(handle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
-            mxs = mc.mouse.getX() * sw / mc.getWindow().getWidth();
-            mys = mc.mouse.getY() * sh / mc.getWindow().getHeight();
+        camX = cam.x; camY = cam.y; camZ = cam.z;
+        fX = -sinY * cosP; fY = -sinP; fZ = cosY * cosP;
+        rX = -cosY; rZ = -sinY;
+        uX = -rZ * fY; uY = rZ * fX - rX * fZ; uZ = rX * fY;
+        double fov = Math.toRadians(mc.options.getFov().getValue());
+        focal = (sh / 2.0) / Math.tan(fov / 2.0);
+        sw2 = sw / 2.0;
+        sh2 = sh / 2.0;
+
+        // сглаженный курс: панель привязана только к горизонтальной оси (повороту), не к наклону головы
+        double dyaw = wrapDeg(yawDeg - smYaw);
+        smYaw = smInit ? smYaw + dyaw * (1 - Math.exp(-dt * 10)) : yawDeg;
+        smInit = true;
+
+        double ac; // направление от игрока к панели, dir(a) = (-sin a, cos a)
+        if (frozen) {
+            pcx = frozenX; pcy = frozenY; pcz = frozenZ;
+            ac = Math.atan2(-(pcx - pos.x), pcz - pos.z);
+        } else {
+            double ang = cfg.angle * (1 - 0.6 * cursorBlend);
+            ac = Math.toRadians(smYaw + ang);
+            pcx = pos.x - Math.sin(ac) * cfg.distance;
+            pcz = pos.z + Math.cos(ac) * cfg.distance;
+            pcy = cam.y - 0.2;
         }
-        pressedEdge = interactive && downNow && !prevDown;
-        releasedEdge = prevDown && !downNow;
-        cancelRelease = releasedEdge && !interactive; // режим выключили/панель скрыли посреди перетаскивания
-        releasedPress = releasedEdge ? pressId : null;
-        releasedDragId = releasedEdge ? dragId : null;
-        if (releasedEdge) {
-            pressId = null;
-            dragId = null;
+        lastX = pcx; lastY = pcy; lastZ = pcz;
+        hasLast = true;
+
+        double beta = ac + Math.PI + Math.toRadians(cfg.tilt);
+        nX = -Math.sin(beta); nZ = Math.cos(beta);
+        pRX = Math.cos(beta); pRZ = Math.sin(beta);
+        kS = cfg.width / W;
+
+        double side = (camX - pcx) * nX + (camZ - pcz) * nZ;
+        boolean facing = side > 0.02;
+
+        // ---- ввод: мышь (курсор) или прицел
+        long handle = mc.getWindow().getHandle();
+        boolean leftDown = GLFW.glfwGetMouseButton(handle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+        inputOn = facing && (mouseMode || crosshair) && anim >= 0.99;
+        double dx, dy, dz;
+        if (mouseMode) {
+            double mxs = mc.mouse.getX() * sw / mc.getWindow().getWidth();
+            double mys = mc.mouse.getY() * sh / mc.getWindow().getHeight();
+            double a = (mxs - sw2) / focal, b = (sh2 - mys) / focal;
+            dx = fX + a * rX + b * uX;
+            dy = fY + b * uY;
+            dz = fZ + a * rZ + b * uZ;
+        } else {
+            dx = fX; dy = fY; dz = fZ;
         }
-        prevDown = downNow;
-        lmx = (mxs - ox) / s;
-        lmy = (mys - oy) / s;
+        boolean valid = false;
+        lmx = -9999;
+        lmy = -9999;
+        double denom = dx * nX + dz * nZ;
+        if (Math.abs(denom) > 1e-6) {
+            double t = ((pcx - camX) * nX + (pcz - camZ) * nZ) / denom;
+            if (t > 0) {
+                double hx = camX + dx * t - pcx, hy = camY + dy * t - pcy, hz = camZ + dz * t - pcz;
+                lmx = (hx * pRX + hz * pRZ) / kS + W / 2.0;
+                lmy = H / 2.0 - hy / kS;
+                valid = true;
+            }
+        }
+        boolean inside = valid && lmx >= 0 && lmx < W && lmy >= 0 && lmy < H;
+        aimHover = crosshair && inputOn && inside;
+        down = inputOn && valid && leftDown;
+        clicked = down && !prevDown;
+        prevDown = down;
 
         g = ctx;
         tr = mc.textRenderer;
         sp = SpotifyPanelMod.spotify;
-        alpha = e;
+        snap = sp.snapshot();
+        if (fitCache.size() > 700) fitCache.clear();
 
-        var m = ctx.getMatrices();
-        m.pushMatrix();
-        m.translate((float) ox, (float) oy);
-        m.scale((float) s, (float) s);
-        try {
-            double shadowDx = -(scx - sw / 2.0) / (sw / 2.0) * 7.0; // тень смещается от центра экрана: ощущение глубины
-            drawPanel((int) Math.round(shadowDx));
-        } finally {
-            m.popMatrix();
+        if (inputOn) handleSliders();
+        else if (dragId != 0) finishDrag();
+
+        if (!facing) return;
+        drawStrips(sw, sh);
+    }
+
+    // ================================================================ клавиши
+
+    private static boolean key(long handle, int code) {
+        return GLFW.glfwGetKey(handle, code) == GLFW.GLFW_PRESS;
+    }
+
+    private static void handleKeys(MinecraftClient mc, Config cfg) {
+        long h = mc.getWindow().getHandle();
+        boolean kt = key(h, cfg.keyToggle), kl = key(h, cfg.keyLock), kc = key(h, cfg.keyCursor);
+        boolean noScreen = mc.currentScreen == null;
+        boolean inCursor = mc.currentScreen instanceof CursorScreen;
+        if (kt && !pKt && noScreen) setVisible(!cfg.visible);
+        if (kl && !pKl && noScreen) toggleFrozen();
+        if (kc && !pKc && (noScreen || inCursor)) toggleCursor();
+        pKt = kt;
+        pKl = kl;
+        pKc = kc;
+    }
+
+    // ================================================================ перетаскивание слайдеров
+
+    private static void handleSliders() {
+        long dur = snap.track() != null ? snap.track().durationMs() : 0;
+        if (clicked) {
+            if (dur > 0 && hit(PB_X - 4, PB_Y - 6, PB_W + 8, 16)) {
+                dragId = 1;
+                clicked = false;
+            } else if (hit(VOL_X - 4, VOL_Y - 6, VOL_W + 8, 16)) {
+                dragId = 2;
+                clicked = false;
+            }
+        }
+        if (dragId == 0) return;
+        int bx = dragId == 1 ? PB_X : VOL_X;
+        int bw = dragId == 1 ? PB_W : VOL_W;
+        if (down) {
+            dragFrac = Math.max(0, Math.min(1, (lmx - bx) / bw));
+            if (dragId == 2) {
+                long now = System.currentTimeMillis();
+                if (now - lastVolSend > 120) {
+                    lastVolSend = now;
+                    sp.volume((int) Math.round(dragFrac * 100), SpotifyPanelMod::say);
+                }
+            }
+        } else {
+            finishDrag();
         }
     }
 
-    private static void drawPanel(int shadowDx) {
-        // мягкая тень (несколько слоёв)
-        for (int i = 0; i < 4; i++) {
-            int grow = 8 - i * 2;
-            rrect(shadowDx - grow / 2 + 2, 6 - grow / 2 + 4, W + grow - 4, H + grow - 4, 12, 0x14000000);
+    private static void finishDrag() {
+        if (dragId == 1) {
+            long dur = snap.track() != null ? snap.track().durationMs() : 0;
+            sp.seek((long) (dragFrac * dur), SpotifyPanelMod::say);
+        } else if (dragId == 2) {
+            sp.volume((int) Math.round(dragFrac * 100), SpotifyPanelMod::say);
         }
-        rrect(-1, -1, W + 2, H + 2, 10, PanelState.interacting ? 0xFF2F6F46 : EDGE);
-        rrect(0, 0, W, H, 9, BASE);
-        // верхний блик
-        rrect(6, 1, W - 12, 1, 0, 0x22FFFFFF);
+        dragId = 0;
+    }
 
-        SpotifyClient.Snapshot s = sp.snapshot();
-        if (s.status() == SpotifyClient.Status.NO_CLIENT_ID || s.status() == SpotifyClient.Status.LOGGED_OUT) {
-            tri(150, 60, 150, 96, 182, 78, GREEN);
-            boolean noId = s.status() == SpotifyClient.Status.NO_CLIENT_ID;
-            textS(noId ? "Spotify не настроен" : "Spotify не подключён", 90, 112, WHITE, 170, 1.4f, true);
-            textS(noId ? "/spotify setup <client_id>" : "/spotify login", 90, 132, noId ? GRAY : GREEN, 170, 1.1f, false);
+    // ================================================================ 3D: рисование полосами
+
+    private static double[] world(double u, double v) {
+        double a = (u - W / 2.0) * kS;
+        return new double[]{pcx + pRX * a, pcy + (H / 2.0 - v) * kS, pcz + pRZ * a};
+    }
+
+    private static double[] proj(double[] p) {
+        double vx = p[0] - camX, vy = p[1] - camY, vz = p[2] - camZ;
+        double zc = vx * fX + vy * fY + vz * fZ;
+        if (zc < 0.12) return null;
+        double xc = vx * rX + vz * rZ;
+        double yc = vx * uX + vy * uY + vz * uZ;
+        return new double[]{sw2 + xc / zc * focal, sh2 - yc / zc * focal, zc};
+    }
+
+    private static void drawStrips(int sw, int sh) {
+        double[] tl = proj(world(0, 0)), tr2 = proj(world(W, 0));
+        double projW = (tl != null && tr2 != null) ? Math.abs(tr2[0] - tl[0]) : 400;
+        int n = anim < 0.999 ? 26 : (int) Math.max(1, Math.min(14, Math.round(projW / 36.0)));
+
+        double[][] top = new double[n + 1][];
+        double[][] bot = new double[n + 1][];
+        int[] bx = new int[n + 1];
+        boolean any = false;
+        for (int j = 0; j <= n; j++) {
+            double u = W * (double) j / n;
+            top[j] = proj(world(u, 0));
+            bot[j] = proj(world(u, H));
+            if (top[j] != null && bot[j] != null) {
+                bx[j] = (int) Math.round((top[j][0] + bot[j][0]) / 2.0);
+                any = true;
+            }
+        }
+        if (!any) return;
+
+        double eased = anim * anim * (3 - 2 * anim);
+        double uBound = eased * (W + 16);
+
+        for (int j = 0; j < n; j++) {
+            double[] t0 = top[j], b0 = bot[j], t1 = top[j + 1], b1 = bot[j + 1];
+            if (t0 == null || b0 == null || t1 == null || b1 == null) continue;
+            double u0 = W * (double) j / n, u1 = W * (double) (j + 1) / n;
+            double xl = (t0[0] + b0[0]) / 2.0, xr = (t1[0] + b1[0]) / 2.0;
+            if (xr - xl < 0.01) continue;
+
+            double sx = (xr - xl) / (u1 - u0);
+            double sy = (((b0[1] - t0[1]) + (b1[1] - t1[1])) / 2.0) / H;
+            double ml = (t0[1] + b0[1]) / 2.0, mr = (t1[1] + b1[1]) / 2.0;
+            double kk = (mr - ml) / (u1 - u0);
+
+            int s0 = Math.max(0, bx[j]), s1 = Math.min(sw, bx[j + 1]);
+            int y0 = (int) Math.max(0, Math.floor(Math.min(t0[1], t1[1])) - 3);
+            int y1 = (int) Math.min(sh, Math.ceil(Math.max(b0[1], b1[1])) + 3);
+            if (s1 <= s0 || y1 <= y0) continue;
+
+            Matrix3x2f mat = new Matrix3x2f(
+                    (float) sx, (float) kk,
+                    0f, (float) sy,
+                    (float) (xl - sx * u0), (float) (ml - kk * u0 - sy * H / 2.0));
+
+            g.enableScissor(s0, y0, s1, y1);
+            var m = g.getMatrices();
+            m.pushMatrix();
+            m.mul(mat);
+            try {
+                boolean ui = anim >= 0.999 || (u0 + u1) / 2.0 < uBound;
+                if (ui) {
+                    drawUI();
+                } else {
+                    drawCode(u0, u1);
+                }
+                if (anim < 0.999) fill(uBound - 1, 0, uBound + 1, H, 0xFFB8FFD8);
+            } finally {
+                m.popMatrix();
+                g.disableScissor();
+            }
+        }
+    }
+
+    /** «Код»: падающие шестнадцатеричные символы на месте ещё не проявившейся (или уже распавшейся) части. */
+    private static void drawCode(double u0, double u1) {
+        fill(0, 0, W, H, 0x40021008);
+        double a = Math.sin(Math.PI * anim);
+        long t = System.currentTimeMillis();
+        int rows = H / 9;
+        int c0 = (int) Math.max(0, Math.floor(u0 / 8.0)), c1 = (int) Math.min(W / 8, Math.ceil(u1 / 8.0));
+        for (int c = c0; c < c1; c++) {
+            int seed = c * 7919 + 13;
+            double speed = 6 + (seed % 5);
+            int head = (int) (((t / 1000.0) * speed + (seed % rows)) % rows);
+            for (int k = 0; k < 9; k++) {
+                int row = ((head - k) % rows + rows) % rows;
+                int alpha = (int) (255 * a * (1 - k / 9.0));
+                if (alpha < 12) continue;
+                int idx = (c * 31 + row * 17 + (int) (t / 90)) & 15;
+                int color = k == 0 ? (((int) (255 * a) << 24) | 0xD8FFE8) : ((alpha << 24) | 0x1ED760);
+                g.drawText(tr, HEX[idx], c * 8, row * 9, color, false);
+            }
+        }
+    }
+
+    // ================================================================ интерфейс
+
+    private static void drawUI() {
+        fill(0, 0, W, H, BG);
+
+        if (snap.status() == SpotifyClient.Status.NO_CLIENT_ID || snap.status() == SpotifyClient.Status.LOGGED_OUT) {
+            fill(6, 6, W - 6, H - 6, PANEL);
+            tri(180, 90, 180, 130, 214, 110, GREEN);
+            if (snap.status() == SpotifyClient.Status.NO_CLIENT_ID) {
+                text("Spotify не настроен", 140, 142, WHITE, 240);
+                text("/spotify setup <client_id>", 140, 156, GRAY, 240);
+            } else {
+                text("Spotify не подключён", 140, 142, WHITE, 240);
+                text("/spotify login", 140, 156, GREEN, 240);
+            }
+        } else {
+            drawSidebar();
+            drawMain();
+            drawBottom();
+        }
+        drawFrame();
+        if (aimHover) {
+            circle((int) lmx, (int) lmy, 3, WHITE);
+            circle((int) lmx, (int) lmy, 2, GREEN);
+        }
+    }
+
+    private static void drawFrame() {
+        int edge = 0x805CE1E6;
+        fill(0, 0, W, 1, edge);
+        fill(0, H - 1, W, H, edge);
+        fill(0, 0, 1, H, edge);
+        fill(W - 1, 0, W, H, edge);
+        int L = 16;
+        fill(0, 0, L, 2, CYAN);
+        fill(0, 0, 2, L, CYAN);
+        fill(W - L, 0, W, 2, CYAN);
+        fill(W - 2, 0, W, L, CYAN);
+        fill(0, H - 2, L, H, CYAN);
+        fill(0, H - L, 2, H, CYAN);
+        fill(W - L, H - 2, W, H, CYAN);
+        fill(W - 2, H - L, W, H, CYAN);
+        // голографический «блик»
+        int sy = (int) ((System.currentTimeMillis() / 16) % (H + 80)) - 40;
+        int y0 = Math.max(0, sy), y1 = Math.min(H, sy + 3);
+        if (y1 > y0) fill(2, y0, W - 2, y1, 0x1CFFFFFF);
+    }
+
+    // ---------------------------------------------------------------- сайдбар
+
+    private static void drawSidebar() {
+        fill(6, 6, 118, 192, PANEL);
+        text("Медиатека", 12, 12, WHITE, 76);
+
+        List<SpotifyClient.Playlist> pls = sp.playlists();
+        int maxScroll = Math.max(0, pls.size() - 8);
+        sideScroll = Math.max(0, Math.min(sideScroll, maxScroll));
+        if (arrow(96, 13, true)) sideScroll = Math.max(0, sideScroll - 1);
+        if (arrow(106, 13, false)) sideScroll = Math.min(maxScroll, sideScroll + 1);
+
+        if (pls.isEmpty()) {
+            String err = sp.playlistsError();
+            wrap(err.isEmpty() ? "Загрузка…" : err, 12, 30, GRAY, 100);
+            return;
+        }
+        for (int i = 0; i < 8; i++) {
+            int idx = sideScroll + i;
+            if (idx >= pls.size()) break;
+            SpotifyClient.Playlist p = pls.get(idx);
+            int y = 26 + i * 20;
+            boolean sel = p.id().equals(selected);
+            boolean hov = hit(8, y, 108, 19);
+            if (sel) fill(8, y, 116, y + 19, ROW_SEL);
+            else if (hov) fill(8, y, 116, y + 19, ROW_HOVER);
+
+            cover(p.coverUrl(), 10, y + 1, 17);
+            text(p.name(), 32, y + 2, sel ? GREEN : WHITE, 82);
+            text(p.total() + " тр.", 32, y + 11, GRAY, 82);
+
+            if (click(8, y, 108, 19)) {
+                selected = p.id();
+                trackScroll = 0;
+                sp.requestItems(p.id(), true);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- центр
+
+    private static void drawMain() {
+        fill(124, 6, 394, 192, PANEL);
+        List<SpotifyClient.Playlist> pls = sp.playlists();
+        if (pls.isEmpty()) {
+            text("Здесь появятся твои плейлисты", 134, 16, GRAY, 250);
             return;
         }
 
-        rrect(8, 8, 160, 188, 7, CARD);
-        rrect(176, 8, 156, 188, 7, CARD);
-        drawNowPlaying(s);
-        drawLibrary(s);
-        drawHint();
-    }
-
-    // ============================================================ левая карточка
-
-    private static void drawNowPlaying(SpotifyClient.Snapshot s) {
-        SpotifyClient.Track t = s.track();
-        boolean has = s.status() == SpotifyClient.Status.ACTIVE && t != null;
-
-        // анимация смены трека
-        String uri = has ? t.uri() : "";
-        if (!uri.equals(lastUri)) {
-            lastUri = uri;
-            changeAt = System.currentTimeMillis();
-        }
-        float ta = ease(Math.min(1f, (System.currentTimeMillis() - changeAt) / 380f));
-        float keep = alpha;
-
-        // обложка
-        rrect(38, 22, 100, 100, 6, 0x44000000);
-        int[] cm = has ? sp.mosaic(t.coverUrl(), 24) : null;
-        alpha = keep * ta;
-        if (cm != null) {
-            drawGrid(cm, 24, 40, 18, 4);
-        } else {
-            rrect(40, 18, 96, 96, 5, 0xFF282828);
-            circle(88, 66, 12, 0xFF3A3A3A);
-            circle(88, 66, 4, 0xFF282828);
-        }
-
-        // название и исполнитель
-        String title, artist;
-        int artistColor = GRAY;
-        if (has) {
-            title = t.title();
-            artist = t.artists();
-        } else if (s.status() == SpotifyClient.Status.ERROR) {
-            title = "Ошибка Spotify";
-            artist = s.error();
-            artistColor = RED;
-        } else {
-            title = "Ничего не играет";
-            artist = "Запусти Spotify на любом устройстве";
-        }
-        float slideX = (1 - ta) * 10;
-        textS(marquee(title, 100), 16 + slideX, 120, WHITE, 144, 1.35f, true);
-        textS(marquee(artist, 130), 16 + slideX, 136, artistColor, 144, 1.05f, false);
-        alpha = keep;
-
-        // --- прогресс (перетаскиваемый)
-        long dur = has ? t.durationMs() : 0;
-        long pos = s.currentProgress();
-        int bx = 20, by = 152, bw = 136, bh = 5;
-        Slider sl = slider("seek", bx, by, bw, bh, has && dur > 0);
-        double frac = dur > 0 ? Math.max(0, Math.min(1, (double) pos / dur)) : 0;
-        if (sl.active) frac = sl.frac;
-        int fw = (int) Math.round(bw * frac);
-        rrect(bx, by, bw, bh, 2, BAR_BG);
-        if (fw > 0) rrect(bx, by, Math.max(fw, 4), bh, 2, sl.hover || sl.active ? GREEN : WHITE);
-        if ((sl.hover || sl.active) && has) circle(bx + fw, by + 2, sl.active ? 5 : 4, WHITE);
-        long shown = sl.active ? (long) (frac * dur) : pos;
-        text(fmt(shown), 20, 162, sl.active ? WHITE : GRAY, 30);
-        String total = fmt(dur);
-        text(total, 156 - tr.getWidth(total), 162, GRAY, 30);
-        if (sl.released && !sl.cancel && dur > 0) {
-            sp.seek((long) (sl.frac * dur), SpotifyPanelMod::say);
-        }
-
-        // --- кнопки
-        int cy = 183;
-        boolean en = has;
-
-        Btn bShuffle = btn("shuffle", 18, cy - 11, 24, 22, en);
-        int c1 = iconColor(bShuffle, en, s.shuffle());
-        int po = bShuffle.pressed ? 1 : 0;
-        line(23, cy - 4 + po, 35, cy + 4 + po, c1);
-        line(23, cy + 4 + po, 35, cy - 4 + po, c1);
-        tri(33, cy - 8 + po, 38, cy - 5 + po, 33, cy - 1 + po, c1);
-        tri(33, cy + 1 + po, 38, cy + 5 + po, 33, cy + 8 + po, c1);
-        if (bShuffle.clicked) sp.shuffle(!s.shuffle(), SpotifyPanelMod::say);
-
-        Btn bPrev = btn("prev", 50, cy - 12, 24, 24, en);
-        int c2 = iconColor(bPrev, en, false);
-        po = bPrev.pressed ? 1 : 0;
-        fill(55, cy - 6 + po, 58, cy + 6 + po, c2);
-        tri(70, cy - 6 + po, 70, cy + 6 + po, 59, cy + po, c2);
-        if (bPrev.clicked) sp.previous(SpotifyPanelMod::say);
-
-        Btn bPlay = btn("play", 74, cy - 15, 30, 30, true);
-        int pr = Math.round(13 + bPlay.h * 1.5f) - (bPlay.pressed ? 2 : 0);
-        circle(89, cy, pr, mix(0xFFDADADA, WHITE, bPlay.h));
-        if (s.playing()) {
-            fill(84, cy - 5, 88, cy + 6, BLACK);
-            fill(91, cy - 5, 95, cy + 6, BLACK);
-        } else {
-            tri(85, cy - 7, 85, cy + 7, 96, cy, BLACK);
-        }
-        if (bPlay.clicked) sp.togglePlay(SpotifyPanelMod::say);
-
-        Btn bNext = btn("next", 104, cy - 12, 24, 24, en);
-        int c3 = iconColor(bNext, en, false);
-        po = bNext.pressed ? 1 : 0;
-        tri(108, cy - 6 + po, 108, cy + 6 + po, 119, cy + po, c3);
-        fill(120, cy - 6 + po, 123, cy + 6 + po, c3);
-        if (bNext.clicked) sp.next(SpotifyPanelMod::say);
-
-        String rep = s.repeat();
-        boolean repOn = !"off".equals(rep);
-        Btn bRep = btn("repeat", 136, cy - 11, 24, 22, en);
-        int c4 = iconColor(bRep, en, repOn);
-        po = bRep.pressed ? 1 : 0;
-        line(141, cy - 5 + po, 155, cy - 5 + po, c4);
-        line(141, cy + 5 + po, 155, cy + 5 + po, c4);
-        line(140, cy - 4 + po, 140, cy + 4 + po, c4);
-        line(156, cy - 4 + po, 156, cy + 4 + po, c4);
-        tri(152, cy - 9 + po, 158, cy - 5 + po, 152, cy - 1 + po, c4);
-        if ("track".equals(rep)) g.drawText(tr, "1", 146, cy - 4 + po, a(c4), false);
-        if (bRep.clicked) {
-            String next = "off".equals(rep) ? "context" : ("context".equals(rep) ? "track" : "off");
-            sp.repeat(next, SpotifyPanelMod::say);
-        }
-    }
-
-    // ============================================================ правая карточка
-
-    private static void drawLibrary(SpotifyClient.Snapshot s) {
-        List<SpotifyClient.Playlist> pls = sp.playlists();
         SpotifyClient.Playlist cur = null;
         for (SpotifyClient.Playlist p : pls) {
-            if (p.id().equals(selected)) {
-                cur = p;
-                break;
-            }
+            if (p.id().equals(selected)) { cur = p; break; }
         }
-        if (view == 1 && cur == null) view = 0;
-
-        // --- шапка
-        if (view == 0) {
-            textS("Плейлисты", 188, 15, WHITE, 110, 1.2f, true);
-        } else {
-            Btn back = btn("back", 180, 10, 22, 20, true);
-            int bc = mix(GRAY, WHITE, back.h);
-            line(193, 14, 187, 20, bc);
-            line(187, 20, 193, 26, bc);
-            if (back.clicked) view = 0;
-            textS(cur.name(), 204, 15, WHITE, 76, 1.1f, true);
-
-            Btn playAll = btn("playall", 288, 11, 20, 20, true);
-            circle(298, 21, Math.round(8 + playAll.h * 1.5f), mix(GREEN, 0xFF3BE477, playAll.h));
-            tri(295, 17, 295, 25, 303, 21, BLACK);
-            if (playAll.clicked) sp.playContext(cur.uri(), "", SpotifyPanelMod::say);
-        }
-        drawPin();
-
-        // --- содержимое
-        int rows = 6;
-        if (view == 0) {
-            if (pls.isEmpty()) {
-                String err = sp.playlistsError();
-                text(err.isEmpty() ? "Загрузка…" : err, 188, 40, GRAY, 124);
-            } else {
-                int max = Math.max(0, pls.size() - rows);
-                listScroll = Math.max(0, Math.min(listScroll, max));
-                drawScroll(max > 0, () -> listScroll = Math.max(0, listScroll - 1),
-                        () -> listScroll = Math.min(max, listScroll + 1));
-                for (int i = 0; i < rows; i++) {
-                    int idx = listScroll + i;
-                    if (idx >= pls.size()) break;
-                    SpotifyClient.Playlist p = pls.get(idx);
-                    int y = 34 + i * 24;
-                    Btn b = btn("pl" + idx, 180, y, 138, 24, true);
-                    if (b.hover) rrect(180, y, 138, 24, 5, ROW_HOVER);
-                    int[] cm = sp.mosaic(p.coverUrl(), 6);
-                    if (cm != null) drawGrid(cm, 6, 184, y + 3, 3);
-                    else rrect(184, y + 3, 18, 18, 3, 0xFF282828);
-                    text(p.name(), 208, y + 4, WHITE, 106);
-                    text(p.total() + " треков", 208, y + 13, GRAY, 106);
-                    if (b.clicked) {
-                        selected = p.id();
-                        view = 1;
-                        trackScroll = 0;
-                        sp.requestItems(p.id(), true);
-                    }
-                }
-            }
-        } else {
-            List<SpotifyClient.Item> its = sp.items(cur.id());
-            if (its == null) {
-                String err = sp.itemError(cur.id());
-                text(err.isEmpty() ? "Загрузка треков…" : err, 188, 40, GRAY, 124);
-                if (err.isEmpty()) sp.requestItems(cur.id(), false);
-            } else if (its.isEmpty()) {
-                text("В плейлисте нет треков", 188, 40, GRAY, 124);
-            } else {
-                int max = Math.max(0, its.size() - rows);
-                trackScroll = Math.max(0, Math.min(trackScroll, max));
-                drawScroll(max > 0, () -> trackScroll = Math.max(0, trackScroll - 1),
-                        () -> trackScroll = Math.min(max, trackScroll + 1));
-                String playingUri = s.track() != null ? s.track().uri() : "";
-                for (int i = 0; i < rows; i++) {
-                    int idx = trackScroll + i;
-                    if (idx >= its.size()) break;
-                    SpotifyClient.Item it = its.get(idx);
-                    int y = 34 + i * 24;
-                    boolean isCur = !playingUri.isEmpty() && playingUri.equals(it.uri());
-                    Btn b = btn("tr" + idx, 180, y, 138, 24, true);
-                    if (b.hover) rrect(180, y, 138, 24, 5, ROW_HOVER);
-                    if (b.hover) tri(186, y + 7, 186, y + 17, 194, y + 12, WHITE);
-                    else text(String.valueOf(idx + 1), 186, y + 8, isCur ? GREEN : DIM, 14);
-                    text(it.title(), 200, y + 4, isCur ? GREEN : WHITE, 82);
-                    text(it.artists(), 200, y + 13, GRAY, 82);
-                    String d = fmt(it.durationMs());
-                    g.drawText(tr, d, 316 - tr.getWidth(d), y + 8, a(DIM), false);
-                    if (b.clicked) sp.playContext(cur.uri(), it.uri(), SpotifyPanelMod::say);
-                }
-            }
+        if (cur == null) {
+            cur = pls.get(0);
+            selected = cur.id();
+            trackScroll = 0;
+            sp.requestItems(cur.id(), false);
         }
 
-        // --- громкость (перетаскиваемая)
-        int vx = 206, vy = 187, vw = 92;
-        boolean hasPlayer = s.status() == SpotifyClient.Status.ACTIVE;
-        Slider vs = slider("vol", vx, vy, vw, 4, hasPlayer);
-        int vol = Math.max(0, Math.min(100, s.volume()));
-        if (vs.active) {
-            vol = (int) Math.round(vs.frac * 100);
-            long now = System.currentTimeMillis();
-            if (now - lastVolSend > 150) { // не чаще ~7 запросов в секунду, итог отправляется при отпускании
-                lastVolSend = now;
-                sp.volume(vol, SpotifyPanelMod::say);
+        // шапка с градиентом из цвета обложки
+        int cc = sp.coverColor(cur.coverUrl());
+        int base = cc != 0 ? mix(0xFF000000, cc, 0.55f) : 0xFF1B3B4A;
+        for (int k = 0; k < 24; k++) {
+            fill(124, 6 + k * 3, 394, 9 + k * 3, mix(base, PANEL, k / 23f));
+        }
+        cover(cur.coverUrl(), 134, 14, 58);
+
+        text("Плейлист", 200, 18, 0xFFE0E8EE, 190);
+        g.drawText(tr, Text.literal(fit(cur.name(), 176)).formatted(Formatting.BOLD), 200, 30, WHITE, false);
+        String info = (cur.owner().isEmpty() ? "" : cur.owner() + " • ") + cur.total() + " треков";
+        text(info, 200, 44, GRAY, 190);
+
+        int pcx2 = 210, pcy2 = 63;
+        boolean ph = hit(pcx2 - 10, pcy2 - 10, 20, 20);
+        circle(pcx2, pcy2, 9, ph ? 0xFF3BE477 : GREEN);
+        tri(pcx2 - 3, pcy2 - 5, pcx2 + 5, pcy2, pcx2 - 3, pcy2 + 5, 0xFF000000);
+        if (click(pcx2 - 10, pcy2 - 10, 20, 20)) {
+            sp.playContext(cur.uri(), "", SpotifyPanelMod::say);
+        }
+
+        // таблица треков
+        text("#", 134, 84, DIM, 14);
+        text("Название", 150, 84, DIM, 110);
+        text("Исполнитель", 272, 84, DIM, 80);
+        fill(130, 95, 388, 96, 0xFF2A3A46);
+
+        List<SpotifyClient.Item> its = sp.items(cur.id());
+        if (its == null) {
+            String err = sp.itemError(cur.id());
+            wrap(err.isEmpty() ? "Загрузка треков…" : err, 136, 108, GRAY, 240);
+            if (err.isEmpty()) sp.requestItems(cur.id(), false);
+            return;
+        }
+        if (its.isEmpty()) {
+            text("В плейлисте нет треков", 136, 108, GRAY, 240);
+            return;
+        }
+
+        int maxScroll = Math.max(0, its.size() - 6);
+        trackScroll = Math.max(0, Math.min(trackScroll, maxScroll));
+        if (arrow(362, 85, true)) trackScroll = Math.max(0, trackScroll - 1);
+        if (arrow(374, 85, false)) trackScroll = Math.min(maxScroll, trackScroll + 1);
+
+        String playingUri = snap.track() != null ? snap.track().uri() : "";
+        for (int r = 0; r < 6; r++) {
+            int idx = trackScroll + r;
+            if (idx >= its.size()) break;
+            SpotifyClient.Item it = its.get(idx);
+            int ry = 98 + r * 14;
+            boolean hov = hit(128, ry, 262, 14);
+            boolean isCur = !playingUri.isEmpty() && playingUri.equals(it.uri());
+            if (hov) fill(128, ry, 390, ry + 14, ROW_HOVER);
+
+            if (hov) tri(134, ry + 3, 134, ry + 11, 141, ry + 7, WHITE);
+            else text(String.valueOf(idx + 1), 134, ry + 3, isCur ? GREEN : GRAY, 14);
+
+            text(it.title(), 150, ry + 3, isCur ? GREEN : WHITE, 116);
+            text(it.artists(), 272, ry + 3, GRAY, 84);
+            String d = fmt(it.durationMs());
+            g.drawText(tr, d, 388 - tr.getWidth(d), ry + 3, GRAY, false);
+
+            if (click(128, ry, 262, 14)) {
+                sp.playContext(cur.uri(), it.uri(), SpotifyPanelMod::say);
             }
         }
-        if (vs.released) {
-            vol = (int) Math.round(vs.frac * 100);
-            sp.volume(vol, SpotifyPanelMod::say);
-        }
-        int vc = !hasPlayer ? OFF : mix(GRAY, WHITE, vs.hover || vs.active ? 1f : 0f);
-        fill(185, 186, 188, 191, vc);
-        tri(188, 186, 194, 182, 194, 195, vc);
-        if (vol == 0) {
-            line(197, 185, 203, 191, vc);
-        }
-        rrect(vx, vy, vw, 4, 2, BAR_BG);
-        int vf = vw * vol / 100;
-        if (vf > 0) rrect(vx, vy, Math.max(vf, 4), 4, 2, vs.hover || vs.active ? GREEN : WHITE);
-        if ((vs.hover || vs.active) && hasPlayer) circle(vx + vf, vy + 2, vs.active ? 5 : 4, WHITE);
-        String vt = vol + "%";
-        g.drawText(tr, vt, 326 - tr.getWidth(vt), 186, a(vs.active ? WHITE : GRAY), false);
     }
 
-    private static void drawScroll(boolean enabled, Runnable up, Runnable down) {
-        Btn bu = btn("sup", 318, 34, 14, 12, enabled);
-        int cu = !enabled ? OFF : mix(DIM, WHITE, bu.h);
-        tri(325, 36, 321, 42, 329, 42, cu);
-        if (bu.clicked) up.run();
-        Btn bd = btn("sdown", 318, 166, 14, 12, enabled);
-        int cd = !enabled ? OFF : mix(DIM, WHITE, bd.h);
-        tri(321, 168, 329, 168, 325, 174, cd);
-        if (bd.clicked) down.run();
-    }
+    // ---------------------------------------------------------------- нижняя панель
 
-    private static void drawPin() {
-        Btn b = btn("pin", 310, 11, 20, 20, true);
-        boolean fixed = PanelState.fixed;
-        int c = fixed ? GREEN : mix(DIM, WHITE, b.h);
-        int po = b.pressed ? 1 : 0;
-        circle(320, 18 + po, 4, c);
-        fill(319, 21 + po, 321, 27 + po, c);
-        if (fixed) rrect(316, 29 + po, 8, 1, 0, c);
-        if (b.clicked) PanelState.toggleFixed();
-    }
+    private static void drawBottom() {
+        fill(6, 197, 394, 198, 0xFF1C2A34);
+        SpotifyClient.Snapshot s = snap;
+        SpotifyClient.Track t = s.track();
 
-    private static void drawHint() {
-        if (PanelState.interacting) {
-            String t = "Esc / " + PanelInput.keyName(PanelInput.interact) + " — выйти из режима управления";
-            g.drawText(tr, t, (W - tr.getWidth(t)) / 2, H + 8, a(GRAY), false);
+        if (s.status() == SpotifyClient.Status.ACTIVE && t != null) {
+            cover(t.coverUrl(), 12, 203, 32);
+            text(t.title(), 50, 205, WHITE, 104);
+            text(t.artists(), 50, 217, GRAY, 104);
+        } else if (s.status() == SpotifyClient.Status.ERROR) {
+            wrap(s.error(), 12, 204, 0xFFFF6B6B, 150);
         } else {
-            String t = "[" + PanelInput.keyName(PanelInput.interact) + "] управление   ["
-                    + PanelInput.keyName(PanelInput.mode) + "] " + (PanelState.fixed ? "фиксация" : "следование")
-                    + "   [" + PanelInput.keyName(PanelInput.hide) + "] скрыть";
-            g.drawText(tr, t, (W - tr.getWidth(t)) / 2, H + 8, a(DIM), false);
+            text("Ничего не играет", 12, 207, GRAY, 150);
+            text("Включи трек в Spotify", 12, 219, DIM, 150);
         }
+
+        int cy = 210;
+
+        // shuffle
+        boolean sh = s.shuffle();
+        boolean hs = hit(207, cy - 7, 14, 14);
+        int cs = sh ? GREEN : (hs ? WHITE : GRAY);
+        for (int i = 0; i < 9; i++) {
+            fill(209 + i, cy - 4 + i, 210 + i, cy - 3 + i, cs);
+            fill(209 + i, cy + 4 - i, 210 + i, cy + 5 - i, cs);
+        }
+        if (click(207, cy - 7, 14, 14)) sp.shuffle(!sh, SpotifyPanelMod::say);
+
+        // previous
+        boolean hp = hit(225, cy - 7, 14, 14);
+        int cp = hp ? WHITE : GRAY;
+        fill(226, cy - 5, 228, cy + 5, cp);
+        tri(237, cy - 5, 237, cy + 5, 228, cy, cp);
+        if (click(225, cy - 7, 14, 14)) sp.previous(SpotifyPanelMod::say);
+
+        // play / pause
+        boolean hpl = hit(240, cy - 10, 20, 20);
+        circle(250, cy, 9, hpl ? WHITE : 0xFFEAEAEA);
+        if (s.playing()) {
+            fill(246, cy - 4, 249, cy + 4, 0xFF000000);
+            fill(252, cy - 4, 255, cy + 4, 0xFF000000);
+        } else {
+            tri(247, cy - 5, 247, cy + 5, 255, cy, 0xFF000000);
+        }
+        if (click(240, cy - 10, 20, 20)) sp.togglePlay(SpotifyPanelMod::say);
+
+        // next
+        boolean hn = hit(261, cy - 7, 14, 14);
+        int cn = hn ? WHITE : GRAY;
+        tri(263, cy - 5, 263, cy + 5, 272, cy, cn);
+        fill(272, cy - 5, 274, cy + 5, cn);
+        if (click(261, cy - 7, 14, 14)) sp.next(SpotifyPanelMod::say);
+
+        // repeat
+        String rep = s.repeat();
+        boolean on = !"off".equals(rep);
+        boolean hr = hit(279, cy - 7, 14, 14);
+        int cr = on ? GREEN : (hr ? WHITE : GRAY);
+        fill(280, cy - 4, 292, cy - 3, cr);
+        fill(280, cy + 3, 292, cy + 4, cr);
+        fill(280, cy - 4, 281, cy + 4, cr);
+        fill(291, cy - 4, 292, cy + 4, cr);
+        if ("track".equals(rep)) fill(284, cy - 1, 288, cy + 1, cr);
+        if (click(279, cy - 7, 14, 14)) {
+            String nextMode = "off".equals(rep) ? "context" : ("context".equals(rep) ? "track" : "off");
+            sp.repeat(nextMode, SpotifyPanelMod::say);
+        }
+
+        // прогресс
+        long dur = t != null ? t.durationMs() : 0;
+        long pos = s.currentProgress();
+        double frac = dragId == 1 ? dragFrac : (dur > 0 ? Math.min(1.0, (double) pos / dur) : 0);
+        boolean hb = hit(PB_X - 4, PB_Y - 6, PB_W + 8, 16) || dragId == 1;
+        fill(PB_X, PB_Y, PB_X + PB_W, PB_Y + 4, BAR_BG);
+        int fw = (int) (PB_W * frac);
+        fill(PB_X, PB_Y, PB_X + fw, PB_Y + 4, hb ? GREEN : WHITE);
+        if (hb) circle(PB_X + fw, PB_Y + 2, 4, WHITE);
+        long shown = dragId == 1 ? (long) (dragFrac * dur) : pos;
+        String lt = fmt(shown);
+        g.drawText(tr, lt, 186 - tr.getWidth(lt), 224, GRAY, false);
+        g.drawText(tr, fmt(dur), 316, 224, GRAY, false);
+
+        // громкость
+        double vfrac = dragId == 2 ? dragFrac : Math.max(0, Math.min(100, s.volume())) / 100.0;
+        boolean hv = hit(VOL_X - 4, VOL_Y - 6, VOL_W + 8, 16) || dragId == 2;
+        fill(336, VOL_Y - 2, 340, VOL_Y + 3, GRAY);
+        tri(340, VOL_Y + 0.5f, 346, VOL_Y - 5, 346, VOL_Y + 6, GRAY);
+        fill(VOL_X, VOL_Y - 2, VOL_X + VOL_W, VOL_Y + 2, BAR_BG);
+        int vw = (int) (VOL_W * vfrac);
+        fill(VOL_X, VOL_Y - 2, VOL_X + vw, VOL_Y + 2, hv ? GREEN : WHITE);
+        if (hv) circle(VOL_X + vw, VOL_Y, 4, WHITE);
     }
 
     // ================================================================ ввод
 
-    private static final class Btn {
-        boolean hover, pressed, clicked;
-        float h;
-    }
-
-    private static final class Slider {
-        boolean hover, active, released, cancel;
-        double frac;
-    }
-
     private static boolean hit(double x, double y, double w, double h) {
-        return interactive && lmx >= x && lmx < x + w && lmy >= y && lmy < y + h;
+        return inputOn && lmx >= x && lmx < x + w && lmy >= y && lmy < y + h;
     }
 
-    /** Кнопка: срабатывает при отпускании над ней (после нажатия на ней же), показывает состояния hover/pressed. */
-    private static Btn btn(String id, double x, double y, double w, double h, boolean enabled) {
-        Btn b = new Btn();
-        b.hover = enabled && hit(x, y, w, h);
-        if (b.hover && pressedEdge) {
-            pressId = id;
-            pressedEdge = false; // нажатие «съедено», соседние элементы не сработают
+    private static boolean click(double x, double y, double w, double h) {
+        if (clicked && hit(x, y, w, h)) {
+            clicked = false;
+            return true;
         }
-        b.pressed = b.hover && id.equals(pressId) && downNow;
-        b.clicked = b.hover && id.equals(releasedPress);
-        b.h = hoverAmt(id, b.hover);
-        return b;
+        return false;
     }
 
-    /** Горизонтальный ползунок: значение меняется при удержании, итог доступен при отпускании. */
-    private static Slider slider(String id, int x, int y, int w, int h, boolean enabled) {
-        Slider s = new Slider();
-        s.hover = enabled && hit(x - 3, y - 7, w + 6, h + 14);
-        if (s.hover && pressedEdge) {
-            dragId = id;
-            pressedEdge = false;
+    private static boolean arrow(int x, int y, boolean up) {
+        boolean hov = hit(x - 3, y - 3, 12, 10);
+        int c = hov ? WHITE : DIM;
+        if (up) tri(x + 3, y, x, y + 5, x + 6, y + 5, c);
+        else tri(x, y, x + 6, y, x + 3, y + 5, c);
+        return click(x - 3, y - 3, 12, 10);
+    }
+
+    // ================================================================ примитивы
+
+    private static void fill(double x1, double y1, double x2, double y2, int color) {
+        g.fill((int) Math.round(x1), (int) Math.round(y1), (int) Math.round(x2), (int) Math.round(y2), color);
+    }
+
+    private static void cover(String url, int x, int y, int size) {
+        Identifier id = sp.coverTexture(url);
+        if (id != null) {
+            g.drawTexture(RenderPipelines.GUI_TEXTURED, id, x, y, 0f, 0f, size, size,
+                    SpotifyClient.RAW, SpotifyClient.RAW, SpotifyClient.RAW, SpotifyClient.RAW);
+        } else {
+            int c = sp.coverColor(url);
+            fill(x, y, x + size, y + size, c != 0 ? c : 0xFF22303A);
         }
-        s.active = id.equals(dragId);
-        if (s.active) {
-            dragFrac = clamp01((lmx - x) / w);
-            s.frac = dragFrac;
-        }
-        if (id.equals(releasedDragId)) {
-            s.released = true;
-            s.cancel = cancelRelease;
-            s.frac = cancelRelease ? dragFrac : clamp01((lmx - x) / w);
-        }
-        return s;
     }
 
-    private static float hoverAmt(String id, boolean hovered) {
-        float v = hoverAnim.getOrDefault(id, 0f);
-        v = approach(v, hovered ? 1f : 0f, (float) (dt / 0.12));
-        hoverAnim.put(id, v);
-        return v;
-    }
-
-    private static int iconColor(Btn b, boolean enabled, boolean green) {
-        if (!enabled) return OFF;
-        if (green) return mix(GREEN, WHITE, b.h * 0.4f);
-        return mix(GRAY, WHITE, b.h);
-    }
-
-    // =============================================================== рисование
-
-    private static int a(int c) {
-        int al = (int) ((c >>> 24) * alpha);
-        return (al << 24) | (c & 0xFFFFFF);
-    }
-
-    private static void fill(int x1, int y1, int x2, int y2, int c) {
-        g.fill(x1, y1, x2, y2, a(c));
-    }
-
-    private static void rrect(int x, int y, int w, int h, int r, int c) {
-        r = Math.max(0, Math.min(r, Math.min(w, h) / 2));
-        for (int i = 0; i < r; i++) {
-            double dy = r - i - 0.5;
-            int inset = r - (int) Math.round(Math.sqrt(r * r - dy * dy));
-            fill(x + inset, y + i, x + w - inset, y + i + 1, c);
-            fill(x + inset, y + h - i - 1, x + w - inset, y + h - i, c);
-        }
-        fill(x, y + r, x + w, y + h - r, c);
-    }
-
-    private static void circle(int cx, int cy, int r, int c) {
+    private static void circle(int cx, int cy, int r, int color) {
         for (int dy = -r; dy <= r; dy++) {
             int half = (int) Math.round(Math.sqrt((double) r * r - (double) dy * dy));
-            fill(cx - half, cy + dy, cx + half, cy + dy + 1, c);
+            g.fill(cx - half, cy + dy, cx + half, cy + dy + 1, color);
         }
     }
 
-    private static void line(int x0, int y0, int x1, int y1, int c) {
-        int steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
-        if (steps == 0) {
-            fill(x0, y0, x0 + 2, y0 + 2, c);
-            return;
-        }
-        for (int i = 0; i <= steps; i++) {
-            int x = x0 + Math.round((float) (x1 - x0) * i / steps);
-            int y = y0 + Math.round((float) (y1 - y0) * i / steps);
-            fill(x, y, x + 2, y + 2, c);
-        }
-    }
-
-    private static void drawGrid(int[] cm, int grid, int x, int y, int cs) {
-        for (int cy = 0; cy < grid; cy++) {
-            for (int cx = 0; cx < grid; cx++) {
-                fill(x + cx * cs, y + cy * cs, x + cx * cs + cs, y + cy * cs + cs, cm[cy * grid + cx]);
-            }
-        }
-    }
-
+    /** Закрашенный треугольник построчной заливкой. */
     private static void tri(float x1, float y1, float x2, float y2, float x3, float y3, int color) {
         int minY = (int) Math.floor(Math.min(y1, Math.min(y2, y3)));
         int maxY = (int) Math.ceil(Math.max(y1, Math.max(y2, y3)));
@@ -594,7 +726,7 @@ public final class PanelRenderer {
             edge(acc, sy, x3, y3, x1, y1);
             if (acc[1] > acc[0]) {
                 int l = Math.round(acc[0]), r = Math.round(acc[1]);
-                if (r > l) fill(l, y, r, y + 1, color);
+                if (r > l) g.fill(l, y, r, y + 1, color);
             }
         }
     }
@@ -607,78 +739,62 @@ public final class PanelRenderer {
         }
     }
 
-    // ================================================================= текст
+    // ================================================================ текст / цвет
 
     private static void text(String s, int x, int y, int color, int maxW) {
-        g.drawText(tr, fit(s, maxW, false), x, y, a(color), false);
+        g.drawText(tr, fit(s, maxW), x, y, color, false);
     }
 
-    /** Текст с масштабом (чтобы название и исполнитель были крупнее основного шрифта). */
-    private static void textS(String s, float x, float y, int color, int maxW, float scale, boolean bold) {
-        var m = g.getMatrices();
-        m.pushMatrix();
-        m.translate(x, y);
-        m.scale(scale, scale);
-        String f = fit(s, (int) (maxW / scale), bold);
-        Text t = bold ? Text.literal(f).formatted(Formatting.BOLD) : Text.literal(f);
-        g.drawText(tr, t, 0, 0, a(color), false);
-        m.popMatrix();
+    /** Многострочный текст с переносом по словам (до 3 строк). */
+    private static void wrap(String s, int x, int y, int color, int maxW) {
+        if (s == null) return;
+        String[] words = s.split(" ");
+        StringBuilder line = new StringBuilder();
+        int row = 0;
+        for (String w : words) {
+            String test = line.length() == 0 ? w : line + " " + w;
+            if (tr.getWidth(test) > maxW && line.length() > 0) {
+                g.drawText(tr, fit(line.toString(), maxW), x, y + row * 10, color, false);
+                row++;
+                if (row >= 3) return;
+                line = new StringBuilder(w);
+            } else {
+                line = new StringBuilder(test);
+            }
+        }
+        if (line.length() > 0) g.drawText(tr, fit(line.toString(), maxW), x, y + row * 10, color, false);
     }
 
-    private static int width(String s, boolean bold) {
-        return bold ? tr.getWidth(Text.literal(s).formatted(Formatting.BOLD)) : tr.getWidth(s);
-    }
-
-    private static String fit(String s, int maxW, boolean bold) {
+    private static String fit(String s, int maxW) {
         if (s == null) return "";
-        if (width(s, bold) <= maxW) return s;
-        int n = s.length();
-        while (n > 0 && width(s.substring(0, n) + "…", bold) > maxW) n--;
-        return s.substring(0, n) + "…";
-    }
-
-    /** Бегущая строка для длинных названий: пауза в начале, прокрутка, пауза в конце. */
-    private static String marquee(String s, int maxW) {
-        if (s == null) return "";
-        if (tr.getWidth(s) <= maxW) return s;
-        int n = s.length();
-        int maxOff = 0;
-        while (maxOff < n && tr.getWidth(s.substring(maxOff)) > maxW) maxOff++;
-        long step = System.currentTimeMillis() / 140;
-        int pause = 10;
-        long period = pause * 2L + maxOff;
-        int pos = (int) (step % period);
-        int off = pos < pause ? 0 : (pos < pause + maxOff ? pos - pause : maxOff);
-        return tr.trimToWidth(s.substring(off), maxW);
+        String key = s + '\u0000' + maxW;
+        String cached = fitCache.get(key);
+        if (cached != null) return cached;
+        String out = s;
+        if (tr.getWidth(s) > maxW) {
+            int ell = tr.getWidth("…");
+            out = tr.trimToWidth(s, Math.max(0, maxW - ell)) + "…";
+        }
+        fitCache.put(key, out);
+        return out;
     }
 
     private static String fmt(long ms) {
-        long sec = Math.max(0, ms) / 1000;
+        long sec = ms / 1000;
         return String.format("%d:%02d", sec / 60, sec % 60);
     }
 
-    // ============================================================ утилиты
-
-    private static float approach(float v, float target, float step) {
-        if (v < target) return Math.min(target, v + step);
-        return Math.max(target, v - step);
-    }
-
-    private static float ease(float t) {
-        t = Math.max(0f, Math.min(1f, t));
-        return t * t * (3 - 2 * t);
-    }
-
-    private static double clamp01(double v) {
-        return Math.max(0, Math.min(1, v));
-    }
-
     private static int mix(int a, int b, float t) {
-        int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
-        int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
-        int r = Math.round(ar + (br - ar) * t);
-        int gg = Math.round(ag + (bg - ag) * t);
-        int bl = Math.round(ab + (bb - ab) * t);
-        return 0xFF000000 | (r << 16) | (gg << 8) | bl;
+        int aa = (a >>> 24), ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+        int ba = (b >>> 24), br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
+        int oa = Math.round(aa + (ba - aa) * t);
+        int or = Math.round(ar + (br - ar) * t);
+        int og = Math.round(ag + (bg - ag) * t);
+        int ob = Math.round(ab + (bb - ab) * t);
+        return (oa << 24) | (or << 16) | (og << 8) | ob;
+    }
+
+    private static double wrapDeg(double a) {
+        return ((a % 360.0) + 540.0) % 360.0 - 180.0;
     }
 }

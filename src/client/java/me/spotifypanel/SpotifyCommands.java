@@ -3,19 +3,50 @@ package me.spotifypanel;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+
+import java.util.function.BiConsumer;
 
 public final class SpotifyCommands {
     private SpotifyCommands() {}
 
+    private static LiteralArgumentBuilder<FabricClientCommandSource> setting(String name, double min, double max,
+                                                                            BiConsumer<Config, Double> apply) {
+        return ClientCommandManager.literal(name)
+                .then(ClientCommandManager.argument("value", DoubleArgumentType.doubleArg(min, max))
+                        .executes(ctx -> {
+                            double v = DoubleArgumentType.getDouble(ctx, "value");
+                            apply.accept(SpotifyPanelMod.config, v);
+                            SpotifyPanelMod.config.save();
+                            SpotifyPanelMod.say("Готово: " + name + " = " + v);
+                            return 1;
+                        }));
+    }
+
     public static void register() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
                 ClientCommandManager.literal("spotify")
+                        // /spotify — показать/скрыть панель (с анимацией)
                         .executes(ctx -> {
-                            PanelState.toggleVisible();
+                            PanelRenderer.setVisible(!SpotifyPanelMod.config.visible);
                             return 1;
                         })
+                        .then(ClientCommandManager.literal("lock").executes(ctx -> {
+                            PanelRenderer.toggleFrozen();
+                            return 1;
+                        }))
+                        .then(ClientCommandManager.literal("cursor").executes(ctx -> {
+                            PanelRenderer.toggleCursor();
+                            return 1;
+                        }))
+                        .then(ClientCommandManager.literal("set")
+                                .then(setting("angle", -170, 170, (c, v) -> c.angle = v))
+                                .then(setting("distance", 0.6, 6, (c, v) -> c.distance = v))
+                                .then(setting("width", 0.4, 4, (c, v) -> c.width = v))
+                                .then(setting("tilt", -60, 60, (c, v) -> c.tilt = v)))
                         .then(ClientCommandManager.literal("setup")
                                 .then(ClientCommandManager.argument("clientId", StringArgumentType.word())
                                         .executes(ctx -> {
@@ -38,20 +69,6 @@ public final class SpotifyCommands {
                             SpotifyPanelMod.say("Вышел из Spotify.");
                             return 1;
                         }))
-                        .then(ClientCommandManager.literal("mode").executes(ctx -> {
-                            PanelState.toggleFixed();
-                            SpotifyPanelMod.say(PanelState.fixed ? "Режим: фиксация в пространстве." : "Режим: следование за игроком.");
-                            return 1;
-                        }))
-                        .then(ClientCommandManager.literal("angle")
-                                .then(ClientCommandManager.argument("degrees", DoubleArgumentType.doubleArg(0, 120))
-                                        .executes(ctx -> {
-                                            Config c = SpotifyPanelMod.config;
-                                            c.angle = DoubleArgumentType.getDouble(ctx, "degrees");
-                                            c.save();
-                                            SpotifyPanelMod.say("Угол справа от взгляда: " + Math.round(c.angle) + "°");
-                                            return 1;
-                                        })))
                         .then(ClientCommandManager.literal("play").executes(ctx -> {
                             SpotifyPanelMod.spotify.play(SpotifyPanelMod::say);
                             return 1;

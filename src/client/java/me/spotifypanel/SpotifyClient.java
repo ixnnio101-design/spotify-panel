@@ -4,7 +4,10 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.texture.NativeImage;
+import net.minecraft.client.texture.NativeImageBackedTexture;
+import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,6 +15,7 @@ import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -26,18 +30,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.IntBinaryOperator;
+import java.util.function.Supplier;
 
-/**
- * Spotify Web API. Весь сетевой код работает в фоновых потоках, игровой поток только читает кэш состояния.
- * Действия игрока сначала применяются к локальному состоянию (интерфейс реагирует сразу),
- * а запросы уходят в фон; повторные запросы одного типа схлопываются (побеждает последний).
- */
+/** Spotify Web API: состояние плеера, плейлисты, треки, обложки и команды управления. */
 public final class SpotifyClient {
     private static final Logger LOG = LoggerFactory.getLogger("spotifypanel");
-    private static final int RAW = 48; // обложка сжимается до 48x48, из неё строятся сетки 6/8/12/16/24
+    public static final int RAW = 96; // сторона текстуры обложки
+
+    private static final int O_PLAY = 1, O_SHUF = 2, O_REP = 4, O_VOL = 8, O_POS = 16;
 
     public enum Status { NO_CLIENT_ID, LOGGED_OUT, IDLE, ACTIVE, ERROR }
 
@@ -62,40 +64,29 @@ public final class SpotifyClient {
             long p = progressMs + (playing ? System.currentTimeMillis() - fetchedAtMs : 0);
             return Math.max(0, Math.min(p, track.durationMs()));
         }
-
-        Snapshot withPlaying(boolean p) {
-            return new Snapshot(status, p, track, currentProgress(), System.currentTimeMillis(), device, volume, shuffle, repeat, error);
-        }
-
-        Snapshot withProgress(long ms) {
-            return new Snapshot(status, playing, track, ms, System.currentTimeMillis(), device, volume, shuffle, repeat, error);
-        }
-
-        Snapshot withVolume(int v) {
-            return new Snapshot(status, playing, track, progressMs, fetchedAtMs, device, v, shuffle, repeat, error);
-        }
-
-        Snapshot withShuffle(boolean b) {
-            return new Snapshot(status, playing, track, progressMs, fetchedAtMs, device, volume, b, repeat, error);
-        }
-
-        Snapshot withRepeat(String r) {
-            return new Snapshot(status, playing, track, progressMs, fetchedAtMs, device, volume, shuffle, r, error);
-        }
     }
 
     private final SpotifyAuth auth;
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(8)).build();
-    private final ScheduledExecutorService exec = Executors.newScheduledThreadPool(4, daemon("spotifypanel"));
-    private final ExecutorService skipExec = Executors.newSingleThreadExecutor(daemon("spotifypanel-skip"));
-    private final AtomicBoolean polling = new AtomicBoolean(false);
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(8))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
+    private final ScheduledExecutorService exec = Executors.newScheduledThreadPool(4, r -> {
+        Thread t = new Thread(r, "spotifypanel");
+        t.setDaemon(true);
+        return t;
+    });
+    // отдельный поток для команд — они не должны стоять в очереди за загрузкой обложек
+    private final ExecutorService ctl = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "spotifypanel-ctl");
+        t.setDaemon(true);
+        return t;
+    });
 
     private volatile Snapshot snapshot = Snapshot.of(Status.LOGGED_OUT);
-    private volatile long overrideUntil = 0; // пока действует, серверное состояние не затирает локальные правки
-
-    // схлопывание повторных запросов одного типа
-    private final Map<String, Runnable> latest = new ConcurrentHashMap<>();
-    private final Set<String> running = ConcurrentHashMap.newKeySet();
+    private volatile long optUntil = 0;
+    private volatile int optMask = 0;
+    private volatile boolean scopeWarned = false;
 
     // плейлисты и треки
     private volatile List<Playlist> playlists = List.of();
@@ -108,24 +99,18 @@ public final class SpotifyClient {
 
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
-    private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
+    private final Map<String, Identifier> textures = new ConcurrentHashMap<>();
     private final Set<String> coverLoading = ConcurrentHashMap.newKeySet();
     private final Set<String> coverFailed = ConcurrentHashMap.newKeySet();
+    private final Set<String> texFailed = ConcurrentHashMap.newKeySet();
+    private volatile boolean coverErrorShown = false;
 
     public SpotifyClient(SpotifyAuth auth) {
         this.auth = auth;
     }
 
-    private static java.util.concurrent.ThreadFactory daemon(String name) {
-        return r -> {
-            Thread t = new Thread(r, name);
-            t.setDaemon(true);
-            return t;
-        };
-    }
-
     public void start() {
-        exec.scheduleWithFixedDelay(this::pollGuarded, 1, 2, TimeUnit.SECONDS);
+        exec.scheduleWithFixedDelay(this::poll, 1, 1500, TimeUnit.MILLISECONDS);
     }
 
     public Snapshot snapshot() { return snapshot; }
@@ -141,15 +126,6 @@ public final class SpotifyClient {
     // ------------------------------------------------------------- HTTP
 
     private HttpResponse<String> send(String method, String path, String jsonBody) throws Exception {
-        HttpResponse<String> r = sendOnce(method, path, jsonBody);
-        if (r.statusCode() == 401) { // токен мог истечь раньше срока: обновляем и повторяем один раз
-            auth.invalidate();
-            r = sendOnce(method, path, jsonBody);
-        }
-        return r;
-    }
-
-    private HttpResponse<String> sendOnce(String method, String path, String jsonBody) throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
                 .header("Authorization", "Bearer " + auth.accessToken())
                 .timeout(Duration.ofSeconds(10));
@@ -165,23 +141,20 @@ public final class SpotifyClient {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
-    // ------------------------------------------------------------ polling
-
-    private void pollGuarded() {
-        if (!polling.compareAndSet(false, true)) return;
+    /** Достаёт текст ошибки из ответа Spotify: {"error":{"status":403,"message":"..."}} */
+    private static String apiError(int sc, String body) {
         try {
-            poll();
-        } finally {
-            polling.set(false);
+            JsonObject o = JsonParser.parseString(body).getAsJsonObject();
+            if (o.has("error") && o.get("error").isJsonObject()) {
+                String m = str(o.getAsJsonObject("error"), "message");
+                if (!m.isEmpty()) return "HTTP " + sc + ": " + m;
+            }
+        } catch (Exception ignored) {
         }
+        return "HTTP " + sc;
     }
 
-    /** Несколько быстрых опросов сразу после действия, чтобы увидеть результат без ожидания 2 секунд. */
-    private void pollsSoon() {
-        exec.schedule(this::pollGuarded, 150, TimeUnit.MILLISECONDS);
-        exec.schedule(this::pollGuarded, 600, TimeUnit.MILLISECONDS);
-        exec.schedule(this::pollGuarded, 1400, TimeUnit.MILLISECONDS);
-    }
+    // ------------------------------------------------------------ polling
 
     private void poll() {
         try {
@@ -192,6 +165,10 @@ public final class SpotifyClient {
             if (!auth.isLoggedIn()) {
                 snapshot = Snapshot.of(Status.LOGGED_OUT);
                 return;
+            }
+            if (!auth.hasScope("playlist-read-private") && !scopeWarned) {
+                scopeWarned = true;
+                SpotifyPanelMod.say("Для плейлистов нужен повторный вход: /spotify login");
             }
 
             long now = System.currentTimeMillis();
@@ -206,11 +183,11 @@ public final class SpotifyClient {
             if (sc == 204) {
                 snapshot = Snapshot.of(Status.IDLE);
             } else if (sc == 401) {
-                snapshot = Snapshot.error("Сессия истекла: /spotify login");
+                auth.invalidate();
             } else if (sc == 429) {
                 snapshot = Snapshot.error("Слишком много запросов (429)");
             } else if (sc != 200) {
-                snapshot = Snapshot.error("HTTP " + sc);
+                snapshot = Snapshot.error(apiError(sc, r.body()));
             } else {
                 parse(r.body());
             }
@@ -240,7 +217,7 @@ public final class SpotifyClient {
         String cover = "";
         JsonObject imgHolder = item.has("album") && item.get("album").isJsonObject() ? item.getAsJsonObject("album")
                 : item.has("images") ? item : null;
-        if (imgHolder != null) cover = lastImage(imgHolder);
+        if (imgHolder != null) cover = bestImage(imgHolder);
 
         String device = "";
         int volume = 0;
@@ -254,18 +231,21 @@ public final class SpotifyClient {
         boolean shuffle = bool(o, "shuffle_state");
         String repeat = str(o, "repeat_state");
         if (repeat.isEmpty()) repeat = "off";
+        long progress = lng(o, "progress_ms");
 
-        Snapshot ns = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
-                lng(o, "progress_ms"), System.currentTimeMillis(), device, volume, shuffle, repeat, "");
-
-        // сразу после действия игрока не даём ещё не обновлённому ответу сервера откатить интерфейс назад
-        Snapshot old = snapshot;
-        boolean sameTrack = old.track() != null && old.track().uri().equals(uri);
-        if (System.currentTimeMillis() < overrideUntil && old.status() == Status.ACTIVE && sameTrack) {
-            ns = new Snapshot(Status.ACTIVE, old.playing(), ns.track(), old.progressMs(), old.fetchedAtMs(),
-                    device, old.volume(), old.shuffle(), old.repeat(), "");
+        // «оптимистичные» значения после наших команд живут ~1.8 с, чтобы ответ Spotify их не откатил
+        long now = System.currentTimeMillis();
+        Snapshot cur = snapshot;
+        if (now < optUntil && cur.status() == Status.ACTIVE && cur.track() != null && uri.equals(cur.track().uri())) {
+            if ((optMask & O_PLAY) != 0) playing = cur.playing();
+            if ((optMask & O_SHUF) != 0) shuffle = cur.shuffle();
+            if ((optMask & O_REP) != 0) repeat = cur.repeat();
+            if ((optMask & O_VOL) != 0) volume = cur.volume();
+            if ((optMask & O_POS) != 0) progress = cur.currentProgress();
         }
-        snapshot = ns;
+
+        snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
+                progress, now, device, volume, shuffle, repeat, "");
     }
 
     private static String artistsOf(JsonObject item) {
@@ -282,14 +262,23 @@ public final class SpotifyClient {
         return artists.toString();
     }
 
-    private static String lastImage(JsonObject holder) {
-        if (holder.has("images") && holder.get("images").isJsonArray()) {
-            JsonArray imgs = holder.getAsJsonArray("images");
-            if (imgs.size() > 0 && imgs.get(imgs.size() - 1).isJsonObject()) {
-                return str(imgs.get(imgs.size() - 1).getAsJsonObject(), "url");
-            }
+    /** Берём самую маленькую картинку шириной от 150 px (иначе самую большую). */
+    private static String bestImage(JsonObject holder) {
+        if (!holder.has("images") || !holder.get("images").isJsonArray()) return "";
+        String best = "";
+        long bestW = Long.MAX_VALUE;
+        String biggest = "";
+        long biggestW = -1;
+        for (JsonElement el : holder.getAsJsonArray("images")) {
+            if (!el.isJsonObject()) continue;
+            JsonObject im = el.getAsJsonObject();
+            String url = str(im, "url");
+            if (url.isEmpty()) continue;
+            long w = im.has("width") && !im.get("width").isJsonNull() ? im.get("width").getAsLong() : 640;
+            if (w >= 150 && w < bestW) { bestW = w; best = url; }
+            if (w > biggestW) { biggestW = w; biggest = url; }
         }
-        return "";
+        return best.isEmpty() ? biggest : best;
     }
 
     private static String str(JsonObject o, String k) {
@@ -311,14 +300,15 @@ public final class SpotifyClient {
 
     private void loadPlaylists() {
         try {
-            HttpResponse<String> r = send("GET", "/me/playlists?limit=50", null);
-            int sc = r.statusCode();
-            if (sc == 401 || sc == 403) {
-                playlistsError = "Нужен повторный вход: /spotify login";
+            if (!auth.hasScope("playlist-read-private")) {
+                playlistsError = "Войди заново: /spotify login";
                 return;
             }
+            HttpResponse<String> r = send("GET", "/me/playlists?limit=50", null);
+            int sc = r.statusCode();
             if (sc != 200) {
-                playlistsError = "Плейлисты: HTTP " + sc;
+                playlistsError = apiError(sc, r.body());
+                LOG.warn("playlists failed: {} {}", sc, r.body());
                 return;
             }
             JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
@@ -339,13 +329,14 @@ public final class SpotifyClient {
                     } else if (p.has("tracks") && p.get("tracks").isJsonObject()) {
                         total = (int) lng(p.getAsJsonObject("tracks"), "total");
                     }
-                    out.add(new Playlist(id, str(p, "name"), owner, total, lastImage(p), str(p, "uri")));
+                    out.add(new Playlist(id, str(p, "name"), owner, total, bestImage(p), str(p, "uri")));
                 }
             }
             playlists = out;
-            playlistsError = "";
+            playlistsError = out.isEmpty() ? "У тебя нет плейлистов" : "";
         } catch (Exception e) {
-            playlistsError = "Плейлисты: " + errText(e);
+            playlistsError = errText(e);
+            LOG.warn("playlists exception", e);
         }
     }
 
@@ -358,13 +349,12 @@ public final class SpotifyClient {
             try {
                 HttpResponse<String> r = send("GET", "/playlists/" + playlistId + "/items?limit=100", null);
                 int sc = r.statusCode();
-                if (sc == 403 || sc == 404) {
-                    itemErrors.put(playlistId, "Spotify не отдаёт треки этого плейлиста");
-                    itemsTime.put(playlistId, System.currentTimeMillis());
-                    return;
-                }
                 if (sc != 200) {
-                    itemErrors.put(playlistId, "Треки: HTTP " + sc);
+                    LOG.warn("items failed: {} {}", sc, r.body());
+                    itemErrors.put(playlistId, sc == 403 || sc == 404
+                            ? "Spotify не отдаёт треки этого плейлиста"
+                            : apiError(sc, r.body()));
+                    itemsTime.put(playlistId, System.currentTimeMillis());
                     return;
                 }
                 JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
@@ -386,7 +376,8 @@ public final class SpotifyClient {
                 itemErrors.remove(playlistId);
                 itemsTime.put(playlistId, System.currentTimeMillis());
             } catch (Exception e) {
-                itemErrors.put(playlistId, "Треки: " + errText(e));
+                itemErrors.put(playlistId, errText(e));
+                LOG.warn("items exception", e);
             } finally {
                 itemsLoading.remove(playlistId);
             }
@@ -395,12 +386,11 @@ public final class SpotifyClient {
 
     // ------------------------------------------------------------- covers
 
-    /** Сетка цветов обложки grid*grid (по одному цвету на ячейку). null, пока обложка грузится. */
-    public int[] mosaic(String url, int grid) {
+    /** Текстура обложки (вызывать из потока рендера). null, пока обложка грузится или не удалась. */
+    public Identifier coverTexture(String url) {
         if (url == null || url.isEmpty()) return null;
-        String key = url + "|" + grid;
-        int[] m = mosaics.get(key);
-        if (m != null) return m;
+        Identifier id = textures.get(url);
+        if (id != null) return id;
         int[] raw = rawCache.get(url);
         if (raw == null) {
             if (!coverFailed.contains(url) && coverLoading.add(url)) {
@@ -408,14 +398,66 @@ public final class SpotifyClient {
             }
             return null;
         }
-        m = buildMosaic(raw, grid);
-        mosaics.put(key, m);
-        return m;
+        if (texFailed.contains(url)) return null;
+        try {
+            NativeImage img = new NativeImage(RAW, RAW, false);
+            for (int y = 0; y < RAW; y++) {
+                for (int x = 0; x < RAW; x++) {
+                    img.setColorArgb(x, y, raw[y * RAW + x]);
+                }
+            }
+            NativeImageBackedTexture tex = makeTexture(img);
+            Identifier nid = Identifier.of("spotify-panel", "cover/" + Integer.toHexString(url.hashCode()) + "x" + url.length());
+            MinecraftClient.getInstance().getTextureManager().registerTexture(nid, tex);
+            textures.put(url, nid);
+            return nid;
+        } catch (Throwable e) {
+            LOG.warn("texture create failed", e);
+            texFailed.add(url);
+            reportCoverError("текстура: " + errText(e));
+            return null;
+        }
+    }
+
+    /** Средний цвет обложки (для градиента и запасного варианта). 0, если ещё нет. */
+    public int coverColor(String url) {
+        int[] raw = url == null ? null : rawCache.get(url);
+        if (raw == null) return 0;
+        long r = 0, g = 0, b = 0;
+        for (int c : raw) {
+            r += (c >> 16) & 0xFF;
+            g += (c >> 8) & 0xFF;
+            b += c & 0xFF;
+        }
+        int n = raw.length;
+        return 0xFF000000 | ((int) (r / n) << 16) | ((int) (g / n) << 8) | (int) (b / n);
+    }
+
+    /** Конструктор NativeImageBackedTexture менялся между версиями — подбираем подходящий. */
+    private static NativeImageBackedTexture makeTexture(NativeImage img) throws Exception {
+        for (Constructor<?> c : NativeImageBackedTexture.class.getConstructors()) {
+            Class<?>[] p = c.getParameterTypes();
+            if (p.length == 2 && p[1] == NativeImage.class) {
+                if (p[0] == String.class) {
+                    return (NativeImageBackedTexture) c.newInstance("spotifypanel", img);
+                }
+                if (p[0] == Supplier.class) {
+                    Supplier<String> name = () -> "spotifypanel";
+                    return (NativeImageBackedTexture) c.newInstance(name, img);
+                }
+            }
+            if (p.length == 1 && p[0] == NativeImage.class) {
+                return (NativeImageBackedTexture) c.newInstance(img);
+            }
+        }
+        throw new IllegalStateException("нет подходящего конструктора NativeImageBackedTexture");
     }
 
     private void loadRaw(String url) {
         try {
-            HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .header("User-Agent", "Mozilla/5.0")
+                    .timeout(Duration.ofSeconds(12)).GET().build();
             HttpResponse<byte[]> r = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
             if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
             int[] raw = decodeNative(r.body());
@@ -424,12 +466,21 @@ public final class SpotifyClient {
                 rawCache.put(url, raw);
             } else {
                 coverFailed.add(url);
+                reportCoverError("не удалось декодировать картинку");
             }
         } catch (Throwable e) {
             LOG.warn("cover load failed: {}", url, e);
             coverFailed.add(url);
+            reportCoverError("загрузка: " + errText(e));
         } finally {
             coverLoading.remove(url);
+        }
+    }
+
+    private void reportCoverError(String msg) {
+        if (!coverErrorShown) {
+            coverErrorShown = true;
+            SpotifyPanelMod.say("Обложки не грузятся (" + msg + "). Подробности в logs/latest.log");
         }
     }
 
@@ -476,96 +527,65 @@ public final class SpotifyClient {
         return out;
     }
 
-    private static int[] buildMosaic(int[] raw, int grid) {
-        int k = RAW / grid;
-        int[] out = new int[grid * grid];
-        for (int cy = 0; cy < grid; cy++) {
-            for (int cx = 0; cx < grid; cx++) {
-                long r = 0, g = 0, b = 0;
-                for (int y = 0; y < k; y++) {
-                    for (int x = 0; x < k; x++) {
-                        int c = raw[(cy * k + y) * RAW + (cx * k + x)];
-                        r += (c >> 16) & 0xFF;
-                        g += (c >> 8) & 0xFF;
-                        b += c & 0xFF;
-                    }
-                }
-                int n = k * k;
-                out[cy * grid + cx] = 0xFF000000 | ((int) (r / n) << 16) | ((int) (g / n) << 8) | (int) (b / n);
-            }
-        }
-        return out;
-    }
-
     // ------------------------------------------------------------ controls
 
-    private void localUpdate(Snapshot s) {
-        snapshot = s;
-        overrideUntil = System.currentTimeMillis() + 1500;
-    }
-
-    /** Выполняет задачу в фоне; если задача с таким ключом уже идёт, будет выполнена только самая свежая из ожидающих. */
-    private void coalesced(String key, Runnable task) {
-        latest.put(key, task);
-        if (!running.add(key)) return;
-        exec.submit(() -> {
-            try {
-                Runnable r;
-                while ((r = latest.remove(key)) != null) r.run();
-            } finally {
-                running.remove(key);
-                Runnable leftover = latest.remove(key);
-                if (leftover != null) coalesced(key, leftover);
-            }
-        });
-    }
-
-    public void play(Consumer<String> err) { setPlaying(true, err); }
-
-    public void pause(Consumer<String> err) { setPlaying(false, err); }
-
-    public void togglePlay(Consumer<String> err) { setPlaying(!snapshot.playing(), err); }
-
-    private void setPlaying(boolean want, Consumer<String> err) {
+    private void optimistic(int mask, java.util.function.UnaryOperator<Snapshot> f) {
         Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withPlaying(want));
-        coalesced("play", () -> controlSync("PUT", want ? "/me/player/play" : "/me/player/pause", null, err));
+        if (s.status() != Status.ACTIVE || s.track() == null) return;
+        long now = System.currentTimeMillis();
+        optMask = (now < optUntil ? optMask : 0) | mask;
+        optUntil = now + 1800;
+        snapshot = f.apply(s);
     }
 
-    public void next(Consumer<String> err) { skip("/me/player/next", err); }
-
-    public void previous(Consumer<String> err) { skip("/me/player/previous", err); }
-
-    private void skip(String path, Consumer<String> err) {
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withProgress(0));
-        skipExec.submit(() -> controlSync("POST", path, null, err));
+    public void togglePlay(Consumer<String> err) {
+        boolean wasPlaying = snapshot.playing();
+        optimistic(O_PLAY | O_POS, s -> new Snapshot(s.status(), !s.playing(), s.track(), s.currentProgress(),
+                System.currentTimeMillis(), s.device(), s.volume(), s.shuffle(), s.repeat(), s.error()));
+        if (wasPlaying) control("PUT", "/me/player/pause", null, err);
+        else control("PUT", "/me/player/play", null, err);
     }
+
+    public void play(Consumer<String> err) {
+        optimistic(O_PLAY | O_POS, s -> new Snapshot(s.status(), true, s.track(), s.currentProgress(),
+                System.currentTimeMillis(), s.device(), s.volume(), s.shuffle(), s.repeat(), s.error()));
+        control("PUT", "/me/player/play", null, err);
+    }
+
+    public void pause(Consumer<String> err) {
+        optimistic(O_PLAY | O_POS, s -> new Snapshot(s.status(), false, s.track(), s.currentProgress(),
+                System.currentTimeMillis(), s.device(), s.volume(), s.shuffle(), s.repeat(), s.error()));
+        control("PUT", "/me/player/pause", null, err);
+    }
+
+    public void next(Consumer<String> err) { control("POST", "/me/player/next", null, err); }
+
+    public void previous(Consumer<String> err) { control("POST", "/me/player/previous", null, err); }
 
     public void volume(int percent, Consumer<String> err) {
         int v = Math.max(0, Math.min(100, percent));
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withVolume(v));
-        coalesced("vol", () -> controlSync("PUT", "/me/player/volume?volume_percent=" + v, null, err));
+        optimistic(O_VOL, s -> new Snapshot(s.status(), s.playing(), s.track(), s.progressMs(), s.fetchedAtMs(),
+                s.device(), v, s.shuffle(), s.repeat(), s.error()));
+        control("PUT", "/me/player/volume?volume_percent=" + v, null, err);
     }
 
     public void seek(long ms, Consumer<String> err) {
         long p = Math.max(0, ms);
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withProgress(p));
-        coalesced("seek", () -> controlSync("PUT", "/me/player/seek?position_ms=" + p, null, err));
+        optimistic(O_POS, s -> new Snapshot(s.status(), s.playing(), s.track(), p, System.currentTimeMillis(),
+                s.device(), s.volume(), s.shuffle(), s.repeat(), s.error()));
+        control("PUT", "/me/player/seek?position_ms=" + p, null, err);
     }
 
     public void shuffle(boolean on, Consumer<String> err) {
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withShuffle(on));
-        coalesced("shuffle", () -> controlSync("PUT", "/me/player/shuffle?state=" + on, null, err));
+        optimistic(O_SHUF, s -> new Snapshot(s.status(), s.playing(), s.track(), s.progressMs(), s.fetchedAtMs(),
+                s.device(), s.volume(), on, s.repeat(), s.error()));
+        control("PUT", "/me/player/shuffle?state=" + on, null, err);
     }
 
     public void repeat(String mode, Consumer<String> err) {
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withRepeat(mode));
-        coalesced("repeat", () -> controlSync("PUT", "/me/player/repeat?state=" + mode, null, err));
+        optimistic(O_REP, s -> new Snapshot(s.status(), s.playing(), s.track(), s.progressMs(), s.fetchedAtMs(),
+                s.device(), s.volume(), s.shuffle(), mode, s.error()));
+        control("PUT", "/me/player/repeat?state=" + mode, null, err);
     }
 
     /** Играть плейлист целиком или с конкретного трека (trackUri может быть пустым). */
@@ -577,34 +597,31 @@ public final class SpotifyClient {
             off.addProperty("uri", trackUri);
             body.add("offset", off);
         }
-        String json = body.toString();
-        Snapshot s = snapshot;
-        if (s.status() == Status.ACTIVE) localUpdate(s.withPlaying(true));
-        coalesced("ctx", () -> controlSync("PUT", "/me/player/play", json, err));
+        control("PUT", "/me/player/play", body.toString(), err);
     }
 
-    private void controlSync(String method, String path, String body, Consumer<String> err) {
-        long t0 = System.nanoTime();
-        try {
-            if (!auth.isLoggedIn()) {
-                err.accept("Сначала войди: /spotify login");
-                return;
+    private void control(String method, String path, String body, Consumer<String> err) {
+        ctl.submit(() -> {
+            try {
+                if (!auth.isLoggedIn()) {
+                    err.accept("Сначала войди: /spotify login");
+                    return;
+                }
+                HttpResponse<String> r = send(method, path, body);
+                int sc = r.statusCode();
+                if (sc >= 300) {
+                    optUntil = 0; // откатываем «оптимистичные» значения
+                    exec.submit(this::poll);
+                    if (sc == 404) err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
+                    else if (sc == 403) err.accept("Spotify отказал (нужен Premium или действие недоступно).");
+                    else err.accept("Spotify: " + apiError(sc, r.body()));
+                } else {
+                    exec.schedule(this::poll, 350, TimeUnit.MILLISECONDS);
+                    exec.schedule(this::poll, 1300, TimeUnit.MILLISECONDS);
+                }
+            } catch (Exception e) {
+                err.accept("Ошибка: " + errText(e));
             }
-            HttpResponse<String> r = send(method, path, body);
-            int sc = r.statusCode();
-            long ms = (System.nanoTime() - t0) / 1_000_000;
-            LOG.info("{} {} -> {} ({} ms)", method, path.split("\\?")[0], sc, ms);
-            if (sc == 404) {
-                err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
-            } else if (sc == 403) {
-                err.accept("Spotify отказал (нужен Premium или действие недоступно на этом устройстве).");
-            } else if (sc >= 300) {
-                err.accept("Spotify: HTTP " + sc);
-            } else {
-                pollsSoon();
-            }
-        } catch (Exception e) {
-            err.accept("Ошибка сети: " + errText(e));
-        }
+        });
     }
 }

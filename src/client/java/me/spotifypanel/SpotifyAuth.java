@@ -59,8 +59,13 @@ public final class SpotifyAuth {
 
     public void logout() {
         config.refreshToken = "";
+        config.scope = "";
         config.save();
         accessToken = null;
+    }
+
+    public boolean hasScope(String scope) {
+        return (" " + config.scope + " ").contains(" " + scope + " ");
     }
 
     public synchronized String accessToken() throws IOException, InterruptedException {
@@ -91,8 +96,11 @@ public final class SpotifyAuth {
         expiresAtMs = System.currentTimeMillis() + j.get("expires_in").getAsLong() * 1000L;
         if (j.has("refresh_token") && !j.get("refresh_token").isJsonNull()) {
             config.refreshToken = j.get("refresh_token").getAsString();
-            config.save();
         }
+        if (j.has("scope") && !j.get("scope").isJsonNull()) {
+            config.scope = j.get("scope").getAsString();
+        }
+        config.save();
     }
 
     private JsonObject tokenRequest(Map<String, String> form) throws IOException, InterruptedException {
