@@ -5,10 +5,12 @@ import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.render.Camera;
 import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.Vec3d;
+import org.joml.Matrix3x2f;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWScrollCallback;
 
@@ -21,7 +23,10 @@ import java.util.List;
  */
 public final class PanelRenderer {
     private static final int W = 300, H = 190;
-    private static final double WORLD_W = 2.1; // ширина панели в блоках
+    private static final double WORLD_W = 3.4; // ширина панели в блоках (больше = крупнее текст)
+    private static final double SIDE = 2.2;    // насколько правее тела
+    private static final double AHEAD = 2.4;   // насколько впереди тела
+    private static final double PANEL_YAW = 15; // разворот панели вокруг вертикальной оси, градусов (даёт «объём»)
 
     private static final int BLACK = 0xFF000000;
     private static final int PANEL = 0xFF121212;
@@ -30,10 +35,14 @@ public final class PanelRenderer {
     private static final int GREEN = 0xFF1ED760;
     private static final int WHITE = 0xFFFFFFFF;
     private static final int GRAY = 0xFFB3B3B3;
-    private static final int DIM = 0xFF727272;
+    private static final int DIM = 0xFF9A9A9A;
     private static final int BAR_BG = 0xFF4D4D4D;
     private static final int WARN = 0xFFFFAA00;
     private static final int ERR = 0xFFFF6B6B;
+
+    /** Размер клетки обложки в пикселях панели: 1 = максимум чёткости, 2 = вчетверо меньше прямоугольников (если просядет FPS). */
+    private static final int CELL = 1;
+    private static final boolean SHADOW = true; // тень у текста — читается намного лучше
 
     // что сейчас тащит мышь
     private static final int D_NONE = 0, D_SIDE = 1, D_TRACK = 2, D_SEEK = 3, D_VOL = 4;
@@ -46,7 +55,9 @@ public final class PanelRenderer {
 
     // позиция панели на экране (держим на месте, пока открыт чат — иначе по ней не попасть)
     private static boolean screenInit;
-    private static double sox, soy, ss, settle;
+    private static final double[] cur = new double[6]; // экранная матрица панели: начало, ось X, ось Y
+    private static double settle, fovMul = 1.0;
+    private static double camX, camY, camZ, cfx, cfy, cfz, crx, crz, cux, cuy, cuz, cfocal, csw, csh;
 
     // состояние интерфейса
     private static String selected = "";
@@ -108,9 +119,15 @@ public final class PanelRenderer {
 
         float pt = tick.getTickProgress(false);
         int sw = ctx.getScaledWindowWidth(), sh = ctx.getScaledWindowHeight();
-        Vec3d cam = player.getCameraPosVec(pt);
-        double yr = Math.toRadians(player.getYaw(pt)), pr = Math.toRadians(player.getPitch(pt));
+        // настоящая камера (в виде от 3-го лица она позади игрока, а не в глазах)
+        Camera camera = mc.gameRenderer.getCamera();
+        double yr = Math.toRadians(camera.getYaw()), pr = Math.toRadians(camera.getPitch());
         double sinY = Math.sin(yr), cosY = Math.cos(yr), sinP = Math.sin(pr), cosP = Math.cos(pr);
+        Vec3d eye = player.getCameraPosVec(pt);
+        double back = mc.options.getPerspective().isFirstPerson() ? 0.0 : 4.0;
+        camX = eye.x + sinY * cosP * back;
+        camY = eye.y + sinP * back;
+        camZ = eye.z - cosY * cosP * back;
 
         // панель привязана к ТОРСУ: берём положение тела и поворот тела (не головы, не камеры),
         // поэтому вертеть головой можно сколько угодно — в мире панель стоит на месте
@@ -131,19 +148,25 @@ public final class PanelRenderer {
             syaw = bodyYaw;
             init = true;
         } else {
-            // чем дальше убежал игрок — тем быстрее панель догоняет
-            double ka = 1.0 - Math.exp(-dt * (4.0 + 3.0 * dist));
-            bx += ddx * ka; by += ddy * ka; bz += ddz * ka;
-            // чем резче и больше поворот — тем быстрее догоняет угол (при 180° почти мгновенно)
+            // положение — жёстко по телу (getLerpedPos уже интерполирован между тиками)
+            bx = body.x; by = body.y; bz = body.z;
+            // угол — тоже почти жёстко: поворот тела меняется только 20 раз в секунду,
+            // лёгкое сглаживание (~30 мс) просто убирает ступеньки, но не даёт панели отставать
             double err = ((bodyYaw - syaw + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
-            double ky = 1.0 - Math.exp(-dt * (5.0 + 0.2 * Math.abs(err)));
+            double ky = 1.0 - Math.exp(-dt * (35.0 + 0.5 * Math.abs(err)));
             syaw += err * ky;
         }
         double br = Math.toRadians(syaw);
         double sinB = Math.sin(br), cosB = Math.cos(br);
-        px = bx - sinB * 2.6 - cosB * 1.5;
+        // система координат тела: вперёд (fxw,fzw), вправо (rxw,rzw)
+        double fxw = -sinB, fzw = cosB, rxw = -cosB, rzw = -sinB;
+        px = bx + fxw * AHEAD + rxw * SIDE;
         py = by + 1.3;
-        pz = bz + cosB * 2.6 - sinB * 1.5;
+        pz = bz + fzw * AHEAD + rzw * SIDE;
+        // ось ширины панели, довёрнутая на PANEL_YAW к игроку
+        double pa = Math.toRadians(PANEL_YAW);
+        double pwx = rxw * Math.cos(pa) - fxw * Math.sin(pa);
+        double pwz = rzw * Math.cos(pa) - fzw * Math.sin(pa);
 
         // мышь (курсор виден только при открытом чате) — читаем до проекции
         chatOpen = mc.currentScreen instanceof ChatScreen;
@@ -159,46 +182,56 @@ public final class PanelRenderer {
         released = prevDown && !down;
         prevDown = down;
 
-        // проекция на экран
-        double vx = px - cam.x, vy = py - cam.y, vz = pz - cam.z;
-        double fx = -sinY * cosP, fy = -sinP, fz = cosY * cosP;
-        double rx = -cosY, rz = -sinY;
-        double ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
-        double zc = vx * fx + vy * fy + vz * fz;
-        if (zc < 0.3) return; // панель за спиной
-        double xc = vx * rx + vz * rz;
-        double yc = vx * ux + vy * uy + vz * uz;
-        double fov = Math.toRadians(mc.options.getFov().getValue());
-        double focal = (sh / 2.0) / Math.tan(fov / 2.0);
-        double scx = sw / 2.0 + xc / zc * focal;
-        double scy = sh / 2.0 - yc / zc * focal;
-        double tsc = Math.max(0.5, Math.min(1.25, focal / zc * WORLD_W / W));
-        double tox = scx - W * tsc / 2.0, toy = scy - H * tsc / 2.0;
+        // реальный FOV: при беге игра его расширяет, без этого панель «плывёт» относительно мира
+        double spd = player.getMovementSpeed();
+        double fTarget = spd > 1e-4 ? Math.max(0.9, Math.min(1.4, (spd / 0.1 + 1.0) / 2.0)) : 1.0;
+        fovMul += (fTarget - fovMul) * (1.0 - Math.exp(-dt * 20.0));
+        double fov = Math.toRadians(mc.options.getFov().getValue() * fovMul);
 
-        // на экране: пока чат открыт — панель стоит намертво (можно спокойно кликать),
-        // иначе мягко догоняет цель
+        // базис камеры
+        cfx = -sinY * cosP; cfy = -sinP; cfz = cosY * cosP;
+        crx = -cosY; crz = -sinY;
+        cux = -crz * cfy; cuy = crz * cfx - crx * cfz; cuz = crx * cfy;
+        csw = sw; csh = sh;
+        cfocal = (sh / 2.0) / Math.tan(fov / 2.0);
+
+        // 4 угла панели в мире -> на экран. Из трёх углов получаем матрицу панели (сдвиг + оси X и Y),
+        // так что панель честно стоит в мире, повёрнутая вокруг вертикальной оси
+        double halfW = WORLD_W / 2.0, halfH = WORLD_W * H / W / 2.0;
+        double[] tl = new double[2], trr = new double[2], bl = new double[2], br2 = new double[2];
+        boolean ok = project(px - pwx * halfW, py + halfH, pz - pwz * halfW, tl);
+        ok &= project(px + pwx * halfW, py + halfH, pz + pwz * halfW, trr);
+        ok &= project(px - pwx * halfW, py - halfH, pz - pwz * halfW, bl);
+        ok &= project(px + pwx * halfW, py - halfH, pz + pwz * halfW, br2);
+        if (!ok) return; // панель за спиной
+
+        double minX = Math.min(Math.min(tl[0], trr[0]), Math.min(bl[0], br2[0]));
+        double maxX = Math.max(Math.max(tl[0], trr[0]), Math.max(bl[0], br2[0]));
+        double minY = Math.min(Math.min(tl[1], trr[1]), Math.min(bl[1], br2[1]));
+        double maxY = Math.max(Math.max(tl[1], trr[1]), Math.max(bl[1], br2[1]));
+        if (maxX < 0 || minX > sw || maxY < 0 || minY > sh) return;
+
+        double[] tg = {tl[0], tl[1], (trr[0] - tl[0]) / W, (trr[1] - tl[1]) / W, (bl[0] - tl[0]) / H, (bl[1] - tl[1]) / H};
         if (!screenInit) {
-            sox = tox; soy = toy; ss = tsc;
+            System.arraycopy(tg, 0, cur, 0, 6);
             screenInit = true;
         } else if (chatOpen) {
-            settle = 0.4; // экран держим на месте
+            settle = 0.4; // пока чат открыт — панель стоит на экране намертво, можно кликать
         } else if (settle > 0) {
             // сразу после закрытия чата плавно возвращаемся к живой позиции, без скачка
             settle -= dt;
             double a = 1.0 - Math.exp(-dt * 12.0);
-            sox += (tox - sox) * a;
-            soy += (toy - soy) * a;
-            ss += (tsc - ss) * a;
+            for (int k = 0; k < 6; k++) cur[k] += (tg[k] - cur[k]) * a;
         } else {
-            sox = tox; soy = toy; ss = tsc; // обычный режим: никакого дополнительного «плавания»
+            System.arraycopy(tg, 0, cur, 0, 6); // обычный режим: жёстко к миру
         }
-        double s = ss;
-        double ox = chatOpen ? Math.round(sox) : sox;
-        double oy = chatOpen ? Math.round(soy) : soy;
-        if (ox > sw || oy > sh || ox + W * s < 0 || oy + H * s < 0) return;
 
-        lmx = (mxs - ox) / s;
-        lmy = (mys - oy) / s;
+        // курсор -> координаты внутри панели (обратная матрица)
+        double det = cur[2] * cur[5] - cur[4] * cur[3];
+        if (Math.abs(det) < 1e-9) return;
+        double mdx = mxs - cur[0], mdy = mys - cur[1];
+        lmx = (mdx * cur[5] - mdy * cur[4]) / det;
+        lmy = (cur[2] * mdy - cur[3] * mdx) / det;
         overPanel = chatOpen && lmx >= 0 && lmx < W && lmy >= 0 && lmy < H;
         int steps = (int) wheelAcc;
         wheelAcc -= steps;
@@ -211,13 +244,24 @@ public final class PanelRenderer {
 
         var m = ctx.getMatrices();
         m.pushMatrix();
-        m.translate((float) ox, (float) oy);
-        m.scale((float) s, (float) s);
+        m.mul(new Matrix3x2f((float) cur[2], (float) cur[3], (float) cur[4], (float) cur[5], (float) cur[0], (float) cur[1]));
         try {
             drawPanel();
         } finally {
             m.popMatrix();
         }
+    }
+
+    /** Точка мира -> экран (в масштабированных пикселях GUI). false, если за камерой. */
+    private static boolean project(double wx, double wy, double wz, double[] out) {
+        double vx = wx - camX, vy = wy - camY, vz = wz - camZ;
+        double zc = vx * cfx + vy * cfy + vz * cfz;
+        if (zc < 0.2) return false;
+        double xc = vx * crx + vz * crz;
+        double yc = vx * cux + vy * cuy + vz * cuz;
+        out[0] = csw / 2.0 + xc / zc * cfocal;
+        out[1] = csh / 2.0 - yc / zc * cfocal;
+        return true;
     }
 
     private static void drawPanel() {
@@ -276,8 +320,8 @@ public final class PanelRenderer {
             if (sel) g.fill(6, y, 76, y + 19, ROW_SEL);
             else if (hov) g.fill(6, y, 76, y + 19, ROW_HOVER);
 
-            int[] img = sp.pixels(p.coverUrl(), 9); // 64x64 -> 9x9 клеток по 2px = 18px
-            if (img != null) drawImage(img, 9, 7, y + 1, 2);
+            int[] img = sp.pixels(p.coverUrl(), 18 / CELL);
+            if (img != null) drawImage(img, 18 / CELL, 7, y + 1, CELL);
             else g.fill(7, y + 1, 25, y + 19, 0xFF282828);
 
             text(p.name(), 28, y + 2, sel ? GREEN : WHITE, 48);
@@ -314,16 +358,16 @@ public final class PanelRenderer {
 
         // шапка с градиентом из цвета обложки
         int[] avg = sp.pixels(cur.coverUrl(), 4);
-        int[] img = sp.pixels(cur.coverUrl(), 36);
+        int[] img = sp.pixels(cur.coverUrl(), 36 / CELL);
         int base = avg != null ? darken(avgColor(avg), 0.55f) : 0xFF1B3B4A;
         for (int k = 0; k < 20; k++) {
             g.fill(84, 4 + k * 3, 296, 7 + k * 3, mix(base, PANEL, k / 19f));
         }
-        if (img != null) drawImage(img, 36, 92, 12, 1);
+        if (img != null) drawImage(img, 36 / CELL, 92, 12, CELL);
         else g.fill(92, 12, 128, 48, 0xFF282828);
 
         text("Плейлист", 134, 14, 0xFFE0E0E0, 158);
-        g.drawText(tr, Text.literal(fit(cur.name(), 150)).formatted(Formatting.BOLD), 134, 24, WHITE, false);
+        g.drawText(tr, Text.literal(fit(cur.name(), 150)).formatted(Formatting.BOLD), 134, 24, WHITE, SHADOW);
         String info = (cur.owner().isEmpty() ? "" : cur.owner() + " • ") + cur.total() + " треков";
         text(info, 134, 36, GRAY, 158);
 
@@ -380,7 +424,7 @@ public final class PanelRenderer {
             text(it.title(), 106, ry + 2, isCur ? GREEN : WHITE, 92);
             text(it.artists(), 202, ry + 2, GRAY, 58);
             String d = fmt(it.durationMs());
-            g.drawText(tr, d, 288 - tr.getWidth(d), ry + 2, GRAY, false);
+            g.drawText(tr, d, 288 - tr.getWidth(d), ry + 2, GRAY, SHADOW);
 
             if (click(88, ry, 201, 12)) {
                 sp.playContext(cur.uri(), it.uri(), SpotifyPanelMod::say);
@@ -395,8 +439,8 @@ public final class PanelRenderer {
         SpotifyClient.Track t = s.track();
 
         if (s.status() == SpotifyClient.Status.ACTIVE && t != null) {
-            int[] img = sp.pixels(t.coverUrl(), 12); // 12 клеток по 2px = 24px
-            if (img != null) drawImage(img, 12, 8, 158, 2);
+            int[] img = sp.pixels(t.coverUrl(), 24 / CELL);
+            if (img != null) drawImage(img, 24 / CELL, 8, 158, CELL);
             else g.fill(8, 158, 32, 182, 0xFF282828);
             text(t.title(), 36, 159, WHITE, 60);
             text(t.artists(), 36, 170, GRAY, 60);
@@ -599,14 +643,14 @@ public final class PanelRenderer {
     // ================================================================= текст/цвет
 
     private static void text(String s, int x, int y, int color, int maxW) {
-        g.drawText(tr, fit(s, maxW), x, y, color, false);
+        g.drawText(tr, fit(s, maxW), x, y, color, SHADOW);
     }
 
     /** Текст с переносом по словам (длинные слова режутся). Лишние строки отбрасываются с «…». */
     private static void wrapped(String s, int x, int y, int maxW, int maxLines, int color) {
         List<String> lines = wrap(s, maxW, maxLines);
         for (int i = 0; i < lines.size(); i++) {
-            g.drawText(tr, lines.get(i), x, y + i * 10, color, false);
+            g.drawText(tr, lines.get(i), x, y + i * 10, color, SHADOW);
         }
     }
 

@@ -35,7 +35,7 @@ import java.util.function.UnaryOperator;
 /** Spotify Web API: состояние плеера, плейлисты, треки, обложки и команды управления. */
 public final class SpotifyClient {
     private static final Logger LOG = LoggerFactory.getLogger("spotifypanel");
-    private static final int RAW = 64; // обложка сжимается до 64x64, из неё считаются картинки любого размера
+    private static final int RAW = 256; // обложка хранится как 256x256, из неё считаются картинки любого размера
 
     public enum Status { NO_CLIENT_ID, LOGGED_OUT, IDLE, ACTIVE, ERROR }
 
@@ -386,6 +386,7 @@ public final class SpotifyClient {
             List<Playlist> out = new ArrayList<>();
             Set<String> seen = new HashSet<>();
             int offset = 0;
+            int apiTotal = -1;
             while (offset < 10_000) {
                 HttpResponse<String> r = send("GET", "/me/playlists?limit=50&offset=" + offset, null);
                 if (r.statusCode() != 200) {
@@ -394,6 +395,7 @@ public final class SpotifyClient {
                 }
                 JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
                 int got = 0;
+                if (apiTotal < 0) apiTotal = (int) lng(o, "total");
                 if (o.has("items") && o.get("items").isJsonArray()) {
                     for (JsonElement el : o.getAsJsonArray("items")) {
                         got++;
@@ -422,8 +424,13 @@ public final class SpotifyClient {
                 if (pl == null) pl = new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())), "", 0, "", "spotify:playlist:" + id);
                 out.add(pl);
             }
+            int before = playlists.size();
             playlists = out;
             playlistsError = "";
+            if (before != out.size()) {
+                SpotifyPanelMod.say("Плейлистов в панели: " + out.size() + " (Spotify вернул " + apiTotal
+                        + " в твоей медиатеке; Liked Songs, подкасты и сборники самого Spotify API не отдаёт)");
+            }
         } catch (Exception e) {
             playlistsError = "Плейлисты: " + errText(e);
         }
