@@ -10,7 +10,9 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.Vec3d;
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWScrollCallback;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -30,31 +32,79 @@ public final class PanelRenderer {
     private static final int GRAY = 0xFFB3B3B3;
     private static final int DIM = 0xFF727272;
     private static final int BAR_BG = 0xFF4D4D4D;
+    private static final int WARN = 0xFFFFAA00;
+    private static final int ERR = 0xFFFF6B6B;
+
+    // что сейчас тащит мышь
+    private static final int D_NONE = 0, D_SIDE = 1, D_TRACK = 2, D_SEEK = 3, D_VOL = 4;
 
     // позиция панели в мире (с плавным догоном)
     private static boolean init;
     private static double px, py, pz;
+    private static double bx, by, bz, syaw; // сглаженные положение и поворот тела
     private static long lastNs;
+
+    // позиция панели на экране (держим на месте, пока открыт чат — иначе по ней не попасть)
+    private static boolean screenInit;
+    private static double sox, soy, ss, settle;
 
     // состояние интерфейса
     private static String selected = "";
     private static int sideScroll, trackScroll;
-    private static boolean prevDown, clicked, chatOpen;
+    private static boolean down, prevDown, clicked, released, chatOpen;
     private static double lmx, lmy;
+    private static int drag = D_NONE;
+    private static double dragOff;
+    private static long seekTarget, lastVolSend;
+    private static int lastSentVol = -1;
+
+    // колесо мыши (перехватываем только когда курсор над панелью)
+    private static volatile boolean overPanel;
+    private static volatile double wheelAcc;
+    private static int wheelSteps;
+    private static boolean scrollHooked;
+    private static GLFWScrollCallback prevScroll;
 
     private static TextRenderer tr;
     private static DrawContext g;
     private static SpotifyClient sp;
+
+    private static String wrapKey = "";
+    private static List<String> wrapVal = List.of();
 
     private PanelRenderer() {}
 
     // =================================================================== кадр
 
     public static void render(DrawContext ctx, RenderTickCounter tick) {
-        if (!SpotifyPanelMod.config.visible) return;
+        released = false;
+        try {
+            draw(ctx, tick);
+        } finally {
+            if (released) drag = D_NONE;
+        }
+    }
+
+    private static void hookScroll(long handle) {
+        if (scrollHooked) return;
+        scrollHooked = true;
+        prevScroll = GLFW.glfwSetScrollCallback(handle, (win, xo, yo) -> {
+            if (overPanel) wheelAcc += yo;
+            else if (prevScroll != null) prevScroll.invoke(win, xo, yo);
+        });
+    }
+
+    private static void draw(DrawContext ctx, RenderTickCounter tick) {
+        overPanel = false;
+        if (!SpotifyPanelMod.config.visible) {
+            drag = D_NONE;
+            return;
+        }
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientPlayerEntity player = mc.player;
         if (player == null || mc.world == null) return;
+
+        hookScroll(mc.getWindow().getHandle());
 
         float pt = tick.getTickProgress(false);
         int sw = ctx.getScaledWindowWidth(), sh = ctx.getScaledWindowHeight();
@@ -62,22 +112,52 @@ public final class PanelRenderer {
         double yr = Math.toRadians(player.getYaw(pt)), pr = Math.toRadians(player.getPitch(pt));
         double sinY = Math.sin(yr), cosY = Math.cos(yr), sinP = Math.sin(pr), cosP = Math.cos(pr);
 
-        // целевая точка: справа-спереди от игрока
-        double tx = cam.x - sinY * 2.6 - cosY * 1.5;
-        double ty = cam.y - 0.3;
-        double tz = cam.z + cosY * 2.6 - sinY * 1.5;
+        // панель привязана к ТОРСУ: берём положение тела и поворот тела (не головы, не камеры),
+        // поэтому вертеть головой можно сколько угодно — в мире панель стоит на месте
+        Vec3d body = player.getLerpedPos(pt);
+        double bodyYaw = player.getBodyYaw();
 
         long now = System.nanoTime();
         double dt = init ? Math.min(0.1, (now - lastNs) / 1e9) : 1.0;
         lastNs = now;
-        double dx = tx - px, dy = ty - py, dz = tz - pz;
-        if (!init || dx * dx + dy * dy + dz * dz > 256) {
-            px = tx; py = ty; pz = tz;
+
+        // Сглаживаем отдельно угол и положение тела, а панель каждый кадр заново ставим
+        // по этим двум числам. Поэтому при повороте она облетает игрока по дуге
+        // и не режет путь напрямик через тело.
+        double ddx = body.x - bx, ddy = body.y - by, ddz = body.z - bz;
+        double dist = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+        if (!init || dist > 16) {
+            bx = body.x; by = body.y; bz = body.z;
+            syaw = bodyYaw;
             init = true;
         } else {
-            double a = 1.0 - Math.exp(-dt * 4.0);
-            px += dx * a; py += dy * a; pz += dz * a;
+            // чем дальше убежал игрок — тем быстрее панель догоняет
+            double ka = 1.0 - Math.exp(-dt * (4.0 + 3.0 * dist));
+            bx += ddx * ka; by += ddy * ka; bz += ddz * ka;
+            // чем резче и больше поворот — тем быстрее догоняет угол (при 180° почти мгновенно)
+            double err = ((bodyYaw - syaw + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+            double ky = 1.0 - Math.exp(-dt * (5.0 + 0.2 * Math.abs(err)));
+            syaw += err * ky;
         }
+        double br = Math.toRadians(syaw);
+        double sinB = Math.sin(br), cosB = Math.cos(br);
+        px = bx - sinB * 2.6 - cosB * 1.5;
+        py = by + 1.3;
+        pz = bz + cosB * 2.6 - sinB * 1.5;
+
+        // мышь (курсор виден только при открытом чате) — читаем до проекции
+        chatOpen = mc.currentScreen instanceof ChatScreen;
+        down = false;
+        double mxs = 0, mys = 0;
+        if (chatOpen) {
+            long handle = mc.getWindow().getHandle();
+            down = GLFW.glfwGetMouseButton(handle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+            mxs = mc.mouse.getX() * sw / mc.getWindow().getWidth();
+            mys = mc.mouse.getY() * sh / mc.getWindow().getHeight();
+        }
+        clicked = chatOpen && down && !prevDown;
+        released = prevDown && !down;
+        prevDown = down;
 
         // проекция на экран
         double vx = px - cam.x, vy = py - cam.y, vz = pz - cam.z;
@@ -92,24 +172,38 @@ public final class PanelRenderer {
         double focal = (sh / 2.0) / Math.tan(fov / 2.0);
         double scx = sw / 2.0 + xc / zc * focal;
         double scy = sh / 2.0 - yc / zc * focal;
-        double s = Math.max(0.5, Math.min(1.25, focal / zc * WORLD_W / W));
-        double ox = scx - W * s / 2.0, oy = scy - H * s / 2.0;
+        double tsc = Math.max(0.5, Math.min(1.25, focal / zc * WORLD_W / W));
+        double tox = scx - W * tsc / 2.0, toy = scy - H * tsc / 2.0;
+
+        // на экране: пока чат открыт — панель стоит намертво (можно спокойно кликать),
+        // иначе мягко догоняет цель
+        if (!screenInit) {
+            sox = tox; soy = toy; ss = tsc;
+            screenInit = true;
+        } else if (chatOpen) {
+            settle = 0.4; // экран держим на месте
+        } else if (settle > 0) {
+            // сразу после закрытия чата плавно возвращаемся к живой позиции, без скачка
+            settle -= dt;
+            double a = 1.0 - Math.exp(-dt * 12.0);
+            sox += (tox - sox) * a;
+            soy += (toy - soy) * a;
+            ss += (tsc - ss) * a;
+        } else {
+            sox = tox; soy = toy; ss = tsc; // обычный режим: никакого дополнительного «плавания»
+        }
+        double s = ss;
+        double ox = chatOpen ? Math.round(sox) : sox;
+        double oy = chatOpen ? Math.round(soy) : soy;
         if (ox > sw || oy > sh || ox + W * s < 0 || oy + H * s < 0) return;
 
-        // мышь (курсор виден только при открытом чате)
-        chatOpen = mc.currentScreen instanceof ChatScreen;
-        boolean down = false;
-        double mxs = 0, mys = 0;
-        if (chatOpen) {
-            long handle = mc.getWindow().getHandle();
-            down = GLFW.glfwGetMouseButton(handle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
-            mxs = mc.mouse.getX() * sw / mc.getWindow().getWidth();
-            mys = mc.mouse.getY() * sh / mc.getWindow().getHeight();
-        }
-        clicked = chatOpen && down && !prevDown;
-        prevDown = down;
         lmx = (mxs - ox) / s;
         lmy = (mys - oy) / s;
+        overPanel = chatOpen && lmx >= 0 && lmx < W && lmy >= 0 && lmy < H;
+        int steps = (int) wheelAcc;
+        wheelAcc -= steps;
+        wheelSteps = overPanel ? steps : 0;
+        if (!overPanel) wheelAcc = 0;
 
         g = ctx;
         tr = mc.textRenderer;
@@ -152,38 +246,44 @@ public final class PanelRenderer {
 
     private static void drawSidebar() {
         g.fill(4, 4, 80, 150, PANEL);
-        text("Медиатека", 10, 9, WHITE, 52);
+        text("Медиатека", 10, 9, WHITE, 66);
 
         List<SpotifyClient.Playlist> pls = sp.playlists();
-        int maxScroll = Math.max(0, pls.size() - 6);
-        sideScroll = Math.max(0, Math.min(sideScroll, maxScroll));
-        if (arrow(64, 11, true)) sideScroll = Math.max(0, sideScroll - 1);
-        if (arrow(72, 11, false)) sideScroll = Math.min(maxScroll, sideScroll + 1);
-
         if (pls.isEmpty()) {
             String err = sp.playlistsError();
-            text(err.isEmpty() ? "Загрузка…" : err, 10, 26, GRAY, 66);
-            if (!err.isEmpty()) text("Повтор… (" + sp.playlistFails() + ")", 10, 140, DIM, 66);
+            if (err.isEmpty()) {
+                text("Загрузка…", 10, 26, GRAY, 66);
+            } else {
+                wrapped(err, 10, 26, 66, 10, ERR);
+                text("Повтор… (" + sp.playlistFails() + ")", 10, 140, DIM, 66);
+            }
             return;
         }
-        for (int i = 0; i < 6; i++) {
+
+        final int vis = 6;
+        int maxScroll = Math.max(0, pls.size() - vis);
+        if (wheelSteps != 0 && hit(4, 4, 76, 146)) sideScroll -= wheelSteps * 2;
+        sideScroll = Math.max(0, Math.min(sideScroll, maxScroll));
+        sideScroll = scrollbar(77, 24, 120, pls.size(), vis, sideScroll, D_SIDE);
+
+        for (int i = 0; i < vis; i++) {
             int idx = sideScroll + i;
             if (idx >= pls.size()) break;
             SpotifyClient.Playlist p = pls.get(idx);
             int y = 24 + i * 20;
             boolean sel = p.id().equals(selected);
-            boolean hov = hit(6, y, 72, 19);
-            if (sel) g.fill(6, y, 78, y + 19, ROW_SEL);
-            else if (hov) g.fill(6, y, 78, y + 19, ROW_HOVER);
+            boolean hov = hit(6, y, 70, 19);
+            if (sel) g.fill(6, y, 76, y + 19, ROW_SEL);
+            else if (hov) g.fill(6, y, 76, y + 19, ROW_HOVER);
 
-            int[] cm = sp.mosaic(p.coverUrl(), 6);
-            if (cm != null) drawMosaic(cm, 6, 7, y + 1, true);
+            int[] img = sp.pixels(p.coverUrl(), 9); // 64x64 -> 9x9 клеток по 2px = 18px
+            if (img != null) drawImage(img, 9, 7, y + 1, 2);
             else g.fill(7, y + 1, 25, y + 19, 0xFF282828);
 
             text(p.name(), 28, y + 2, sel ? GREEN : WHITE, 48);
             text(p.total() + " тр.", 28, y + 11, GRAY, 48);
 
-            if (click(6, y, 72, 19)) {
+            if (click(6, y, 70, 19)) {
                 selected = p.id();
                 trackScroll = 0;
                 sp.requestItems(p.id(), true);
@@ -213,12 +313,13 @@ public final class PanelRenderer {
         }
 
         // шапка с градиентом из цвета обложки
-        int[] cm = sp.mosaic(cur.coverUrl(), 12);
-        int base = cm != null ? darken(avgColor(cm), 0.55f) : 0xFF1B3B4A;
+        int[] avg = sp.pixels(cur.coverUrl(), 4);
+        int[] img = sp.pixels(cur.coverUrl(), 36);
+        int base = avg != null ? darken(avgColor(avg), 0.55f) : 0xFF1B3B4A;
         for (int k = 0; k < 20; k++) {
             g.fill(84, 4 + k * 3, 296, 7 + k * 3, mix(base, PANEL, k / 19f));
         }
-        if (cm != null) drawMosaic(cm, 12, 92, 12, false);
+        if (img != null) drawImage(img, 36, 92, 12, 1);
         else g.fill(92, 12, 128, 48, 0xFF282828);
 
         text("Плейлист", 134, 14, 0xFFE0E0E0, 158);
@@ -239,13 +340,17 @@ public final class PanelRenderer {
         text("#", 94, 69, DIM, 10);
         text("Название", 106, 69, DIM, 90);
         text("Исполнитель", 202, 69, DIM, 60);
-        g.fill(88, 79, 292, 80, 0xFF2A2A2A);
+        g.fill(88, 79, 290, 80, 0xFF2A2A2A);
 
         List<SpotifyClient.Item> its = sp.items(cur.id());
         if (its == null) {
             String err = sp.itemError(cur.id());
-            text(err.isEmpty() ? "Загрузка треков…" : err, 94, 92, GRAY, 196);
-            if (err.isEmpty()) sp.requestItems(cur.id(), false);
+            if (err.isEmpty()) {
+                text("Загрузка треков…", 94, 92, GRAY, 190);
+                sp.requestItems(cur.id(), false);
+            } else {
+                wrapped(err, 94, 90, 190, 6, WARN);
+            }
             return;
         }
         if (its.isEmpty()) {
@@ -253,30 +358,31 @@ public final class PanelRenderer {
             return;
         }
 
-        int maxScroll = Math.max(0, its.size() - 5);
+        final int vis = 5;
+        int maxScroll = Math.max(0, its.size() - vis);
+        if (wheelSteps != 0 && hit(84, 4, 212, 146)) trackScroll -= wheelSteps * 2;
         trackScroll = Math.max(0, Math.min(trackScroll, maxScroll));
-        if (arrow(272, 70, true)) trackScroll = Math.max(0, trackScroll - 1);
-        if (arrow(282, 70, false)) trackScroll = Math.min(maxScroll, trackScroll + 1);
+        trackScroll = scrollbar(291, 82, 60, its.size(), vis, trackScroll, D_TRACK);
 
         String playingUri = s.track() != null ? s.track().uri() : "";
-        for (int r = 0; r < 5; r++) {
+        for (int r = 0; r < vis; r++) {
             int idx = trackScroll + r;
             if (idx >= its.size()) break;
             SpotifyClient.Item it = its.get(idx);
             int ry = 82 + r * 12;
-            boolean hov = hit(88, ry, 204, 12);
+            boolean hov = hit(88, ry, 201, 12);
             boolean isCur = !playingUri.isEmpty() && playingUri.equals(it.uri());
-            if (hov) g.fill(88, ry, 292, ry + 12, ROW_HOVER);
+            if (hov) g.fill(88, ry, 289, ry + 12, ROW_HOVER);
 
             if (hov) tri(93, ry + 2, 93, ry + 9, 99, ry + 5.5f, WHITE);
             else text(String.valueOf(idx + 1), 94, ry + 2, isCur ? GREEN : GRAY, 12);
 
             text(it.title(), 106, ry + 2, isCur ? GREEN : WHITE, 92);
-            text(it.artists(), 202, ry + 2, GRAY, 62);
+            text(it.artists(), 202, ry + 2, GRAY, 58);
             String d = fmt(it.durationMs());
-            g.drawText(tr, d, 291 - tr.getWidth(d), ry + 2, GRAY, false);
+            g.drawText(tr, d, 288 - tr.getWidth(d), ry + 2, GRAY, false);
 
-            if (click(88, ry, 204, 12)) {
+            if (click(88, ry, 201, 12)) {
                 sp.playContext(cur.uri(), it.uri(), SpotifyPanelMod::say);
             }
         }
@@ -289,37 +395,37 @@ public final class PanelRenderer {
         SpotifyClient.Track t = s.track();
 
         if (s.status() == SpotifyClient.Status.ACTIVE && t != null) {
-            int[] cm = sp.mosaic(t.coverUrl(), 8);
-            if (cm != null) drawMosaic(cm, 8, 8, 158, false);
+            int[] img = sp.pixels(t.coverUrl(), 12); // 12 клеток по 2px = 24px
+            if (img != null) drawImage(img, 12, 8, 158, 2);
             else g.fill(8, 158, 32, 182, 0xFF282828);
             text(t.title(), 36, 159, WHITE, 60);
             text(t.artists(), 36, 170, GRAY, 60);
         } else if (s.status() == SpotifyClient.Status.ERROR) {
-            text(s.error(), 8, 162, 0xFFFF6B6B, 86);
+            wrapped(s.error(), 8, 158, 86, 3, ERR);
         } else {
             text("Ничего не играет", 8, 162, GRAY, 86);
             text("Включи трек в Spotify", 8, 173, DIM, 86);
         }
 
-        // --- кнопки управления
+        // --- кнопки управления (зоны клика 16x16 встык, промахнуться сложно)
         int cy = 163;
 
         // shuffle
         boolean sh = s.shuffle();
-        boolean hs = hit(127, cy - 6, 12, 12);
+        boolean hs = hit(125, cy - 8, 16, 16);
         int cs = sh ? GREEN : (hs ? WHITE : GRAY);
         for (int i = 0; i < 8; i++) {
             g.fill(129 + i, cy - 4 + i, 130 + i, cy - 3 + i, cs);
             g.fill(129 + i, cy + 3 - i, 130 + i, cy + 4 - i, cs);
         }
-        if (click(127, cy - 6, 12, 12)) sp.shuffle(!sh, SpotifyPanelMod::say);
+        if (click(125, cy - 8, 16, 16)) sp.shuffle(!sh, SpotifyPanelMod::say);
 
         // previous
-        boolean hp = hit(143, cy - 6, 12, 12);
+        boolean hp = hit(141, cy - 8, 16, 16);
         int cp = hp ? WHITE : GRAY;
         g.fill(144, cy - 4, 146, cy + 4, cp);
         tri(153, cy - 4, 153, cy + 4, 146, cy, cp);
-        if (click(143, cy - 6, 12, 12)) sp.previous(SpotifyPanelMod::say);
+        if (click(141, cy - 8, 16, 16)) sp.previous(SpotifyPanelMod::say);
 
         // play / pause
         boolean hpl = hit(157, cy - 8, 16, 16);
@@ -333,54 +439,75 @@ public final class PanelRenderer {
         if (click(157, cy - 8, 16, 16)) sp.togglePlay(SpotifyPanelMod::say);
 
         // next
-        boolean hn = hit(175, cy - 6, 12, 12);
+        boolean hn = hit(173, cy - 8, 16, 16);
         int cn = hn ? WHITE : GRAY;
         tri(177, cy - 4, 177, cy + 4, 184, cy, cn);
         g.fill(184, cy - 4, 186, cy + 4, cn);
-        if (click(175, cy - 6, 12, 12)) sp.next(SpotifyPanelMod::say);
+        if (click(173, cy - 8, 16, 16)) sp.next(SpotifyPanelMod::say);
 
         // repeat
         String rep = s.repeat();
         boolean on = !"off".equals(rep);
-        boolean hr = hit(191, cy - 6, 12, 12);
+        boolean hr = hit(189, cy - 8, 16, 16);
         int cr = on ? GREEN : (hr ? WHITE : GRAY);
         g.fill(192, cy - 3, 201, cy - 2, cr);
         g.fill(192, cy + 2, 201, cy + 3, cr);
         g.fill(192, cy - 3, 193, cy + 3, cr);
         g.fill(200, cy - 3, 201, cy + 3, cr);
         if ("track".equals(rep)) g.fill(195, cy - 1, 198, cy + 1, cr);
-        if (click(191, cy - 6, 12, 12)) {
+        if (click(189, cy - 8, 16, 16)) {
             String nextMode = "off".equals(rep) ? "context" : ("context".equals(rep) ? "track" : "off");
             sp.repeat(nextMode, SpotifyPanelMod::say);
         }
 
-        // --- прогресс
+        // --- прогресс: клик перематывает, зажал и тянешь — перемотка применится, когда отпустишь
         long dur = t != null ? t.durationMs() : 0;
-        long pos = s.currentProgress();
         int bx = 124, bw = 84, by = 176;
-        boolean hb = hit(bx - 2, by - 4, bw + 4, 12);
+        boolean hb = hit(bx - 3, by - 5, bw + 6, 14);
+        if (click(bx - 3, by - 5, bw + 6, 14) && dur > 0) drag = D_SEEK;
+        long pos = s.currentProgress();
+        boolean seeking = drag == D_SEEK && dur > 0;
+        if (seeking) {
+            double f = Math.max(0, Math.min(1, (lmx - bx) / bw));
+            seekTarget = (long) (f * dur);
+            pos = seekTarget;
+            if (released) sp.seek(seekTarget, SpotifyPanelMod::say);
+        }
         g.fill(bx, by, bx + bw, by + 4, BAR_BG);
         int fw = dur > 0 ? (int) (bw * pos / dur) : 0;
-        g.fill(bx, by, bx + fw, by + 4, hb ? GREEN : WHITE);
-        if (hb) circle(bx + fw, by + 2, 3, WHITE);
+        g.fill(bx, by, bx + fw, by + 4, (hb || seeking) ? GREEN : WHITE);
+        if (hb || seeking) circle(bx + fw, by + 2, 3, WHITE);
         text(fmt(pos), 98, 174, GRAY, 24);
         text(fmt(dur), 212, 174, GRAY, 24);
-        if (click(bx - 2, by - 4, bw + 4, 12) && dur > 0) {
-            double f = Math.max(0, Math.min(1, (lmx - bx) / bw));
-            sp.seek((long) (f * dur), SpotifyPanelMod::say);
-        }
 
-        // --- громкость
+        // --- громкость: тянется мышью, колесом над блоком — шаг 5%
         int vx = 252, vw = 40, vy = 163;
         g.fill(238, 161, 241, 166, GRAY);
         tri(241, 163.5f, 246, 159, 246, 168, GRAY);
-        boolean hv = hit(vx - 2, vy - 4, vw + 4, 12);
-        g.fill(vx, vy, vx + vw, vy + 4, BAR_BG);
-        g.fill(vx, vy, vx + vw * Math.max(0, Math.min(100, s.volume())) / 100, vy + 4, hv ? GREEN : WHITE);
-        if (click(vx - 2, vy - 4, vw + 4, 12)) {
-            double f = Math.max(0, Math.min(1, (lmx - vx) / vw));
-            sp.volume((int) Math.round(f * 100), SpotifyPanelMod::say);
+        boolean hv = hit(vx - 3, vy - 5, vw + 6, 14);
+        if (click(vx - 3, vy - 5, vw + 6, 14)) {
+            drag = D_VOL;
+            lastSentVol = -1;
+            lastVolSend = 0;
         }
+        int vol = Math.max(0, Math.min(100, s.volume()));
+        if (drag == D_VOL) {
+            int nv = (int) Math.round(Math.max(0, Math.min(1, (lmx - vx) / vw)) * 100);
+            long nowMs = System.currentTimeMillis();
+            if (nv != lastSentVol && (released || nowMs - lastVolSend >= 100)) {
+                sp.volume(nv, SpotifyPanelMod::say);
+                lastSentVol = nv;
+                lastVolSend = nowMs;
+            }
+            vol = nv;
+        }
+        if (wheelSteps != 0 && hit(232, 152, 64, 36)) {
+            vol = Math.max(0, Math.min(100, vol + wheelSteps * 5));
+            sp.volume(vol, SpotifyPanelMod::say);
+        }
+        g.fill(vx, vy, vx + vw, vy + 4, BAR_BG);
+        g.fill(vx, vy, vx + vw * vol / 100, vy + 4, (hv || drag == D_VOL) ? GREEN : WHITE);
+        if (hv || drag == D_VOL) circle(vx + vw * vol / 100, vy + 2, 3, WHITE);
     }
 
     // ================================================================ ввод
@@ -397,30 +524,40 @@ public final class PanelRenderer {
         return false;
     }
 
-    private static boolean arrow(int x, int y, boolean up) {
-        boolean hov = hit(x - 2, y - 2, 10, 8);
-        int c = hov ? WHITE : DIM;
-        if (up) tri(x + 3, y, x, y + 4, x + 6, y + 4, c);
-        else tri(x, y, x + 6, y, x + 3, y + 4, c);
-        return click(x - 2, y - 2, 10, 8);
+    /** Вертикальный скроллбар: тащится мышью, клик по полосе — ползунок прыгает туда. Возвращает новую позицию. */
+    private static int scrollbar(int x, int y, int h, int total, int vis, int scroll, int id) {
+        if (total <= vis) return scroll;
+        int max = total - vis;
+        int th = Math.max(8, h * vis / total);
+        if (click(x - 3, y, 8, h)) {
+            drag = id;
+            int ty0 = y + (h - th) * scroll / max;
+            dragOff = (lmy >= ty0 && lmy < ty0 + th) ? lmy - ty0 : th / 2.0;
+        }
+        if (drag == id) {
+            double f = (lmy - dragOff - y) / (double) (h - th);
+            scroll = (int) Math.round(Math.max(0, Math.min(1, f)) * max);
+        }
+        int ty = y + (h - th) * scroll / max;
+        boolean hov = hit(x - 3, y, 8, h);
+        g.fill(x, y, x + 3, y + h, 0xFF1C1C1C);
+        g.fill(x, ty, x + 3, ty + th, (drag == id || hov) ? GRAY : 0xFF5A5A5A);
+        return scroll;
     }
 
     // =============================================================== рисование
 
-    private static void drawMosaic(int[] m, int grid, int x, int y, boolean flat) {
-        for (int cy = 0; cy < grid; cy++) {
-            for (int cx = 0; cx < grid; cx++) {
-                int i = (cy * grid + cx) * 2;
-                int lo = m[i], hi = m[i + 1];
-                int px0 = x + cx * 3, py0 = y + cy * 3;
-                if (flat) {
-                    g.fill(px0, py0, px0 + 3, py0 + 3, mix(lo, hi, 0.5f));
-                } else {
-                    for (int dy = 0; dy < 3; dy++) {
-                        g.fill(px0, py0 + dy, px0 + dy + 1, py0 + dy + 1, lo);
-                        if (dy + 1 < 3) g.fill(px0 + dy + 1, py0 + dy, px0 + 3, py0 + dy + 1, hi);
-                    }
-                }
+    /** Картинка n x n, каждая клетка — cell x cell пикселей. Подряд идущие одинаковые цвета склеиваются в один fill. */
+    private static void drawImage(int[] img, int n, int x, int y, int cell) {
+        for (int j = 0; j < n; j++) {
+            int row = j * n;
+            int a = 0;
+            while (a < n) {
+                int c = img[row + a];
+                int b = a + 1;
+                while (b < n && img[row + b] == c) b++;
+                g.fill(x + a * cell, y + j * cell, x + b * cell, y + (j + 1) * cell, c);
+                a = b;
             }
         }
     }
@@ -463,6 +600,50 @@ public final class PanelRenderer {
 
     private static void text(String s, int x, int y, int color, int maxW) {
         g.drawText(tr, fit(s, maxW), x, y, color, false);
+    }
+
+    /** Текст с переносом по словам (длинные слова режутся). Лишние строки отбрасываются с «…». */
+    private static void wrapped(String s, int x, int y, int maxW, int maxLines, int color) {
+        List<String> lines = wrap(s, maxW, maxLines);
+        for (int i = 0; i < lines.size(); i++) {
+            g.drawText(tr, lines.get(i), x, y + i * 10, color, false);
+        }
+    }
+
+    private static List<String> wrap(String s, int maxW, int maxLines) {
+        if (s == null) s = "";
+        String key = maxW + "|" + maxLines + "|" + s;
+        if (key.equals(wrapKey)) return wrapVal;
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String word : s.split(" ")) {
+            String t = cur.length() == 0 ? word : cur + " " + word;
+            if (tr.getWidth(t) <= maxW) {
+                cur.setLength(0);
+                cur.append(t);
+                continue;
+            }
+            if (cur.length() > 0) {
+                out.add(cur.toString());
+                cur.setLength(0);
+            }
+            while (tr.getWidth(word) > maxW) {
+                String part = tr.trimToWidth(word, maxW);
+                if (part.isEmpty()) break;
+                out.add(part);
+                word = word.substring(part.length());
+            }
+            cur.append(word);
+        }
+        if (cur.length() > 0) out.add(cur.toString());
+        if (out.size() > maxLines) {
+            List<String> cut = new ArrayList<>(out.subList(0, maxLines));
+            cut.set(maxLines - 1, fit(cut.get(maxLines - 1) + "…", maxW));
+            out = cut;
+        }
+        wrapKey = key;
+        wrapVal = out;
+        return out;
     }
 
     private static String fit(String s, int maxW) {
