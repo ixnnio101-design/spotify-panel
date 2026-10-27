@@ -36,6 +36,9 @@ public final class SpotifyAuth {
     private final Config config;
     private final SecureRandom random = new SecureRandom();
 
+    private volatile int loginGen = 0;
+    private volatile ServerSocket loginSocket;
+
     private volatile String accessToken;
     private volatile long expiresAtMs;
 
@@ -133,11 +136,25 @@ public final class SpotifyAuth {
         q.put("state", state);
         q.put("code_challenge_method", "S256");
         q.put("code_challenge", challenge);
+        q.put("show_dialog", "true"); // заново запросить права, чтобы плейлисты точно были разрешены
         String url = "https://accounts.spotify.com/authorize?" + encode(q);
+
+        // закрыть предыдущую незавершённую попытку входа, она держит порт
+        final int myGen = ++loginGen;
+        ServerSocket prev = loginSocket;
+        if (prev != null) {
+            try { prev.close(); } catch (IOException ignored) {}
+            Thread.sleep(1200);
+        }
 
         try (ServerSocket ss = new ServerSocket()) {
             ss.setReuseAddress(true);
-            ss.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), PORT));
+            try {
+                ss.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), PORT));
+            } catch (java.net.BindException e) {
+                throw new IOException("порт " + PORT + " занят другой программой. Закрой её (или перезапусти Minecraft) и повтори /spotify login");
+            }
+            loginSocket = ss;
             ss.setSoTimeout(1000);
 
             MinecraftClient mc = MinecraftClient.getInstance();
@@ -161,6 +178,9 @@ public final class SpotifyAuth {
                     s = ss.accept();
                 } catch (SocketTimeoutException e) {
                     continue;
+                } catch (java.net.SocketException e) {
+                    if (myGen != loginGen) return; // вытеснены новой попыткой входа
+                    throw e;
                 }
                 try (s) {
                     s.setSoTimeout(5000);
@@ -193,7 +213,8 @@ public final class SpotifyAuth {
             form.put("client_id", config.clientId);
             form.put("code_verifier", verifier);
             applyTokens(tokenRequest(form));
-            say.accept("Spotify подключён!");
+            say.accept("Spotify подключён! Загружаю плейлисты…");
+            if (SpotifyPanelMod.spotify != null) SpotifyPanelMod.spotify.reloadPlaylists();
         }
     }
 

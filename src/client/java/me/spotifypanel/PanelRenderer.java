@@ -163,6 +163,7 @@ public final class PanelRenderer {
         if (pls.isEmpty()) {
             String err = sp.playlistsError();
             text(err.isEmpty() ? "Загрузка…" : err, 10, 26, GRAY, 66);
+            if (!err.isEmpty()) text("Повтор… (" + sp.playlistFails() + ")", 10, 140, DIM, 66);
             return;
         }
         for (int i = 0; i < 6; i++) {

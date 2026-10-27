@@ -69,7 +69,10 @@ public final class SpotifyClient {
     // плейлисты и треки
     private volatile List<Playlist> playlists = List.of();
     private volatile String playlistsError = "";
-    private volatile long lastPlaylistTry = 0;
+    private volatile long nextPlaylistTry = 0;
+    private volatile long retryAfterMs = 0;
+    private volatile int playlistFails = 0;
+    private final java.util.concurrent.atomic.AtomicBoolean playlistsLoading = new java.util.concurrent.atomic.AtomicBoolean();
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
@@ -131,11 +134,7 @@ public final class SpotifyClient {
             }
 
             long now = System.currentTimeMillis();
-            long every = playlists.isEmpty() ? 8_000 : 120_000;
-            if (now - lastPlaylistTry > every) {
-                lastPlaylistTry = now;
-                exec.submit(this::loadPlaylists);
-            }
+            if (now >= nextPlaylistTry) tryLoadPlaylists();
 
             HttpResponse<String> r = send("GET", "/me/player", null);
             int sc = r.statusCode();
@@ -238,8 +237,42 @@ public final class SpotifyClient {
 
     /** Сбросить таймер и сразу перезагрузить список (после add/remove плейлиста). */
     public void reloadPlaylists() {
-        lastPlaylistTry = System.currentTimeMillis();
-        exec.submit(this::loadPlaylists);
+        nextPlaylistTry = 0;
+        tryLoadPlaylists();
+    }
+
+    public int playlistFails() { return playlistFails; }
+
+    /** Один запуск загрузки за раз. Неудача — повтор через 3 с (или Retry-After при 429), успех — обновление раз в 2 минуты. */
+    private void tryLoadPlaylists() {
+        if (!playlistsLoading.compareAndSet(false, true)) return;
+        nextPlaylistTry = Long.MAX_VALUE; // пока идёт запрос, новых не стартуем
+        exec.submit(() -> {
+            retryAfterMs = 0;
+            try {
+                loadPlaylists();
+            } finally {
+                long now = System.currentTimeMillis();
+                if (playlistsError.isEmpty()) {
+                    playlistFails = 0;
+                    nextPlaylistTry = now + 120_000;
+                } else {
+                    playlistFails++;
+                    nextPlaylistTry = now + Math.max(3_000, retryAfterMs);
+                }
+                playlistsLoading.set(false);
+            }
+        });
+    }
+
+    private static String apiMessage(String body) {
+        try {
+            JsonObject o = JsonParser.parseString(body).getAsJsonObject();
+            if (o.has("error") && o.get("error").isJsonObject()) return str(o.getAsJsonObject("error"), "message");
+            if (o.has("error_description")) return str(o, "error_description");
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 
     private Playlist parsePlaylist(JsonObject p) {
@@ -262,12 +295,27 @@ public final class SpotifyClient {
         try {
             HttpResponse<String> r = send("GET", "/me/playlists?limit=50", null);
             int sc = r.statusCode();
-            if (sc == 401 || sc == 403) {
-                playlistsError = "Нужен повторный вход: /spotify login";
-                return;
-            }
             if (sc != 200) {
-                playlistsError = "Плейлисты: HTTP " + sc;
+                String msg = apiMessage(r.body());
+                String full;
+                if (sc == 429) {
+                    String ra = r.headers().firstValue("Retry-After").orElse("5");
+                    try { retryAfterMs = Long.parseLong(ra.trim()) * 1000L; } catch (NumberFormatException e) { retryAfterMs = 5_000; }
+                    full = "Spotify просит подождать (429), повтор автоматически…";
+                } else if (sc == 401) {
+                    full = "Токен не принят, войди заново: /spotify login";
+                    auth.invalidate();
+                } else if (sc == 403) {
+                    full = "403 от Spotify: " + (msg.isEmpty() ? "нет доступа" : msg)
+                            + ". Скорее всего: твой аккаунт не добавлен в User Management приложения на developer.spotify.com, или нужен /spotify logout + /spotify login (обновить права).";
+                } else {
+                    full = "Плейлисты: HTTP " + sc + (msg.isEmpty() ? "" : " " + msg);
+                }
+                if (!full.equals(playlistsError)) {
+                    LOG.warn("playlists failed: HTTP {} {}", sc, r.body());
+                    SpotifyPanelMod.say(full);
+                }
+                playlistsError = full;
                 return;
             }
             JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
