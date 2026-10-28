@@ -44,8 +44,8 @@ public final class PanelRenderer {
     private static final int ERR = 0xFFFF6B6B;
 
     /** Размер клетки обложки в пикселях панели: 1 = максимум чёткости, 2 = вчетверо меньше прямоугольников (если просядет FPS). */
-    private static final int CELL_HEAD = 2;  // большая обложка 64x64: 1 = каждый пиксель отдельно (чётче, но тяжелее)
-    private static final int CELL_SMALL = 2; // маленькие 32x32 (сайдбар и плеер)
+    private static final int CELL_HEAD = 1;  // большая обложка 64x64: 1 = каждый пиксель отдельно (чётче, но тяжелее)
+    private static final int CELL_SMALL = 1; // маленькие 32x32 (сайдбар и плеер)
     private static final boolean SHADOW = true; // тень у текста — читается намного лучше
 
     // что сейчас тащит мышь
@@ -53,15 +53,15 @@ public final class PanelRenderer {
 
     // позиция панели в мире (с плавным догоном)
     private static boolean init;
-    private static double px, py, pz;
-    private static double bx, by, bz, syaw; // сглаженные положение и поворот тела
+    private static double px, pz;
+    private static double bx, bz, syaw; // сглаженные положение и поворот тела
     private static long lastNs;
 
     // позиция панели на экране (держим на месте, пока открыт чат — иначе по ней не попасть)
     private static boolean screenInit;
     private static final double[] cur = new double[6]; // экранная матрица панели: начало, ось X, ось Y
     private static double settle, fovMul = 1.0;
-    private static double camX, camY, camZ, cfx, cfy, cfz, crx, crz, cux, cuy, cuz, cfocal, csw, csh;
+    private static double cfx, cfz, crx, crz, cux, cuz, cfocal, csw, csh;
 
     // состояние интерфейса
     private static String selected = "";
