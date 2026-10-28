@@ -22,6 +22,7 @@ public class SpotifyPanelMod implements ClientModInitializer {
         spotify.start();
 
         SpotifyCommands.register();
+        WorldPanel.register();
         HudElementRegistry.attachElementBefore(VanillaHudElements.CHAT, Identifier.of(ID, "panel"), PanelRenderer::render);
     }
 

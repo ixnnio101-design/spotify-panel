@@ -92,6 +92,7 @@ public final class PanelRenderer {
     // =================================================================== кадр
 
     public static void render(DrawContext ctx, RenderTickCounter tick) {
+        if (WorldPanel.ENABLED) return; // этап 3D: плоский HUD временно отключён
         released = false;
         try {
             draw(ctx, tick);
