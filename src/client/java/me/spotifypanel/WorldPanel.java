@@ -144,6 +144,8 @@ public final class WorldPanel {
                 MAIN_FACE_W, MAIN_FACE_H, MAIN_BODY_D / 2.0 + 0.005);
 
         // Each playlist is a separate miniature 3D object, all rendered from one reusable layout/texture template.
+        // IMPORTANT: drawTexturedPlane switches RenderLayers, which may flush the solid buffer. Reacquire
+        // the solid consumer for every miniature panel instead of using a stale VertexConsumer.
         for (int i = 0; i < playlists.size(); i++) {
             int col = i % MINI_COLUMNS;
             int row = i / MINI_COLUMNS;
@@ -152,9 +154,10 @@ public final class WorldPanel {
             double miniZ = cz + wz * xOffset;
             double miniY = centerY - MAIN_BODY_H / 2.0 - MINI_GAP - MINI_BODY_H / 2.0
                     - row * (MINI_BODY_H + MINI_GAP);
-            drawBox(solid, matrix, miniX, miniY, miniZ, wx, wz, nx, nz,
+            VertexConsumer miniSolid = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(SOLID_TEXTURE_ID));
+            drawBox(miniSolid, matrix, miniX, miniY, miniZ, wx, wz, nx, nz,
                     MINI_BODY_W, MINI_BODY_H, MINI_BODY_D, 0xFF07110B, 0xFF11251A);
-            drawSolidPlane(solid, matrix, miniX, miniY, miniZ, wx, wz, nx, nz,
+            drawSolidPlane(miniSolid, matrix, miniX, miniY, miniZ, wx, wz, nx, nz,
                     MINI_BODY_W - 0.014, MINI_BODY_H - 0.014, MINI_BODY_D / 2.0 + 0.001, 0xFF169C46);
             drawTexturedPlane(context, matrices, playlistTextureId(i), miniX, miniY, miniZ, wx, wz, nx, nz,
                     MINI_FACE_W, MINI_FACE_H, MINI_BODY_D / 2.0 + 0.004);
