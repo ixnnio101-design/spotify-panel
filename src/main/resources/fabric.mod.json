@@ -3,7 +3,7 @@
 	"id": "spotify-panel",
 	"version": "${version}",
 	"name": "Spotify Panel",
-	"description": "Low-poly Spotify panel on the HUD with playback control via commands.",
+	"description": "3D world-space Spotify hologram with dynamic album and playlist textures.",
 	"authors": [
 		"Me!"
 	],
