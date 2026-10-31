@@ -71,7 +71,11 @@ public final class SpotifyClient {
         }
     }
 
-    public record Item(String title, String artists, long durationMs, String uri) {}
+    public record Item(String title, String artists, long durationMs, String uri, String albumUri) {
+        public Item(String title, String artists, long durationMs, String uri) {
+            this(title, artists, durationMs, uri, "");
+        }
+    }
 
     public record Snapshot(Status status, boolean playing, Track track, long progressMs, long fetchedAtMs,
                            String device, int volume, boolean shuffle, String repeat, String error) {
@@ -126,6 +130,9 @@ public final class SpotifyClient {
     private final Object pollLock = new Object();
     private final AtomicBoolean pollPending = new AtomicBoolean();
     private final AtomicInteger pendingVolume = new AtomicInteger(-1);
+    private final AtomicBoolean volumeFlushScheduled = new AtomicBoolean();
+    private volatile long lastVolumeRequestAtMs;
+    private static final long MIN_VOLUME_REQUEST_INTERVAL_MS = 240;
     /** До этого момента ответы опроса игнорируются: на экране то, что игрок только что нажал (без «отскока»). */
     private volatile long ignorePollUntil = 0;
     private volatile long lastLocalAt = 0;
@@ -509,7 +516,16 @@ public final class SpotifyClient {
     private static Item parseTrackItem(JsonObject item) {
         String uri = str(item, "uri");
         if (uri.isEmpty()) return null;
-        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri);
+        String albumUri = "";
+        if (item.has("album") && item.get("album").isJsonObject()) {
+            JsonObject album = item.getAsJsonObject("album");
+            albumUri = str(album, "uri");
+            if (albumUri.isEmpty()) {
+                String albumId = str(album, "id");
+                if (!albumId.isEmpty()) albumUri = "spotify:album:" + albumId;
+            }
+        }
+        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri, albumUri);
     }
 
     private void loadLibrary() {
@@ -747,9 +763,11 @@ public final class SpotifyClient {
                 err.accept("Сначала загружаю содержимое коллекции — нажми ещё раз через секунду.");
                 return;
             }
-            List<String> uris = loaded.stream().map(Item::uri).filter(u -> u != null && !u.isEmpty()).limit(100).toList();
-            if (uris.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
-            playUris(uris, err);
+            if (loaded.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
+            // Liked Songs is not a Spotify playback context. On some desktop clients,
+            // a bare `uris` playback request may clear the current player. Start the
+            // chosen saved track through its album context and exact track offset instead.
+            playTrackFromAlbum(loaded.get(0), err);
             return;
         }
         // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
@@ -772,7 +790,18 @@ public final class SpotifyClient {
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
+            case "saved_tracks" -> playTrackFromAlbum(item, err);
             default -> playUris(List.of(item.uri()), err);
+        }
+    }
+
+    private void playTrackFromAlbum(Item item, Consumer<String> err) {
+        if (item == null || item.uri().isEmpty()) return;
+        if (item.albumUri() != null && !item.albumUri().isEmpty()) {
+            playContext(item.albumUri(), item.uri(), err);
+        } else {
+            // Fallback for an incomplete API response. Most track objects include album.uri.
+            playUris(List.of(item.uri()), err);
         }
     }
 
@@ -940,15 +969,38 @@ public final class SpotifyClient {
 
     public void previous(Consumer<String> err) { control("POST", "/me/player/previous", null, err); }
 
-    /** Можно вызывать хоть каждый кадр при перетаскивании: лишние значения склеиваются, уходит последнее. */
+    /**
+     * Update the visible value immediately, but coalesce rapid slider movements into
+     * at most one in-flight volume command plus one latest pending value. This prevents
+     * a long queue of stale Spotify requests while the player drags the slider.
+     */
     public void volume(int percent, Consumer<String> err) {
         int v = Math.max(0, Math.min(100, percent));
         local(s -> s.withVolume(v), 1500);
         pendingVolume.set(v);
-        ctl.submit(() -> {
-            int p = pendingVolume.getAndSet(-1);
-            if (p >= 0) doControl("PUT", "/me/player/volume?volume_percent=" + p, null, err);
-        });
+        scheduleVolumeFlush(err);
+    }
+
+    private void scheduleVolumeFlush(Consumer<String> err) {
+        if (!volumeFlushScheduled.compareAndSet(false, true)) return;
+        long elapsed = System.currentTimeMillis() - lastVolumeRequestAtMs;
+        long delay = Math.max(0, MIN_VOLUME_REQUEST_INTERVAL_MS - elapsed);
+        exec.schedule(() -> ctl.submit(() -> flushPendingVolume(err)), delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void flushPendingVolume(Consumer<String> err) {
+        try {
+            int value = pendingVolume.getAndSet(-1);
+            if (value >= 0) {
+                lastVolumeRequestAtMs = System.currentTimeMillis();
+                doControl("PUT", "/me/player/volume?volume_percent=" + value, null, err);
+            }
+        } finally {
+            volumeFlushScheduled.set(false);
+            // If the user kept dragging while the previous HTTP request was running,
+            // send only the newest value after the minimum interval.
+            if (pendingVolume.get() >= 0) scheduleVolumeFlush(err);
+        }
     }
 
     public void seek(long ms, Consumer<String> err) {

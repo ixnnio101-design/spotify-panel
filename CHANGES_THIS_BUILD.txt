@@ -1,0 +1,18 @@
+Changes in this build
+
+- Added a restrained half-pixel visual style: large text is rasterized on a half-resolution glyph grid and enlarged with nearest-neighbour sampling; small labels keep finer, non-antialiased strokes so Cyrillic remains readable.
+- Replaced rounded UI panels and controls with square surfaces, stepped corner frames, rectangular sliders, pixel-shaped play controls, and a cover-colour header gradient rendered in horizontal colour bands.
+- Updated the panel material texture to a low-contrast 4x4-pixel grain so surfaces have a subtle pixel texture without competing with album artwork or text.
+- Album and playlist cover art stays high-resolution; only typography and UI decoration use the pixel treatment.
+- Kept the previous world-space positioning, one-block forward anchor, single-pass flat Blockbench geometry, dynamic Spotify text/cover overlay, and left-mouse drag controls for volume and seeking.
+
+Build command on Windows: gradlew.bat build
+Minecraft target: 1.21.11 / Fabric
+
+
+Playback and input responsiveness fixes
+
+- Volume dragging now updates the local slider immediately and coalesces Spotify requests: at most one request is in flight, with only the latest drag value kept pending. This prevents a backlog of stale volume commands.
+- The world-space overlay refreshes at a faster interval while a slider is being dragged, so the visible knob/bar follows the cursor more closely without repainting the full texture every frame.
+- Clicking a library entry in the left column now only selects/opens it; it no longer automatically starts playback. This avoids accidentally sending a bulk playback command when opening Liked Songs.
+- Clicking a song inside Liked Songs now starts that song with its album as the playback context and the song as the offset. This avoids the bare-URI playback path that can make Spotify Desktop clear playback on some recent clients.
