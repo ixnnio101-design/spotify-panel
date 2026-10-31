@@ -32,7 +32,7 @@ import java.util.function.Consumer;
 import java.util.function.IntBinaryOperator;
 import java.util.function.UnaryOperator;
 
-/** Spotify Web API: состояние плеера, плейлисты, треки, обложки и команды управления. */
+/** Spotify Web API: состояние плеера, медиатека разных типов, треки, обложки и команды управления. */
 public final class SpotifyClient {
     private static final Logger LOG = LoggerFactory.getLogger("spotifypanel");
     private static final int RAW = 256; // обложка хранится как 256x256, из неё считаются картинки любого размера
@@ -42,6 +42,34 @@ public final class SpotifyClient {
     public record Track(String title, String artists, String coverUrl, long durationMs, String uri) {}
 
     public record Playlist(String id, String name, String owner, int total, String coverUrl, String uri) {}
+
+    /** Единый элемент медиатеки: плейлист, альбом, артист, коллекция треков, подкаст или аудиокнига. */
+    public record LibraryEntry(String id, String name, String owner, int total, String coverUrl, String uri, String kind) {
+        public String key() { return "playlist".equals(kind) ? id : kind + ":" + id; }
+        public String kindLabel() {
+            return switch (kind) {
+                case "playlist" -> "ПЛЕЙЛИСТ";
+                case "album" -> "АЛЬБОМ";
+                case "artist" -> "ИСПОЛНИТЕЛЬ";
+                case "saved_tracks" -> "ЛЮБИМЫЕ ТРЕКИ";
+                case "show" -> "ПОДКАСТ";
+                case "saved_episodes" -> "СОХРАНЁННЫЕ ЭПИЗОДЫ";
+                case "audiobook" -> "АУДИОКНИГА";
+                default -> "МЕДИАТЕКА";
+            };
+        }
+        public String iconMark() {
+            return switch (kind) {
+                case "playlist" -> "≡";
+                case "album" -> "▣";
+                case "artist" -> "♪";
+                case "saved_tracks" -> "♥";
+                case "show", "saved_episodes" -> "◖";
+                case "audiobook" -> "▤";
+                default -> "•";
+            };
+        }
+    }
 
     public record Item(String title, String artists, long durationMs, String uri) {}
 
@@ -105,7 +133,9 @@ public final class SpotifyClient {
     private volatile Snapshot snapshot = Snapshot.of(Status.LOGGED_OUT);
 
     // плейлисты и треки
+    // playlists() оставлен для старого HUD-кода; WorldPanel использует общую library().
     private volatile List<Playlist> playlists = List.of();
+    private volatile List<LibraryEntry> library = List.of();
     private volatile String playlistsError = "";
     private volatile long nextPlaylistTry = 0;
     private volatile long retryAfterMs = 0;
@@ -119,6 +149,7 @@ public final class SpotifyClient {
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
     private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
+    private final Map<String, Integer> coverAccents = new ConcurrentHashMap<>();
     private final Set<String> coverLoading = ConcurrentHashMap.newKeySet();
     private final Set<String> coverFailed = ConcurrentHashMap.newKeySet();
 
@@ -134,11 +165,19 @@ public final class SpotifyClient {
 
     public List<Playlist> playlists() { return playlists; }
 
+    public List<LibraryEntry> library() { return library; }
+
     public String playlistsError() { return playlistsError; }
 
-    public List<Item> items(String playlistId) { return items.get(playlistId); }
+    public String libraryError() { return playlistsError; }
 
-    public String itemError(String playlistId) { return itemErrors.getOrDefault(playlistId, ""); }
+    public List<Item> items(String key) { return items.get(key); }
+
+    public List<Item> items(LibraryEntry entry) { return entry == null ? null : items.get(entry.key()); }
+
+    public String itemError(String key) { return itemErrors.getOrDefault(key, ""); }
+
+    public String itemError(LibraryEntry entry) { return entry == null ? "" : itemErrors.getOrDefault(entry.key(), ""); }
 
     // ------------------------------------------------------------- HTTP
 
@@ -298,9 +337,9 @@ public final class SpotifyClient {
         return e != null && !e.isJsonNull() && e.getAsBoolean();
     }
 
-    // ---------------------------------------------------------- playlists
+    // ---------------------------------------------------------- Spotify library
 
-    /** Сбросить таймер и сразу перезагрузить список (после add/remove плейлиста). */
+    /** Перезагрузить все разделы медиатеки после авторизации или изменения списка. */
     public void reloadPlaylists() {
         nextPlaylistTry = 0;
         tryLoadPlaylists();
@@ -308,14 +347,13 @@ public final class SpotifyClient {
 
     public int playlistFails() { return playlistFails; }
 
-    /** Один запуск загрузки за раз. Неудача — повтор через 3 с (или Retry-After при 429), успех — обновление раз в 2 минуты. */
     private void tryLoadPlaylists() {
         if (!playlistsLoading.compareAndSet(false, true)) return;
-        nextPlaylistTry = Long.MAX_VALUE; // пока идёт запрос, новых не стартуем
+        nextPlaylistTry = Long.MAX_VALUE;
         exec.submit(() -> {
             retryAfterMs = 0;
             try {
-                loadPlaylists();
+                loadLibrary();
             } finally {
                 long now = System.currentTimeMillis();
                 if (playlistsError.isEmpty()) {
@@ -323,7 +361,7 @@ public final class SpotifyClient {
                     nextPlaylistTry = now + 120_000;
                 } else {
                     playlistFails++;
-                    nextPlaylistTry = now + Math.max(3_000, retryAfterMs);
+                    nextPlaylistTry = now + Math.max(60_000, retryAfterMs);
                 }
                 playlistsLoading.set(false);
             }
@@ -335,171 +373,407 @@ public final class SpotifyClient {
             JsonObject o = JsonParser.parseString(body).getAsJsonObject();
             if (o.has("error") && o.get("error").isJsonObject()) return str(o.getAsJsonObject("error"), "message");
             if (o.has("error_description")) return str(o, "error_description");
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         return "";
+    }
+
+    private record PageData(List<JsonObject> objects, int total) {}
+
+    /** Offset pagination used by Spotify's saved albums/tracks/shows/episodes/audiobooks endpoints. */
+    private PageData fetchOffsetPages(String endpoint) throws Exception {
+        List<JsonObject> out = new ArrayList<>();
+        int offset = 0;
+        int total = 0;
+        boolean first = true;
+        while (offset < 1000) {
+            String separator = endpoint.contains("?") ? "&" : "?";
+            HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
+            if (r.statusCode() != 200) {
+                if (r.statusCode() == 429) {
+                    String ra = r.headers().firstValue("Retry-After").orElse("5");
+                    try { retryAfterMs = Math.max(retryAfterMs, Long.parseLong(ra.trim()) * 1000L); }
+                    catch (NumberFormatException ignored) { retryAfterMs = Math.max(retryAfterMs, 5_000); }
+                }
+                if (r.statusCode() == 401) auth.invalidate();
+                throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
+            }
+            JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
+            if (first) { total = (int) lng(page, "total"); first = false; }
+            JsonArray arr = page.has("items") && page.get("items").isJsonArray() ? page.getAsJsonArray("items") : new JsonArray();
+            int got = 0;
+            for (JsonElement el : arr) {
+                got++;
+                if (el.isJsonObject()) out.add(el.getAsJsonObject());
+            }
+            boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
+            if (!hasNext || got == 0) break;
+            offset += got;
+        }
+        return new PageData(out, total);
+    }
+
+    private PageData fetchFollowedArtists() throws Exception {
+        List<JsonObject> out = new ArrayList<>();
+        String after = "";
+        int total = 0;
+        boolean first = true;
+        while (out.size() < 1000) {
+            String path = "/me/following?type=artist&limit=50" + (after.isEmpty() ? "" : "&after=" + after);
+            HttpResponse<String> r = send("GET", path, null);
+            if (r.statusCode() != 200) {
+                if (r.statusCode() == 429) {
+                    String ra = r.headers().firstValue("Retry-After").orElse("5");
+                    try { retryAfterMs = Math.max(retryAfterMs, Long.parseLong(ra.trim()) * 1000L); }
+                    catch (NumberFormatException ignored) { retryAfterMs = Math.max(retryAfterMs, 5_000); }
+                }
+                if (r.statusCode() == 401) auth.invalidate();
+                throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
+            }
+            JsonObject root = JsonParser.parseString(r.body()).getAsJsonObject();
+            JsonObject artists = root.has("artists") && root.get("artists").isJsonObject() ? root.getAsJsonObject("artists") : new JsonObject();
+            if (first) { total = (int) lng(artists, "total"); first = false; }
+            JsonArray arr = artists.has("items") && artists.get("items").isJsonArray() ? artists.getAsJsonArray("items") : new JsonArray();
+            int got = 0;
+            for (JsonElement el : arr) { got++; if (el.isJsonObject()) out.add(el.getAsJsonObject()); }
+            JsonObject cursors = artists.has("cursors") && artists.get("cursors").isJsonObject() ? artists.getAsJsonObject("cursors") : new JsonObject();
+            String nextAfter = str(cursors, "after");
+            if (got == 0 || nextAfter.isEmpty() || nextAfter.equals(after)) break;
+            after = nextAfter;
+        }
+        return new PageData(out, total);
     }
 
     private Playlist parsePlaylist(JsonObject p) {
         String id = str(p, "id");
         if (id.isEmpty()) return null;
         String owner = "";
-        if (p.has("owner") && p.get("owner").isJsonObject()) {
-            owner = str(p.getAsJsonObject("owner"), "display_name");
-        }
+        if (p.has("owner") && p.get("owner").isJsonObject()) owner = str(p.getAsJsonObject("owner"), "display_name");
         int total = 0;
-        if (p.has("items") && p.get("items").isJsonObject()) {
-            total = (int) lng(p.getAsJsonObject("items"), "total");
-        } else if (p.has("tracks") && p.get("tracks").isJsonObject()) {
-            total = (int) lng(p.getAsJsonObject("tracks"), "total");
-        }
+        if (p.has("items") && p.get("items").isJsonObject()) total = (int) lng(p.getAsJsonObject("items"), "total");
+        else if (p.has("tracks") && p.get("tracks").isJsonObject()) total = (int) lng(p.getAsJsonObject("tracks"), "total");
         return new Playlist(id, str(p, "name"), owner, total, bestImage(p), "spotify:playlist:" + id);
     }
 
-    private void playlistsFailed(HttpResponse<String> r) {
-        int sc = r.statusCode();
-        String msg = apiMessage(r.body());
-        String full;
-        if (sc == 429) {
-            String ra = r.headers().firstValue("Retry-After").orElse("5");
-            try { retryAfterMs = Long.parseLong(ra.trim()) * 1000L; } catch (NumberFormatException e) { retryAfterMs = 5_000; }
-            full = "Spotify просит подождать (429), повтор автоматически…";
-        } else if (sc == 401) {
-            full = "Токен не принят, войди заново: /spotify login";
-            auth.invalidate();
-        } else if (sc == 403) {
-            full = "403 от Spotify: " + (msg.isEmpty() ? "нет доступа" : msg)
-                    + ". Скорее всего: твой аккаунт не добавлен в User Management приложения на developer.spotify.com, или нужен /spotify logout + /spotify login (обновить права).";
-        } else {
-            full = "Плейлисты: HTTP " + sc + (msg.isEmpty() ? "" : " " + msg);
-        }
-        if (!full.equals(playlistsError)) {
-            LOG.warn("playlists failed: HTTP {} {}", sc, r.body());
-            SpotifyPanelMod.say(full);
-        }
-        playlistsError = full;
+    private static LibraryEntry asEntry(Playlist p) {
+        return new LibraryEntry(p.id(), p.name(), p.owner(), p.total(), p.coverUrl(), p.uri(), "playlist");
     }
 
-    /** Грузит ВСЕ плейлисты пользователя страницами по 50 (раньше брались только первые 50). */
-    private void loadPlaylists() {
+    private static JsonObject nested(JsonObject wrapper, String key) {
+        return wrapper.has(key) && wrapper.get(key).isJsonObject() ? wrapper.getAsJsonObject(key) : wrapper;
+    }
+
+    private static LibraryEntry albumEntry(JsonObject album) {
+        String id = str(album, "id");
+        if (id.isEmpty()) return null;
+        String uri = str(album, "uri");
+        if (uri.isEmpty()) uri = "spotify:album:" + id;
+        return new LibraryEntry(id, str(album, "name"), artistsOf(album),
+                (int) lng(album, "total_tracks"), bestImage(album), uri, "album");
+    }
+
+    private static LibraryEntry artistEntry(JsonObject artist) {
+        String id = str(artist, "id");
+        if (id.isEmpty()) return null;
+        String uri = str(artist, "uri");
+        if (uri.isEmpty()) uri = "spotify:artist:" + id;
+        return new LibraryEntry(id, str(artist, "name"), "Исполнитель", 0, bestImage(artist), uri, "artist");
+    }
+
+    private static LibraryEntry showEntry(JsonObject show) {
+        String id = str(show, "id");
+        if (id.isEmpty()) return null;
+        String uri = str(show, "uri");
+        if (uri.isEmpty()) uri = "spotify:show:" + id;
+        return new LibraryEntry(id, str(show, "name"), "Подкаст",
+                (int) lng(show, "total_episodes"), bestImage(show), uri, "show");
+    }
+
+    private static LibraryEntry audiobookEntry(JsonObject book) {
+        String id = str(book, "id");
+        if (id.isEmpty()) return null;
+        String uri = str(book, "uri");
+        if (uri.isEmpty()) uri = "spotify:audiobook:" + id;
+        String author = "";
+        if (book.has("authors") && book.get("authors").isJsonArray()) {
+            for (JsonElement el : book.getAsJsonArray("authors")) {
+                if (el.isJsonObject()) {
+                    if (!author.isEmpty()) author += ", ";
+                    author += str(el.getAsJsonObject(), "name");
+                }
+            }
+        }
+        return new LibraryEntry(id, str(book, "name"), author,
+                (int) lng(book, "total_chapters"), bestImage(book), uri, "audiobook");
+    }
+
+    private static Item parseTrackItem(JsonObject item) {
+        String uri = str(item, "uri");
+        if (uri.isEmpty()) return null;
+        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri);
+    }
+
+    private void loadLibrary() {
+        List<LibraryEntry> previousLibrary = library;
+        List<LibraryEntry> all = new ArrayList<>();
+        List<Playlist> playlistOnly = new ArrayList<>();
+        List<String> errors = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+
+        // Regular and private/collaborative playlists.
         try {
-            List<Playlist> out = new ArrayList<>();
-            Set<String> seen = new HashSet<>();
-            int offset = 0;
-            int apiTotal = -1;
-            while (offset < 10_000) {
-                HttpResponse<String> r = send("GET", "/me/playlists?limit=50&offset=" + offset, null);
-                if (r.statusCode() != 200) {
-                    playlistsFailed(r);
-                    return;
+            PageData page = fetchOffsetPages("/me/playlists");
+            for (JsonObject obj : page.objects()) {
+                Playlist p = parsePlaylist(obj);
+                if (p != null && seen.add("playlist:" + p.id())) {
+                    playlistOnly.add(p);
+                    all.add(asEntry(p));
                 }
-                JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
-                int got = 0;
-                if (apiTotal < 0) apiTotal = (int) lng(o, "total");
-                if (o.has("items") && o.get("items").isJsonArray()) {
-                    for (JsonElement el : o.getAsJsonArray("items")) {
-                        got++;
-                        if (!el.isJsonObject()) continue;
-                        Playlist pl = parsePlaylist(el.getAsJsonObject());
-                        if (pl != null && seen.add(pl.id())) out.add(pl);
-                    }
-                }
-                boolean hasNext = o.has("next") && !o.get("next").isJsonNull();
-                if (!hasNext || got == 0) break;
-                offset += got;
             }
+        } catch (Exception e) { errors.add("плейлисты: " + errText(e)); }
 
-            // плейлисты, добавленные по ссылке
-            for (String id : new ArrayList<>(SpotifyPanelMod.config.extraPlaylists)) {
-                if (!seen.add(id)) continue;
-                Playlist pl = null;
-                try {
-                    HttpResponse<String> pr = send("GET", "/playlists/" + id, null);
-                    if (pr.statusCode() == 200) {
-                        pl = parsePlaylist(JsonParser.parseString(pr.body()).getAsJsonObject());
-                    }
-                } catch (Exception ignored) {
-                }
-                // метаданные недоступны (403/404/сеть) — всё равно оставляем, играть по URI можно
-                if (pl == null) pl = new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())), "", 0, "", "spotify:playlist:" + id);
-                out.add(pl);
+        // Saved albums.
+        try {
+            PageData page = fetchOffsetPages("/me/albums");
+            for (JsonObject wrapper : page.objects()) {
+                LibraryEntry entry = albumEntry(nested(wrapper, "album"));
+                if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-            int before = playlists.size();
-            playlists = out;
-            playlistsError = "";
-            if (before != out.size()) {
-                SpotifyPanelMod.say("Плейлистов в панели: " + out.size() + " (Spotify вернул " + apiTotal
-                        + " в твоей медиатеке; Liked Songs, подкасты и сборники самого Spotify API не отдаёт)");
+        } catch (Exception e) { errors.add("альбомы: " + errText(e)); }
+
+        // Followed artists (cursor pagination rather than offset pagination).
+        try {
+            PageData page = fetchFollowedArtists();
+            for (JsonObject obj : page.objects()) {
+                LibraryEntry entry = artistEntry(obj);
+                if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-        } catch (Exception e) {
-            playlistsError = "Плейлисты: " + errText(e);
+        } catch (Exception e) { errors.add("исполнители: " + errText(e)); }
+
+        // Liked songs are a synthetic collection backed by /me/tracks.
+        try {
+            PageData page = fetchOffsetPages("/me/tracks");
+            List<Item> liked = new ArrayList<>();
+            String cover = "";
+            for (JsonObject wrapper : page.objects()) {
+                JsonObject track = nested(wrapper, "track");
+                Item item = parseTrackItem(track);
+                if (item != null) liked.add(item);
+                if (cover.isEmpty() && track.has("album") && track.get("album").isJsonObject()) cover = bestImage(track.getAsJsonObject("album"));
+            }
+            String key = "saved_tracks:liked";
+            items.put(key, liked);
+            itemsTime.put(key, System.currentTimeMillis());
+            all.add(new LibraryEntry("liked", "Любимые треки", "Твоя медиатека", page.total(), cover, "", "saved_tracks"));
+        } catch (Exception e) { errors.add("любимые треки: " + errText(e)); }
+
+        // Saved podcast shows.
+        try {
+            PageData page = fetchOffsetPages("/me/shows");
+            for (JsonObject wrapper : page.objects()) {
+                LibraryEntry entry = showEntry(nested(wrapper, "show"));
+                if (entry != null && seen.add(entry.key())) all.add(entry);
+            }
+        } catch (Exception e) { errors.add("подкасты: " + errText(e)); }
+
+        // Saved episodes as a single collection.
+        try {
+            PageData page = fetchOffsetPages("/me/episodes");
+            List<Item> savedEpisodes = new ArrayList<>();
+            String cover = "";
+            for (JsonObject wrapper : page.objects()) {
+                JsonObject episode = nested(wrapper, "episode");
+                String uri = str(episode, "uri");
+                if (uri.isEmpty()) continue;
+                String showName = episode.has("show") && episode.get("show").isJsonObject()
+                        ? str(episode.getAsJsonObject("show"), "name") : "Подкаст";
+                savedEpisodes.add(new Item(str(episode, "name"), showName, lng(episode, "duration_ms"), uri));
+                if (cover.isEmpty() && episode.has("images")) cover = bestImage(episode);
+                if (cover.isEmpty() && episode.has("show") && episode.get("show").isJsonObject()) cover = bestImage(episode.getAsJsonObject("show"));
+            }
+            String key = "saved_episodes:episodes";
+            items.put(key, savedEpisodes);
+            itemsTime.put(key, System.currentTimeMillis());
+            all.add(new LibraryEntry("episodes", "Сохранённые эпизоды", "Твоя медиатека", page.total(), cover, "", "saved_episodes"));
+        } catch (Exception e) { errors.add("эпизоды: " + errText(e)); }
+
+        // Audiobooks.
+        try {
+            PageData page = fetchOffsetPages("/me/audiobooks");
+            for (JsonObject wrapper : page.objects()) {
+                LibraryEntry entry = audiobookEntry(nested(wrapper, "audiobook"));
+                if (entry != null && seen.add(entry.key())) all.add(entry);
+            }
+        } catch (Exception e) { errors.add("аудиокниги: " + errText(e)); }
+
+        // Extra playlists manually added by Spotify URL.
+        for (String id : new ArrayList<>(SpotifyPanelMod.config.extraPlaylists)) {
+            if (!seen.add("playlist:" + id)) continue;
+            Playlist p = null;
+            try {
+                HttpResponse<String> r = send("GET", "/playlists/" + id, null);
+                if (r.statusCode() == 200) p = parsePlaylist(JsonParser.parseString(r.body()).getAsJsonObject());
+            } catch (Exception ignored) {}
+            if (p == null) p = new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())), "", 0, "", "spotify:playlist:" + id);
+            playlistOnly.add(p);
+            all.add(asEntry(p));
+        }
+
+        playlists = List.copyOf(playlistOnly);
+        String newError = errors.isEmpty() ? "" : "Часть медиатеки недоступна: " + String.join("; ", errors);
+        if (!newError.equals(playlistsError)) {
+            if (!newError.isEmpty()) LOG.warn("Spotify library partially unavailable: {}", newError);
+            playlistsError = newError;
+            if (!newError.isEmpty()) SpotifyPanelMod.say(newError + ". Проверь права /spotify login; доступные разделы всё равно показаны.");
+        }
+        // Keep the special "Liked Songs" collection at the top, then show the user's
+        // playlists, albums, followed artists, podcasts, saved episodes and audiobooks.
+        all.sort((a, b) -> Integer.compare(libraryOrder(a.kind()), libraryOrder(b.kind())));
+        library = List.copyOf(all);
+        if (!all.isEmpty() || errors.isEmpty()) {
+            if (previousLibrary.isEmpty() || previousLibrary.size() != all.size()
+                    || !previousLibrary.stream().map(LibraryEntry::key).toList().equals(all.stream().map(LibraryEntry::key).toList())) {
+                SpotifyPanelMod.say("Медиатека обновлена: " + all.size() + " элементов — любимые треки, плейлисты, альбомы, исполнители, подкасты и аудиокниги.");
+            }
         }
     }
 
-    /** Достать ID плейлиста из ссылки open.spotify.com, spotify:playlist:... или голого ID. null — не похоже. */
-    public static String parsePlaylistId(String input) {
-        if (input == null) return null;
-        String v = input.trim();
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("(?:playlist[/:])([A-Za-z0-9]{10,40})").matcher(v);
-        if (m.find()) return m.group(1);
-        if (v.matches("[A-Za-z0-9]{22}")) return v;
-        return null;
+    private static int libraryOrder(String kind) {
+        return switch (kind) {
+            case "saved_tracks" -> 0;
+            case "playlist" -> 1;
+            case "album" -> 2;
+            case "artist" -> 3;
+            case "show" -> 4;
+            case "saved_episodes" -> 5;
+            case "audiobook" -> 6;
+            default -> 7;
+        };
     }
+
+    /** Прочитать ID из Spotify URL/URI с указанным типом. */
+    public static String parseSpotifyId(String input, String type) {
+        if (input == null || type == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?:" + java.util.regex.Pattern.quote(type) + "[/:])([A-Za-z0-9]{10,40})").matcher(input.trim());
+        return m.find() ? m.group(1) : null;
+    }
+
+    /** Сохраняем старый helper для существующей команды добавления плейлистов. */
+    public static String parsePlaylistId(String input) { return parseSpotifyId(input, "playlist"); }
 
     public void requestItems(String playlistId, boolean force) {
+        requestItems(new LibraryEntry(playlistId, "", "", 0, "", "spotify:playlist:" + playlistId, "playlist"), force);
+    }
+
+    public void requestItems(LibraryEntry entry, boolean force) {
+        if (entry == null || "saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) return;
+        String key = entry.key();
         long now = System.currentTimeMillis();
-        Long t = itemsTime.get(playlistId);
+        Long t = itemsTime.get(key);
         if (!force && t != null && now - t < 60_000) return;
-        if (!itemsLoading.add(playlistId)) return;
+        if (!itemsLoading.add(key)) return;
         exec.submit(() -> {
             try {
                 List<Item> out = new ArrayList<>();
                 int offset = 0;
-                while (offset < 3000) {
-                    HttpResponse<String> r = send("GET", "/playlists/" + playlistId + "/items?limit=50&offset=" + offset, null);
-                    int sc = r.statusCode();
-                    if (sc != 200) {
-                        if (offset > 0) break; // часть треков уже есть — показываем что успели
-                        if (sc == 403 || sc == 404) {
-                            itemErrors.put(playlistId, "Spotify не отдаёт список треков (403/404): в Development mode чужие плейлисты не читаются. Кнопка ▶ всё равно играет плейлист.");
-                            itemsTime.put(playlistId, System.currentTimeMillis());
-                        } else {
-                            itemErrors.put(playlistId, "Треки: HTTP " + sc);
-                        }
-                        return;
+                while (offset < 1000) {
+                    String endpoint;
+                    switch (entry.kind()) {
+                        case "playlist" -> endpoint = "/playlists/" + entry.id() + "/items";
+                        case "album" -> endpoint = "/albums/" + entry.id() + "/tracks";
+                        case "artist" -> endpoint = "/artists/" + entry.id() + "/albums?include_groups=album,single,compilation";
+                        case "show" -> endpoint = "/shows/" + entry.id() + "/episodes";
+                        case "audiobook" -> endpoint = "/audiobooks/" + entry.id() + "/chapters";
+                        default -> { itemErrors.put(key, "Для этого раздела список элементов не поддерживается."); return; }
                     }
-                    JsonObject o = JsonParser.parseString(r.body()).getAsJsonObject();
+                    String separator = endpoint.contains("?") ? "&" : "?";
+                    HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
+                    if (r.statusCode() != 200) {
+                        if (offset == 0) {
+                            String detail = apiMessage(r.body());
+                            itemErrors.put(key, "Не удалось загрузить содержимое: HTTP " + r.statusCode() + (detail.isEmpty() ? "" : " — " + detail));
+                        }
+                        break;
+                    }
+                    JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
+                    JsonArray arr = page.has("items") && page.get("items").isJsonArray() ? page.getAsJsonArray("items") : new JsonArray();
                     int got = 0;
-                    if (o.has("items") && o.get("items").isJsonArray()) {
-                        for (JsonElement el : o.getAsJsonArray("items")) {
-                            got++;
-                            if (!el.isJsonObject()) continue;
-                            JsonObject entry = el.getAsJsonObject();
-                            JsonElement inner = entry.get("item");
-                            if (inner == null || inner.isJsonNull()) inner = entry.get("track");
-                            if (inner == null || !inner.isJsonObject()) continue;
-                            JsonObject tr = inner.getAsJsonObject();
-                            String uri = str(tr, "uri");
-                            if (uri.isEmpty()) continue;
-                            out.add(new Item(str(tr, "name"), artistsOf(tr), lng(tr, "duration_ms"), uri));
+                    for (JsonElement el : arr) {
+                        got++;
+                        if (!el.isJsonObject()) continue;
+                        JsonObject wrapper = el.getAsJsonObject();
+                        JsonObject obj = switch (entry.kind()) {
+                            case "playlist" -> nested(wrapper, "item").equals(wrapper) ? nested(wrapper, "track") : nested(wrapper, "item");
+                            case "show" -> nested(wrapper, "episode");
+                            default -> wrapper;
+                        };
+                        String uri = str(obj, "uri");
+                        if (uri.isEmpty()) continue;
+                        if ("artist".equals(entry.kind())) {
+                            out.add(new Item(str(obj, "name"), artistsOf(obj), 0, uri));
+                        } else if ("show".equals(entry.kind())) {
+                            String showName = entry.name();
+                            out.add(new Item(str(obj, "name"), showName, lng(obj, "duration_ms"), uri));
+                        } else if ("audiobook".equals(entry.kind())) {
+                            out.add(new Item(str(obj, "name"), entry.owner(), lng(obj, "duration_ms"), uri));
+                        } else {
+                            Item item = parseTrackItem(obj);
+                            if (item != null) out.add(item);
                         }
                     }
-                    items.put(playlistId, new ArrayList<>(out)); // список появляется постепенно
-                    itemErrors.remove(playlistId);
-                    boolean hasNext = o.has("next") && !o.get("next").isJsonNull();
+                    items.put(key, new ArrayList<>(out));
+                    itemErrors.remove(key);
+                    boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
                     if (!hasNext || got == 0) break;
                     offset += got;
                 }
-                items.put(playlistId, out);
-                itemErrors.remove(playlistId);
-                itemsTime.put(playlistId, System.currentTimeMillis());
+                items.put(key, out);
+                itemErrors.remove(key);
+                itemsTime.put(key, System.currentTimeMillis());
             } catch (Exception e) {
-                itemErrors.put(playlistId, "Треки: " + errText(e));
+                itemErrors.put(key, "Содержимое: " + errText(e));
             } finally {
-                itemsLoading.remove(playlistId);
+                itemsLoading.remove(key);
             }
         });
+    }
+
+    /** Запустить контекст медиатеки или конкретную строку. */
+    public void playLibraryEntry(LibraryEntry entry, Consumer<String> err) {
+        if (entry == null) return;
+        if ("saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) {
+            List<Item> loaded = items(entry);
+            if (loaded == null) {
+                err.accept("Сначала загружаю содержимое коллекции — нажми ещё раз через секунду.");
+                return;
+            }
+            List<String> uris = loaded.stream().map(Item::uri).filter(u -> u != null && !u.isEmpty()).limit(100).toList();
+            if (uris.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
+            playUris(uris, err);
+            return;
+        }
+        // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
+        // but not for show/audiobook objects. For those, play the first loaded episode/chapter.
+        if ("show".equals(entry.kind()) || "audiobook".equals(entry.kind())) {
+            List<Item> loaded = items(entry);
+            if (loaded == null) {
+                err.accept("Загружаю эпизоды/главы. Нажми на обложку ещё раз через секунду.");
+                return;
+            }
+            if (loaded.isEmpty()) { err.accept("В этом разделе пока нет доступных эпизодов или глав."); return; }
+            playLibraryItem(entry, loaded.get(0), err);
+            return;
+        }
+        if (!entry.uri().isEmpty()) playContext(entry.uri(), "", err);
+    }
+
+    public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
+        if (entry == null || item == null || item.uri().isEmpty()) return;
+        switch (entry.kind()) {
+            case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
+            case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
+            default -> playUris(List.of(item.uri()), err);
+        }
     }
 
     // ------------------------------------------------------------- covers
@@ -522,6 +796,59 @@ public final class SpotifyClient {
         return m;
     }
 
+    /** Returns an artwork-derived accent color for the selected library header. */
+    public int coverAccentColor(String url) {
+        if (url == null || url.isBlank()) return 0xFF52635B;
+        Integer cached = coverAccents.get(url);
+        if (cached != null) return cached;
+        // Also starts the asynchronous artwork download if the cover is not cached yet.
+        pixels(url, 8);
+        int[] raw = rawCache.get(url);
+        if (raw == null) return 0xFF52635B;
+        int accent = extractAccentColor(raw);
+        coverAccents.put(url, accent);
+        return accent;
+    }
+
+    private static int extractAccentColor(int[] pixels) {
+        long allR = 0, allG = 0, allB = 0, allCount = 0;
+        double r = 0, g = 0, b = 0, weightSum = 0;
+        // Sample every fourth pixel. Saturated mid-range pixels get more weight than
+        // white borders, black shadows and nearly-neutral artwork.
+        for (int y = 0; y < RAW; y += 4) {
+            for (int x = 0; x < RAW; x += 4) {
+                int c = pixels[y * RAW + x];
+                int cr = (c >>> 16) & 255;
+                int cg = (c >>> 8) & 255;
+                int cb = c & 255;
+                allR += cr; allG += cg; allB += cb; allCount++;
+
+                int max = Math.max(cr, Math.max(cg, cb));
+                int min = Math.min(cr, Math.min(cg, cb));
+                double saturation = max == 0 ? 0 : (max - min) / (double) max;
+                double luminance = (0.2126 * cr + 0.7152 * cg + 0.0722 * cb) / 255.0;
+                double visibility = 0.30 + 0.70 * (1.0 - Math.abs(luminance - 0.52) / 0.52);
+                double weight = (0.18 + saturation * 2.2) * Math.max(0.20, visibility);
+                if (luminance < 0.035 || luminance > 0.97) weight *= 0.22;
+                r += cr * weight; g += cg * weight; b += cb * weight; weightSum += weight;
+            }
+        }
+        if (weightSum < 1 || allCount == 0) return 0xFF52635B;
+        int rr = (int) Math.round(r / weightSum);
+        int gg = (int) Math.round(g / weightSum);
+        int bb = (int) Math.round(b / weightSum);
+        // If the image is almost entirely monochrome, keep its neutral character.
+        double saturation = Math.max(rr, Math.max(gg, bb)) == 0 ? 0
+                : (Math.max(rr, Math.max(gg, bb)) - Math.min(rr, Math.min(gg, bb)))
+                / (double) Math.max(rr, Math.max(gg, bb));
+        if (saturation < 0.10) {
+            rr = (int) (allR / allCount);
+            gg = (int) (allG / allCount);
+            bb = (int) (allB / allCount);
+        }
+        return 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+    }
+
     private void loadRaw(String url) {
         try {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
@@ -531,6 +858,7 @@ public final class SpotifyClient {
             if (raw == null) raw = decodeNative(r.body());
             if (raw != null) {
                 rawCache.put(url, raw);
+                coverAccents.put(url, extractAccentColor(raw));
             } else {
                 coverFailed.add(url);
             }
@@ -648,6 +976,16 @@ public final class SpotifyClient {
             off.addProperty("uri", trackUri);
             body.add("offset", off);
         }
+        control("PUT", "/me/player/play", body.toString(), err);
+    }
+
+    /** Запускает отдельные сохранённые треки/эпизоды через список URI (Spotify принимает до 100 URI). */
+    public void playUris(List<String> uris, Consumer<String> err) {
+        JsonArray array = new JsonArray();
+        if (uris != null) for (String uri : uris) if (uri != null && !uri.isEmpty() && array.size() < 100) array.add(uri);
+        if (array.isEmpty()) { err.accept("Нет доступных элементов для запуска."); return; }
+        JsonObject body = new JsonObject();
+        body.add("uris", array);
         control("PUT", "/me/player/play", body.toString(), err);
     }
 

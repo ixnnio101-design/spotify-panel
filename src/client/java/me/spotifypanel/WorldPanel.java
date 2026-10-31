@@ -17,6 +17,7 @@ import net.minecraft.client.texture.NativeImage;
 import net.minecraft.client.texture.NativeImageBackedTexture;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
@@ -57,8 +58,9 @@ public final class WorldPanel {
     private static final double MODEL_OVERLAY_X = -0.25;
     private static final double MODEL_CENTER_Y = 6.5;
 
-    private static final double SIDE = 1.10;
-    private static final double AHEAD = 1.60;
+    // Keep the hologram close to the upper torso instead of floating several blocks away.
+    private static final double SIDE = 0.92;
+    private static final double AHEAD = 0.95;
     private static final double TURN_DEG = 15.0;
     private static final int FULL_BRIGHT = LightmapTextureManager.MAX_LIGHT_COORDINATE;
 
@@ -68,12 +70,14 @@ public final class WorldPanel {
     private static long lastOverlayUpdateNs;
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
-    private static boolean init;
-    private static double bx, by, bz, syaw;
-    private static long lastNs;
     private static boolean wasLeftDown;
-    private static String selectedPlaylistId = "";
-    private static String lastRequestedPlaylistId = "";
+    private static final int DRAG_NONE = 0, DRAG_SEEK = 1, DRAG_VOLUME = 2;
+    private static int dragMode = DRAG_NONE;
+    private static long lastDragSendMs;
+    private static long lastDragSeekMs = -1;
+    private static int lastDragVolume = -1;
+    private static String selectedLibraryKey = "";
+    private static String lastRequestedLibraryKey = "";
     private static long lastItemsRequestNs;
     private static int sideScroll, trackScroll;
     private static volatile int scrollArea;
@@ -143,6 +147,7 @@ public final class WorldPanel {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!SpotifyPanelMod.config.visible || mc.player == null || mc.world == null) {
             wasLeftDown = false;
+            dragMode = DRAG_NONE;
             return;
         }
         MatrixStack matrices = context.matrices();
@@ -152,54 +157,44 @@ public final class WorldPanel {
         Vec3d cameraPos = context.worldState().cameraRenderState.pos;
         float tickDelta = mc.getRenderTickCounter().getTickProgress(false);
         hookScroll(mc.getWindow().getHandle());
+        // Interpolate the BODY yaw between ticks. Never use camera/head yaw here: turning
+        // the mouse alone must not swing the panel. Interpolation also avoids tick-to-tick jitter.
         Vec3d body = player.getLerpedPos(tickDelta);
-        double bodyYaw = player.getBodyYaw();
-
+        double bodyYaw = MathHelper.lerpAngleDegrees(tickDelta, player.prevBodyYaw, player.bodyYaw);
         long now = System.nanoTime();
-        double dt = init ? Math.min(0.1, Math.max(0.0, (now - lastNs) / 1e9)) : 1.0;
-        lastNs = now;
-        if (!init) {
-            syaw = bodyYaw;
-            init = true;
-        }
-        bx = body.x;
-        by = body.y;
-        bz = body.z;
-        double yawError = wrapDegrees(bodyYaw - syaw);
-        syaw += yawError * (1.0 - Math.exp(-dt * (35.0 + 0.5 * Math.abs(yawError))));
 
-        double bodyRad = Math.toRadians(syaw);
+        double bodyRad = Math.toRadians(bodyYaw);
         double fx = -Math.sin(bodyRad), fz = Math.cos(bodyRad);
         double rx = -Math.cos(bodyRad), rz = -Math.sin(bodyRad);
-        double cx = bx + fx * AHEAD + rx * SIDE;
-        double cz = bz + fz * AHEAD + rz * SIDE;
+        double cx = body.x + fx * AHEAD + rx * SIDE;
+        double cz = body.z + fz * AHEAD + rz * SIDE;
         double turn = Math.toRadians(TURN_DEG);
         double wx = rx * Math.cos(turn) - fx * Math.sin(turn);
         double wz = rz * Math.cos(turn) - fz * Math.sin(turn);
         double nx = -fx * Math.cos(turn) - rx * Math.sin(turn);
         double nz = -fz * Math.cos(turn) - rz * Math.sin(turn);
-        double centerY = by + 1.45;
+        double centerY = body.y + 1.28;
 
-        List<SpotifyClient.Playlist> playlists = SpotifyPanelMod.spotify.playlists();
-        SpotifyClient.Playlist selected = selectedPlaylist(playlists);
+        List<SpotifyClient.LibraryEntry> libraryEntries = SpotifyPanelMod.spotify.library();
+        SpotifyClient.LibraryEntry selected = selectedLibraryEntry(libraryEntries);
         updateScrollArea(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz);
-        applyWheel(playlists.size(), selected == null ? 0 : safeItemCount(selected.id()));
+        applyWheel(libraryEntries.size(), selected == null ? 0 : safeItemCount(selected.key()));
         List<SpotifyClient.Item> items = null;
         if (selected != null) {
-            if (!selected.id().equals(lastRequestedPlaylistId) || now - lastItemsRequestNs > 60_000_000_000L) {
-                lastRequestedPlaylistId = selected.id();
+            if (!selected.key().equals(lastRequestedLibraryKey) || now - lastItemsRequestNs > 60_000_000_000L) {
+                lastRequestedLibraryKey = selected.key();
                 lastItemsRequestNs = now;
-                SpotifyPanelMod.spotify.requestItems(selected.id(), false);
+                SpotifyPanelMod.spotify.requestItems(selected, false);
             }
-            items = SpotifyPanelMod.spotify.items(selected.id());
+            items = SpotifyPanelMod.spotify.items(selected.key());
         }
-        sideScroll = Math.min(sideScroll, Math.max(0, playlists.size() - 7));
+        sideScroll = Math.min(sideScroll, Math.max(0, libraryEntries.size() - 7));
         if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 7));
 
         ensureOverlayTexture(mc);
         if (now - lastOverlayUpdateNs >= 350_000_000L) {
             lastOverlayUpdateNs = now;
-            upload(overlayTexture, paintOverlay(SpotifyPanelMod.spotify.snapshot(), playlists, selected, items));
+            upload(overlayTexture, paintOverlay(SpotifyPanelMod.spotify.snapshot(), libraryEntries, selected, items));
         }
 
         matrices.push();
@@ -212,11 +207,11 @@ public final class WorldPanel {
         for (ModelPart part : MODEL_PARTS) {
             drawModelPart(material, matrix, cx, centerY, cz, wx, wz, nx, nz, part);
         }
-        // Reuse the playlist-icon plane for each visible playlist. Every icon remains flat;
+        // Reuse the library-icon plane for each visible library item. Every icon remains flat;
         // the only depth is the subtle layer offset from its original Blockbench X coordinate.
-        int visiblePlaylistIcons = Math.min(7, Math.max(0, playlists.size() - sideScroll));
+        int visibleLibraryIcons = Math.min(7, Math.max(0, libraryEntries.size() - sideScroll));
         int[] iconColors = palette("playlist_icons");
-        for (int i = 0; i < visiblePlaylistIcons; i++) {
+        for (int i = 0; i < visibleLibraryIcons; i++) {
             double top = 11.5 - i * 1.2;
             ModelPart iconPart = new ModelPart("playlist_icon_" + i,
                     -0.2, top - 0.9, -9.7,
@@ -229,13 +224,15 @@ public final class WorldPanel {
         drawOverlay(context, matrices, cx, centerY, cz, wx, wz, nx, nz);
         matrices.pop();
 
-        handleMouse(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz, playlists, selected, items);
+        handleMouse(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz, libraryEntries, selected, items);
     }
 
     private static void hookScroll(long handle) {
         if (scrollHooked) return;
         scrollHooked = true;
         previousScroll = GLFW.glfwSetScrollCallback(handle, (window, xOffset, yOffset) -> {
+            // Wheel is reserved for scrolling the library and track lists.
+            // Volume and seeking are controlled by holding the left mouse button on their sliders.
             if (scrollArea != 0) wheelDelta += yOffset;
             else if (previousScroll != null) previousScroll.invoke(window, xOffset, yOffset);
         });
@@ -244,7 +241,10 @@ public final class WorldPanel {
     private static void updateScrollArea(MinecraftClient mc, Vec3d cameraPos,
                                          double cx, double cy, double cz, double wx, double wz, double nx, double nz) {
         scrollArea = 0;
-        if (!(mc.currentScreen instanceof ChatScreen)) return;
+        if (!(mc.currentScreen instanceof ChatScreen)) {
+            wheelDelta = 0;
+            return;
+        }
         int sw = mc.getWindow().getScaledWidth();
         int sh = mc.getWindow().getScaledHeight();
         double mx = mc.mouse.getX() * sw / (double) mc.getWindow().getWidth();
@@ -256,11 +256,14 @@ public final class WorldPanel {
         if (uv == null) return;
         int tx = (int) (uv[0] * TEX_W);
         int ty = (int) (uv[1] * TEX_H);
+        // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
+        scrollArea = 3;
         if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) && ty <= py(2.5)) scrollArea = 1;
         else if (tx >= px(-8.4) && tx <= px(4.2) && ty >= py(9.1) && ty <= py(2.5)) scrollArea = 2;
     }
 
     private static void applyWheel(int playlistCount, int itemCount) {
+        // Unmodified wheel only scrolls the library and selected content list.
         while (Math.abs(wheelDelta) >= 1.0) {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
@@ -274,16 +277,16 @@ public final class WorldPanel {
         return loaded == null ? 0 : loaded.size();
     }
 
-    private static SpotifyClient.Playlist selectedPlaylist(List<SpotifyClient.Playlist> playlists) {
-        if (playlists.isEmpty()) {
-            selectedPlaylistId = "";
+    private static SpotifyClient.LibraryEntry selectedLibraryEntry(List<SpotifyClient.LibraryEntry> entries) {
+        if (entries.isEmpty()) {
+            selectedLibraryKey = "";
             return null;
         }
-        for (SpotifyClient.Playlist playlist : playlists) {
-            if (playlist.id().equals(selectedPlaylistId)) return playlist;
+        for (SpotifyClient.LibraryEntry entry : entries) {
+            if (entry.key().equals(selectedLibraryKey)) return entry;
         }
-        selectedPlaylistId = playlists.get(0).id();
-        return playlists.get(0);
+        selectedLibraryKey = entries.get(0).key();
+        return entries.get(0);
     }
 
     private static void ensureOverlayTexture(MinecraftClient mc) {
@@ -306,15 +309,15 @@ public final class WorldPanel {
 
     // -------------------------------------------------------------------- live overlay painting
 
-    private static BufferedImage paintOverlay(SpotifyClient.Snapshot s, List<SpotifyClient.Playlist> playlists,
-                                              SpotifyClient.Playlist selected, List<SpotifyClient.Item> items) {
+    private static BufferedImage paintOverlay(SpotifyClient.Snapshot s, List<SpotifyClient.LibraryEntry> libraryEntries,
+                                              SpotifyClient.LibraryEntry selected, List<SpotifyClient.Item> items) {
         BufferedImage image = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = image.createGraphics();
         prepare(g);
         g.setColor(new Color(0, 0, 0, 0));
         g.fillRect(0, 0, TEX_W, TEX_H);
 
-        paintSidebar(g, playlists, selected);
+        paintSidebar(g, libraryEntries, selected);
         paintPlaylistHeader(g, selected, items);
         paintTrackTable(g, s, items, selected);
         paintNowPlaying(g, s);
@@ -324,15 +327,16 @@ public final class WorldPanel {
         return image;
     }
 
-    private static void paintSidebar(Graphics2D g, List<SpotifyClient.Playlist> playlists, SpotifyClient.Playlist selected) {
+    private static void paintSidebar(Graphics2D g, List<SpotifyClient.LibraryEntry> libraryEntries, SpotifyClient.LibraryEntry selected) {
         int left = px(-9.8), right = px(-8.6), top = py(12.8), bottom = py(2.5);
         g.setColor(new Color(5, 9, 7, 220));
         g.fillRoundRect(left, top, right - left, bottom - top, 12, 12);
+        paintLowPolyFacets(g, left, top, right - left, bottom - top, 5);
         g.setColor(new Color(30, 215, 96, 155));
         g.setStroke(new BasicStroke(2f));
         g.drawRoundRect(left + 1, top + 1, right - left - 3, bottom - top - 3, 10, 10);
 
-        // Small library mark at the top, then one icon per user's playlist.
+        // Small library mark at the top, then one icon per saved library item.
         int libX = left + 8, libY = top + 10;
         g.setColor(new Color(30, 215, 96));
         g.fillRoundRect(libX, libY, Math.max(18, right - left - 16), 28, 7, 7);
@@ -340,64 +344,124 @@ public final class WorldPanel {
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
         g.drawString("≡", libX + 8, libY + 21);
 
-        int shown = Math.min(7, Math.max(0, playlists.size() - sideScroll));
+        int shown = Math.min(7, Math.max(0, libraryEntries.size() - sideScroll));
         int iconSize = Math.max(22, Math.min(34, right - left - 12));
         int x = left + (right - left - iconSize) / 2;
         int y0 = top + 53;
         for (int i = 0; i < shown; i++) {
-            SpotifyClient.Playlist p = playlists.get(sideScroll + i);
+            SpotifyClient.LibraryEntry p = libraryEntries.get(sideScroll + i);
             int y = y0 + i * 46;
             int[] pixels = SpotifyPanelMod.spotify.pixels(p.coverUrl(), 32);
             drawCover(g, pixels, 32, x, y, iconSize);
-            if (selected != null && p.id().equals(selected.id())) {
+            if (selected != null && p.key().equals(selected.key())) {
                 g.setColor(new Color(30, 215, 96));
                 g.setStroke(new BasicStroke(2.5f));
                 g.drawRoundRect(x - 2, y - 2, iconSize + 3, iconSize + 3, 7, 7);
             }
+            // Tiny type glyph distinguishes playlists, albums, artists and saved collections.
+            g.setColor(new Color(5, 12, 8, 220));
+            g.fillRoundRect(x + iconSize - 13, y + iconSize - 13, 13, 13, 4, 4);
+            g.setColor(new Color(235, 245, 238));
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 10));
+            g.drawString(p.iconMark(), x + iconSize - 11, y + iconSize - 3);
         }
         if (sideScroll > 0) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
             g.drawString("▲", left + 15, y0 - 8);
         }
-        if (sideScroll + shown < playlists.size()) {
+        if (sideScroll + shown < libraryEntries.size()) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
             g.drawString("▼", left + 15, y0 + 7 * 46 + 9);
         }
     }
 
-    private static void paintPlaylistHeader(Graphics2D g, SpotifyClient.Playlist selected, List<SpotifyClient.Item> items) {
+    private static void paintPlaylistHeader(Graphics2D g, SpotifyClient.LibraryEntry selected, List<SpotifyClient.Item> items) {
         int x0 = px(-8.2), x1 = px(4.0), y0 = py(12.6), y1 = py(9.3);
-        g.setPaint(new GradientPaint(x0, y0, new Color(73, 43, 130, 226), x1, y1, new Color(20, 42, 29, 225)));
+        int accentRgb = selected == null ? 0xFF52635B
+                : SpotifyPanelMod.spotify.coverAccentColor(selected.coverUrl());
+        Color[] headerColors = headerGradient(accentRgb);
+        g.setPaint(new GradientPaint(0, y0, headerColors[0], 0, y1, headerColors[1]));
         g.fillRoundRect(x0, y0, x1 - x0, y1 - y0, 15, 15);
-        g.setColor(new Color(255, 255, 255, 28));
+        paintLowPolyFacets(g, x0, y0, x1 - x0, y1 - y0, 1);
+        g.setColor(new Color(255, 255, 255, 35));
         g.drawLine(x0 + 18, y1 - 8, x1 - 18, y1 - 8);
 
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
-        g.setColor(new Color(240, 245, 241));
-        g.drawString("ПЛЕЙЛИСТ", x0 + 20, y0 + 27);
-        String title = selected == null ? "Твоя медиатека" : safe(selected.name(), "Плейлист");
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 42));
+        // Selected playlist artwork belongs in the header (separate from the currently
+        // playing track artwork on the right side of the panel).
+        int coverSize = Math.min(104, y1 - y0 - 18);
+        int coverX = x0 + 12;
+        int coverY = y0 + (y1 - y0 - coverSize) / 2;
+        int[] cover = selected == null ? null : SpotifyPanelMod.spotify.pixels(selected.coverUrl(), 128);
+        drawCover(g, cover, 128, coverX, coverY, coverSize);
+        g.setColor(new Color(30, 215, 96, 220));
+        g.setStroke(new BasicStroke(2.5f));
+        g.drawRect(coverX, coverY, coverSize, coverSize);
+
+        int textX = coverX + coverSize + 16;
+        int textWidth = Math.max(80, x1 - textX - 16);
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
+        g.setColor(new Color(250, 252, 250));
+        g.drawString(selected == null ? "МЕДИАТЕКА" : selected.kindLabel(), textX, y0 + 27);
+        String title = selected == null ? "Твоя медиатека" : safe(selected.name(), "Элемент Spotify");
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 46));
         g.setColor(Color.WHITE);
-        g.drawString(fit(g, title, x1 - x0 - 40), x0 + 20, y0 + 77);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
-        g.setColor(new Color(235, 235, 235, 225));
-        String meta = selected == null ? "Подключи Spotify, чтобы увидеть плейлисты"
-                : safe(selected.owner(), "Spotify") + "  •  " + (items == null ? selected.total() : items.size()) + " треков";
-        g.drawString(fit(g, meta, x1 - x0 - 40), x0 + 22, y1 - 17);
+        g.drawString(fit(g, title, textWidth), textX, y0 + 76);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+        g.setColor(new Color(245, 248, 245, 245));
+        String countLabel = selected == null ? "" : switch (selected.kind()) {
+            case "artist" -> "релизов";
+            case "show" -> "эпизодов";
+            case "audiobook" -> "глав";
+            case "saved_tracks" -> "сохранённых треков";
+            case "saved_episodes" -> "сохранённых эпизодов";
+            case "album" -> "треков в альбоме";
+            default -> "треков";
+        };
+        String meta = selected == null ? "Подключи Spotify, чтобы увидеть медиатеку"
+                : safe(selected.owner(), "Spotify") + "  •  " + (items == null ? selected.total() : items.size()) + " " + countLabel;
+        g.drawString(fit(g, meta, textWidth), textX + 2, y1 - 17);
+    }
+
+    /** Build Spotify-like top/bottom shades from the selected artwork's dominant hue. */
+    private static Color[] headerGradient(int argb) {
+        Color source = new Color(argb, true);
+        float[] hsb = Color.RGBtoHSB(source.getRed(), source.getGreen(), source.getBlue(), null);
+        float hue = hsb[0];
+        float saturation = hsb[1];
+        float brightness = hsb[2];
+
+        // Keep monochrome covers grey; boost colorful covers enough to read like Spotify's
+        // artwork-tinted header without turning them into a neon flat fill.
+        if (saturation < 0.12f) {
+            int neutralTop = Math.max(64, Math.min(142, Math.round(62 + brightness * 78)));
+            int neutralBottom = Math.max(24, Math.round(neutralTop * 0.34f));
+            return new Color[]{new Color(neutralTop, neutralTop, neutralTop, 238),
+                    new Color(neutralBottom, neutralBottom, neutralBottom, 238)};
+        }
+
+        float topSat = Math.max(0.56f, Math.min(0.92f, saturation * 1.48f));
+        float bottomSat = Math.max(0.62f, Math.min(0.96f, topSat * 1.08f));
+        float topBrightness = Math.max(0.48f, Math.min(0.82f, 0.46f + brightness * 0.40f));
+        float bottomBrightness = Math.max(0.16f, topBrightness * 0.34f);
+        Color top = new Color(Color.HSBtoRGB(hue, topSat, topBrightness));
+        Color bottom = new Color(Color.HSBtoRGB(hue, bottomSat, bottomBrightness));
+        return new Color[]{new Color(top.getRed(), top.getGreen(), top.getBlue(), 238),
+                new Color(bottom.getRed(), bottom.getGreen(), bottom.getBlue(), 238)};
     }
 
     private static void paintTrackTable(Graphics2D g, SpotifyClient.Snapshot snapshot,
-                                        List<SpotifyClient.Item> items, SpotifyClient.Playlist selected) {
+                                        List<SpotifyClient.Item> items, SpotifyClient.LibraryEntry selected) {
         int x0 = px(-8.4), x1 = px(4.2), y0 = py(9.1), y1 = py(2.5);
         g.setColor(new Color(8, 12, 9, 215));
         g.fillRoundRect(x0, y0, x1 - x0, y1 - y0, 9, 9);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 11));
-        g.setColor(new Color(175, 190, 179));
+        paintLowPolyFacets(g, x0, y0, x1 - x0, y1 - y0, 2);
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
+        g.setColor(new Color(215, 226, 218));
         g.drawString("#", x0 + 14, y0 + 22);
         g.drawString("НАЗВАНИЕ", x0 + 42, y0 + 22);
-        g.drawString("ИСПОЛНИТЕЛЬ", x0 + 265, y0 + 22);
+        g.drawString("ИСПОЛНИТЕЛЬ / АВТОР", x0 + 265, y0 + 22);
         g.drawString("ВРЕМЯ", x1 - 48, y0 + 22);
         g.setColor(new Color(255, 255, 255, 42));
         g.drawLine(x0 + 10, y0 + 30, x1 - 10, y0 + 30);
@@ -405,19 +469,21 @@ public final class WorldPanel {
         if (selected == null) {
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
             g.setColor(new Color(205, 215, 208));
-            g.drawString("Здесь появятся треки выбранного плейлиста", x0 + 18, y0 + 70);
+            g.drawString("Выбери элемент своей медиатеки слева", x0 + 18, y0 + 70);
             return;
         }
         if (items == null) {
+            String error = SpotifyPanelMod.spotify.itemError(selected);
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
             g.setColor(new Color(205, 215, 208));
-            g.drawString("Загружаю треки из Spotify…", x0 + 18, y0 + 70);
+            String message = error.isEmpty() ? "Загружаю содержимое из Spotify…" : error;
+            g.drawString(fit(g, message, x1 - x0 - 36), x0 + 18, y0 + 70);
             return;
         }
         if (items.isEmpty()) {
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
             g.setColor(new Color(205, 215, 208));
-            g.drawString("В плейлисте пока нет доступных треков", x0 + 18, y0 + 70);
+            g.drawString("В этом разделе пока нет доступных элементов", x0 + 18, y0 + 70);
             return;
         }
 
@@ -437,14 +503,14 @@ public final class WorldPanel {
             g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
             g.setColor(new Color(163, 179, 168));
             g.drawString(Integer.toString(i + 1), x0 + 15, y + 2);
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
-            g.setColor(active ? new Color(30, 215, 96) : new Color(244, 247, 245));
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
+            g.setColor(active ? new Color(30, 235, 105) : new Color(250, 252, 250));
             g.drawString(fit(g, safe(item.title(), "Без названия"), 210), x0 + 42, y - 1);
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
-            g.setColor(new Color(167, 181, 171));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
+            g.setColor(new Color(195, 208, 198));
             g.drawString(fit(g, safe(item.artists(), ""), 130), x0 + 265, y - 1);
-            g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-            g.setColor(new Color(167, 181, 171));
+            g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 14));
+            g.setColor(new Color(200, 214, 204));
             String duration = formatTime(item.durationMs());
             g.drawString(duration, x1 - 48, y - 1);
             if (i < rows - 1) {
@@ -456,49 +522,53 @@ public final class WorldPanel {
 
     private static void paintNowPlaying(Graphics2D g, SpotifyClient.Snapshot s) {
         int x0 = px(4.4), x1 = px(9.8), y0 = py(12.8), y1 = py(2.5);
-        g.setColor(new Color(7, 11, 8, 205));
+        g.setColor(new Color(7, 11, 8, 218));
         g.fillRoundRect(x0, y0, x1 - x0, y1 - y0, 9, 9);
+        paintLowPolyFacets(g, x0, y0, x1 - x0, y1 - y0, 3);
 
         int coverX = px(4.6), coverY = py(12.6), coverSize = Math.min(px(9.6) - coverX, py(7.6) - coverY);
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
         drawCover(g, cover, 128, coverX + 5, coverY + 5, coverSize - 10);
-        g.setColor(new Color(30, 215, 96, 180));
-        g.setStroke(new BasicStroke(2f));
-        g.drawRoundRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8, 8, 8);
+        g.setColor(new Color(30, 215, 96, 210));
+        g.setStroke(new BasicStroke(2.5f));
+        g.drawRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8);
 
         int textY = py(7.1);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 11));
-        g.setColor(new Color(30, 215, 96));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
+        g.setColor(new Color(30, 235, 105));
         g.drawString("СЕЙЧАС ИГРАЕТ", coverX + 4, textY + 17);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 27));
         g.setColor(Color.WHITE);
         String title = s.track() == null ? titleForInactive(s) : s.track().title();
-        g.drawString(fit(g, safe(title, "Ничего не играет"), x1 - x0 - 16), coverX + 4, textY + 48);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
-        g.setColor(new Color(187, 201, 191));
+        g.drawString(fit(g, safe(title, "Ничего не играет"), x1 - x0 - 16), coverX + 4, textY + 49);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 19));
+        g.setColor(new Color(215, 226, 218));
         String artist = s.track() == null ? statusDetail(s) : s.track().artists();
-        g.drawString(fit(g, safe(artist, ""), x1 - x0 - 16), coverX + 4, textY + 72);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
-        g.setColor(new Color(126, 150, 134));
-        g.drawString(s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА", coverX + 4, textY + 96);
+        g.drawString(fit(g, safe(artist, ""), x1 - x0 - 16), coverX + 4, textY + 76);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
+        g.setColor(new Color(165, 190, 172));
+        g.drawString(s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА", coverX + 4, textY + 101);
     }
 
     private static void paintBottomPlayer(Graphics2D g, SpotifyClient.Snapshot s) {
         int x0 = px(-9.8), x1 = px(9.8), y0 = py(2.3), y1 = py(0.2);
         g.setColor(new Color(4, 7, 5, 235));
         g.fillRoundRect(x0, y0, x1 - x0, y1 - y0, 8, 8);
-        g.setColor(new Color(30, 215, 96, 90));
+        paintLowPolyFacets(g, x0, y0, x1 - x0, y1 - y0, 4);
+        g.setColor(new Color(30, 215, 96, 120));
         g.drawLine(x0 + 10, y0 + 1, x1 - 10, y0 + 1);
 
         int leftCover = px(-9.4), leftY = y0 + 12;
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
         drawCover(g, cover, 48, leftCover, leftY, 50);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
         g.setColor(Color.WHITE);
-        g.drawString(fit(g, s.track() == null ? "Spotify" : s.track().title(), 120), leftCover + 58, leftY + 20);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
-        g.setColor(new Color(163, 179, 168));
-        g.drawString(fit(g, s.track() == null ? "Подключи аккаунт" : s.track().artists(), 120), leftCover + 58, leftY + 37);
+        String bottomTitle = s.track() == null ? "Spotify" : s.track().title();
+        g.drawString(fit(g, bottomTitle, 190), leftCover + 58, leftY + 22);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+        g.setColor(new Color(205, 219, 209));
+        String bottomArtist = s.track() == null ? "Подключи аккаунт" : s.track().artists();
+        g.drawString(fit(g, bottomArtist, 190), leftCover + 58, leftY + 43);
 
         int center = (px(-4.4) + px(3.1)) / 2;
         g.setColor(new Color(177, 194, 182));
@@ -524,23 +594,52 @@ public final class WorldPanel {
         g.fillRoundRect(barX, barY, barRight - barX, 4, 3, 3);
         g.setColor(new Color(30, 215, 96));
         g.fillRoundRect(barX, barY, (int) ((barRight - barX) * fraction), 4, 3, 3);
-        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 9));
+        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         g.setColor(new Color(170, 187, 175));
         g.drawString(formatTime(progress), barX, barY - 5);
         String total = formatTime(duration);
         g.drawString(total, barRight - g.getFontMetrics().stringWidth(total), barY - 5);
 
         int volX = px(3.5), volR = px(9.6);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 10));
-        g.setColor(new Color(174, 193, 181));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
+        g.setColor(new Color(205, 218, 209));
         g.drawString("ГРОМКОСТЬ", volX + 8, y0 + 21);
-        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 10));
+        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
         g.drawString(Math.max(0, Math.min(100, s.volume())) + "%", volR - 33, y0 + 21);
         int vBarX = volX + 8, vBarR = volR - 8, vBarY = y0 + 34;
         g.setColor(new Color(75, 94, 81));
         g.fillRoundRect(vBarX, vBarY, vBarR - vBarX, 5, 4, 4);
         g.setColor(new Color(30, 215, 96));
         g.fillRoundRect(vBarX, vBarY, (int) ((vBarR - vBarX) * Math.max(0, Math.min(100, s.volume())) / 100.0), 5, 4, 4);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
+        g.setColor(new Color(165, 184, 171));
+        g.drawString("Зажми ЛКМ и тяни ползунок", vBarX, y0 + 57);
+    }
+
+    /** Subtle angular facets: a low-poly surface treatment that does not compete with labels. */
+    private static void paintLowPolyFacets(Graphics2D g, int x, int y, int width, int height, int variant) {
+        if (width < 24 || height < 24) return;
+        Color[] colors = {
+                new Color(85, 210, 135, 28),
+                new Color(115, 95, 190, 27),
+                new Color(255, 255, 255, 15),
+                new Color(30, 215, 96, 20)
+        };
+        Polygon a = new Polygon(
+                new int[]{x, x + width / 3, x + width / 5},
+                new int[]{y, y, y + height / 2}, 3);
+        Polygon b = new Polygon(
+                new int[]{x + width, x + width * 2 / 3, x + width * 4 / 5},
+                new int[]{y + height, y + height, y + height / 2}, 3);
+        Polygon c = new Polygon(
+                new int[]{x + width / 2, x + width * 3 / 4, x + width * 2 / 3},
+                new int[]{y + height / 3, y + height / 5, y + height * 3 / 4}, 3);
+        g.setColor(colors[Math.floorMod(variant, colors.length)]);
+        g.fillPolygon(a);
+        g.setColor(colors[Math.floorMod(variant + 1, colors.length)]);
+        g.fillPolygon(b);
+        g.setColor(colors[Math.floorMod(variant + 2, colors.length)]);
+        g.fillPolygon(c);
     }
 
     // -------------------------------------------------------------------- model geometry
@@ -555,8 +654,10 @@ public final class WorldPanel {
         Vec3d bottomRight = modelPoint(planeX, part.y0(), part.z1(), cx, cy, cz, wx, wz, nx, nz);
         Vec3d topRight = modelPoint(planeX, part.y1(), part.z1(), cx, cy, cz, wx, wz, nx, nz);
         Vec3d topLeft = modelPoint(planeX, part.y1(), part.z0(), cx, cy, cz, wx, wz, nx, nz);
+        // Use a fixed world-up normal. The panel is emissive/full-bright and must not
+        // darken or brighten as its body-relative yaw changes.
         drawMaterialQuad(vc, matrix, bottomLeft, bottomRight, topRight, topLeft,
-                part.frontColor(), nx, 0, nz);
+                part.frontColor(), 0, 1, 0);
     }
 
     private static Vec3d modelPoint(double localX, double localY, double localZ,
@@ -619,87 +720,174 @@ public final class WorldPanel {
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
                 .light(FULL_BRIGHT)
-                .normal(entry, (float) nx, 0, (float) nz);
+                .normal(entry, 0, 1, 0);
     }
 
     // -------------------------------------------------------------------- click handling against the model's world-space front
 
     private static void handleMouse(MinecraftClient mc, Vec3d cameraPos,
                                     double cx, double cy, double cz, double wx, double wz, double nx, double nz,
-                                    List<SpotifyClient.Playlist> playlists, SpotifyClient.Playlist selected,
+                                    List<SpotifyClient.LibraryEntry> libraryEntries, SpotifyClient.LibraryEntry selected,
                                     List<SpotifyClient.Item> items) {
         boolean chatOpen = mc.currentScreen instanceof ChatScreen;
         long windowHandle = mc.getWindow().getHandle();
         boolean down = chatOpen && GLFW.glfwGetMouseButton(windowHandle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
         boolean clicked = down && !wasLeftDown;
-        wasLeftDown = down;
-        if (!clicked) return;
+        boolean released = !down && wasLeftDown;
+
+        // If the chat closes while dragging, stop cleanly instead of keeping a stale drag state.
+        if (!chatOpen) {
+            dragMode = DRAG_NONE;
+            wasLeftDown = false;
+            return;
+        }
 
         int sw = mc.getWindow().getScaledWidth();
         int sh = mc.getWindow().getScaledHeight();
         double mx = mc.mouse.getX() * sw / (double) mc.getWindow().getWidth();
         double my = mc.mouse.getY() * sh / (double) mc.getWindow().getHeight();
         Vec3d ray = mouseRay(mc, mx, my, sw, sh);
-        if (ray == null) return;
-
-        Vec3d faceCenter = modelPoint(MODEL_OVERLAY_X, MODEL_CENTER_Y, 0, cx, cy, cz, wx, wz, nx, nz);
-        double[] uv = intersectUv(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
-        if (uv == null) return;
-        int tx = (int) (uv[0] * TEX_W);
-        int ty = (int) (uv[1] * TEX_H);
-        SpotifyClient client = SpotifyPanelMod.spotify;
-
-        int sideLeft = px(-9.8), sideRight = px(-8.6);
-        if (tx >= sideLeft && tx <= sideRight && ty >= py(12.8) + 45 && ty <= py(2.5)) {
-            int slot = Math.max(0, (ty - (py(12.8) + 53)) / 46);
-            int playlistIndex = sideScroll + slot;
-            if (playlistIndex < playlists.size() && slot < 7) {
-                selectedPlaylistId = playlists.get(playlistIndex).id();
-                trackScroll = 0;
-                lastRequestedPlaylistId = "";
-                client.requestItems(selectedPlaylistId, false);
-            }
+        if (ray == null) {
+            if (released) dragMode = DRAG_NONE;
+            wasLeftDown = down;
             return;
         }
 
-        // Track rows inside the playlist's central table.
+        Vec3d faceCenter = modelPoint(MODEL_OVERLAY_X, MODEL_CENTER_Y, 0, cx, cy, cz, wx, wz, nx, nz);
+        // Unbounded intersection is used while dragging so the pointer can move slightly
+        // outside the bar and still clamp to 0% / 100% without losing the drag.
+        double[] uv = intersectUvUnbounded(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
+        if (uv == null) {
+            if (released) dragMode = DRAG_NONE;
+            wasLeftDown = down;
+            return;
+        }
+        int tx = (int) Math.round(uv[0] * TEX_W);
+        int ty = (int) Math.round(uv[1] * TEX_H);
+        SpotifyClient client = SpotifyPanelMod.spotify;
+
+        int bottomTop = py(2.3), bottomBottom = py(0.2);
+        int progressX0 = px(-4.0), progressX1 = px(2.7), progressY = bottomBottom - 12;
+        int volumeX0 = px(3.5) + 8, volumeX1 = px(9.6) - 8, volumeY = bottomTop + 34;
+
+        // Continue changing the value every frame while LMB is held. Send requests at a
+        // modest rate and always send the final value on release to avoid flooding Spotify.
+        if (dragMode != DRAG_NONE) {
+            if (down || released) updateDrag(client, tx, dragMode == DRAG_SEEK, released);
+            if (released) {
+                dragMode = DRAG_NONE;
+                lastDragSeekMs = -1;
+                lastDragVolume = -1;
+            }
+            wasLeftDown = down;
+            return;
+        }
+
+        if (!clicked) {
+            wasLeftDown = down;
+            return;
+        }
+
+        // Begin dragging the progress bar.
+        if (ty >= progressY - 10 && ty <= progressY + 11
+                && tx >= progressX0 - 8 && tx <= progressX1 + 8) {
+            SpotifyClient.Track track = client.snapshot().track();
+            if (track != null && track.durationMs() > 0) {
+                dragMode = DRAG_SEEK;
+                lastDragSeekMs = -1;
+                lastDragSendMs = 0;
+                updateDrag(client, tx, true, true);
+                wasLeftDown = down;
+                return;
+            }
+        }
+
+        // Begin dragging the volume slider.
+        if (ty >= volumeY - 10 && ty <= volumeY + 12
+                && tx >= volumeX0 - 8 && tx <= volumeX1 + 8) {
+            if (client.snapshot().status() == SpotifyClient.Status.ACTIVE) {
+                dragMode = DRAG_VOLUME;
+                lastDragVolume = -1;
+                lastDragSendMs = 0;
+                updateDrag(client, tx, false, true);
+                wasLeftDown = down;
+                return;
+            }
+        }
+
+        // All remaining click actions must start inside the actual panel surface.
+        if (uv[0] < 0 || uv[0] > 1 || uv[1] < 0 || uv[1] > 1) {
+            wasLeftDown = down;
+            return;
+        }
+
+        if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) + 45 && ty <= py(2.5)) {
+            int slot = Math.max(0, (ty - (py(12.8) + 53)) / 46);
+            int entryIndex = sideScroll + slot;
+            if (entryIndex < libraryEntries.size() && slot < 7) {
+                SpotifyClient.LibraryEntry clickedEntry = libraryEntries.get(entryIndex);
+                selectedLibraryKey = clickedEntry.key();
+                trackScroll = 0;
+                lastRequestedLibraryKey = "";
+                client.requestItems(clickedEntry, false);
+                client.playLibraryEntry(clickedEntry, SpotifyPanelMod::say);
+            }
+            wasLeftDown = down;
+            return;
+        }
+
+        // Content rows inside the selected library section.
         if (selected != null && items != null && tx >= px(-8.4) && tx <= px(4.2)
                 && ty >= py(9.1) + 48 && ty <= py(2.5)) {
             int row = (ty - (py(9.1) + 57)) / 31;
             int itemIndex = trackScroll + row;
             if (row >= 0 && itemIndex < Math.min(items.size(), trackScroll + 7)) {
-                client.playContext(selected.uri(), items.get(itemIndex).uri(), SpotifyPanelMod::say);
+                client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
+                wasLeftDown = down;
                 return;
             }
         }
 
-        // Bottom player controls and progress bar.
-        int bottomTop = py(2.3), bottomBottom = py(0.2);
-        int center = (px(-4.4) + px(3.1)) / 2;
+        // Bottom transport controls (progress and volume are handled by drag above).
         if (ty >= bottomTop && ty <= bottomBottom) {
-            if (ty >= bottomBottom - 20 && tx >= px(-4.0) && tx <= px(2.7)) {
-                SpotifyClient.Track track = client.snapshot().track();
-                if (track != null && track.durationMs() > 0) {
-                    double fraction = Math.max(0, Math.min(1, (tx - px(-4.0)) / (double) (px(2.7) - px(-4.0))));
-                    client.seek((long) (track.durationMs() * fraction), SpotifyPanelMod::say);
-                }
-                return;
-            }
+            int center = (px(-4.4) + px(3.1)) / 2;
             if (ty <= bottomTop + 46 && tx >= center - 70 && tx <= center + 70) {
                 if (tx < center - 22) client.previous(SpotifyPanelMod::say);
                 else if (tx > center + 25) client.next(SpotifyPanelMod::say);
                 else client.togglePlay(SpotifyPanelMod::say);
-                return;
-            }
-            if (tx >= px(3.5) && tx <= px(9.6)) {
-                double volume = Math.max(0, Math.min(1,
-                        (tx - (px(3.5) + 8)) / (double) (px(9.6) - px(3.5) - 16)));
-                client.volume((int) Math.round(volume * 100), SpotifyPanelMod::say);
+                wasLeftDown = down;
                 return;
             }
         }
         if (tx >= px(4.4) && ty >= py(7.4) && ty <= py(2.7)) {
             client.togglePlay(SpotifyPanelMod::say);
+        }
+        wasLeftDown = down;
+    }
+
+    private static void updateDrag(SpotifyClient client, int textureX, boolean seek, boolean force) {
+        long now = System.currentTimeMillis();
+        if (seek) {
+            SpotifyClient.Snapshot snapshot = client.snapshot();
+            SpotifyClient.Track track = snapshot.track();
+            if (track == null || track.durationMs() <= 0) return;
+            int x0 = px(-4.0), x1 = px(2.7);
+            double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
+            long target = Math.max(0, Math.min(track.durationMs(), Math.round(track.durationMs() * fraction)));
+            if (target != lastDragSeekMs && (force || now - lastDragSendMs >= 250)) {
+                client.seek(target, SpotifyPanelMod::say);
+                lastDragSeekMs = target;
+                lastDragSendMs = now;
+            }
+        } else {
+            int x0 = px(3.5) + 8, x1 = px(9.6) - 8;
+            double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
+            int target = (int) Math.round(fraction * 100.0);
+            if (target != lastDragVolume && (force || now - lastDragSendMs >= 180)) {
+                client.volume(target, SpotifyPanelMod::say);
+                lastDragVolume = target;
+                lastDragSendMs = now;
+            }
         }
     }
 
@@ -724,6 +912,14 @@ public final class WorldPanel {
     private static double[] intersectUv(Vec3d origin, Vec3d direction, Vec3d planeCenter,
                                         double wx, double wz, double nx, double nz,
                                         double width, double height) {
+        double[] uv = intersectUvUnbounded(origin, direction, planeCenter, wx, wz, nx, nz, width, height);
+        if (uv == null || uv[0] < 0 || uv[0] > 1 || uv[1] < 0 || uv[1] > 1) return null;
+        return uv;
+    }
+
+    private static double[] intersectUvUnbounded(Vec3d origin, Vec3d direction, Vec3d planeCenter,
+                                                 double wx, double wz, double nx, double nz,
+                                                 double width, double height) {
         Vec3d normal = new Vec3d(nx, 0, nz).normalize();
         double denominator = direction.dotProduct(normal);
         if (Math.abs(denominator) < 1e-7) return null;
@@ -733,7 +929,6 @@ public final class WorldPanel {
         Vec3d delta = hit.subtract(planeCenter);
         double localX = delta.x * wx + delta.z * wz;
         double localY = delta.y;
-        if (Math.abs(localX) > width / 2.0 || Math.abs(localY) > height / 2.0) return null;
         return new double[]{localX / width + 0.5, 0.5 - localY / height};
     }
 
@@ -815,7 +1010,4 @@ public final class WorldPanel {
         return "Запусти музыку в Spotify";
     }
 
-    private static double wrapDegrees(double degrees) {
-        return ((degrees + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
-    }
 }

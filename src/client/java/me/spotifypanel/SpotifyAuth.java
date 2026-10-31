@@ -31,7 +31,7 @@ import java.util.function.Consumer;
 public final class SpotifyAuth {
     public static final int PORT = 8888;
     public static final String REDIRECT = "http://127.0.0.1:" + PORT + "/callback";
-    private static final String SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative";
+    private static final String SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative user-library-read user-follow-read";
 
     private final Config config;
     private final SecureRandom random = new SecureRandom();
@@ -213,7 +213,7 @@ public final class SpotifyAuth {
             form.put("client_id", config.clientId);
             form.put("code_verifier", verifier);
             applyTokens(tokenRequest(form));
-            say.accept("Spotify подключён! Загружаю плейлисты…");
+            say.accept("Spotify подключён! Загружаю медиатеку…");
             if (SpotifyPanelMod.spotify != null) SpotifyPanelMod.spotify.reloadPlaylists();
         }
     }
