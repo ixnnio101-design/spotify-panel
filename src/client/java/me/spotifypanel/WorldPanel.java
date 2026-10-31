@@ -34,7 +34,10 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Renders the user's flat, layered Blockbench Spotify panel in world space.
@@ -73,13 +76,24 @@ public final class WorldPanel {
     private static long lastBodyYawUpdateNs;
     private static final int DRAG_NONE = 0, DRAG_SEEK = 1, DRAG_VOLUME = 2;
     private static int dragMode = DRAG_NONE;
-    private static long lastDragSendMs;
     private static long lastDragSeekMs = -1;
     private static int lastDragVolume = -1;
     private static String selectedLibraryKey = "";
     private static String lastRequestedLibraryKey = "";
     private static long lastItemsRequestNs;
+    // Wheel input changes integer targets; the rendered lists ease toward them at frame rate.
     private static int sideScroll, trackScroll;
+    private static double sideScrollVisual, trackScrollVisual;
+    private static boolean scrollVisualInitialized;
+    private static long lastUiAnimationNs;
+    private static double viewTransition = 1.0;
+    private static String lastAnimatedLibraryKey = "";
+    private static double displayedVolume;
+    private static boolean volumeVisualInitialized;
+    private static double displayedProgressMs;
+    private static boolean progressVisualInitialized;
+    private static String displayedProgressTrackUri = "";
+    private static final Map<String, Double> playingHighlightAlpha = new HashMap<>();
     private static volatile int scrollArea;
     private static volatile double wheelDelta;
     private static boolean scrollHooked;
@@ -186,6 +200,12 @@ public final class WorldPanel {
 
         List<SpotifyClient.LibraryEntry> libraryEntries = SpotifyPanelMod.spotify.library();
         SpotifyClient.LibraryEntry selected = selectedLibraryEntry(libraryEntries);
+        if (selected != null && !selected.key().equals(lastAnimatedLibraryKey)) {
+            lastAnimatedLibraryKey = selected.key();
+            trackScroll = 0;
+            trackScrollVisual = 0.0;
+            viewTransition = 0.0;
+        }
         updateScrollArea(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz);
         applyWheel(libraryEntries.size(), selected == null ? 0 : safeItemCount(selected.key()));
         List<SpotifyClient.Item> items = null;
@@ -199,14 +219,22 @@ public final class WorldPanel {
         }
         sideScroll = Math.min(sideScroll, Math.max(0, libraryEntries.size() - 7));
         if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 5));
+        SpotifyClient.Snapshot snapshot = SpotifyPanelMod.spotify.snapshot();
+        updateScrollAnimation(now, snapshot, items);
 
         ensureOverlayTexture(mc);
-        // Refresh more often while dragging so the on-panel slider follows the cursor
-        // without the old ~350 ms visual delay. Keep idle updates lighter.
-        long overlayIntervalNs = dragMode == DRAG_NONE ? 180_000_000L : 65_000_000L;
+        boolean scrolling = Math.abs(sideScrollVisual - sideScroll) > 0.004
+                || Math.abs(trackScrollVisual - trackScroll) > 0.004;
+        boolean animatingView = viewTransition < 0.995;
+        // Playback time is animated even when idle; mouse dragging gets a 60 Hz texture
+        // refresh so the slider follows the pointer instead of stepping every ~65-250 ms.
+        long overlayIntervalNs;
+        if (dragMode != DRAG_NONE || scrolling || animatingView) overlayIntervalNs = 16_666_667L;
+        else if (snapshot.playing()) overlayIntervalNs = 33_333_333L;
+        else overlayIntervalNs = 180_000_000L;
         if (now - lastOverlayUpdateNs >= overlayIntervalNs) {
             lastOverlayUpdateNs = now;
-            upload(overlayTexture, paintOverlay(SpotifyPanelMod.spotify.snapshot(), libraryEntries, selected, items));
+            upload(overlayTexture, paintOverlay(snapshot, libraryEntries, selected, items));
         }
 
         matrices.push();
@@ -221,10 +249,12 @@ public final class WorldPanel {
         }
         // Reuse the library-icon plane for each visible library item. Every icon remains flat;
         // the only depth is the subtle layer offset from its original Blockbench X coordinate.
-        int visibleLibraryIcons = Math.min(7, Math.max(0, libraryEntries.size() - sideScroll));
+        int firstLibraryIcon = Math.max(0, (int) Math.floor(sideScrollVisual));
+        double iconFraction = sideScrollVisual - firstLibraryIcon;
+        int visibleLibraryIcons = Math.min(8, Math.max(0, libraryEntries.size() - firstLibraryIcon));
         int[] iconColors = palette("playlist_icons");
         for (int i = 0; i < visibleLibraryIcons; i++) {
-            double top = 11.5 - i * 1.2;
+            double top = 11.5 - (i - iconFraction) * 1.2;
             ModelPart iconPart = new ModelPart("playlist_icon_" + i,
                     -0.2, top - 0.9, -9.7,
                     -0.2, top, -8.7,
@@ -284,6 +314,80 @@ public final class WorldPanel {
         }
     }
 
+    private static void updateScrollAnimation(long now, SpotifyClient.Snapshot snapshot,
+                                              List<SpotifyClient.Item> items) {
+        if (!scrollVisualInitialized) {
+            sideScrollVisual = sideScroll;
+            trackScrollVisual = trackScroll;
+            displayedVolume = snapshot.volume();
+            displayedProgressMs = snapshot.currentProgress();
+            displayedProgressTrackUri = snapshot.track() == null ? "" : snapshot.track().uri();
+            volumeVisualInitialized = true;
+            progressVisualInitialized = true;
+            scrollVisualInitialized = true;
+            lastUiAnimationNs = now;
+            return;
+        }
+        double dt = Math.max(0.0, Math.min(0.1, (now - lastUiAnimationNs) / 1_000_000_000.0));
+        lastUiAnimationNs = now;
+
+        // Ease wheel movement over a longer interval: the target changes by rows,
+        // while the rendered offset moves continuously at frame rate.
+        double scrollEase = 1.0 - Math.exp(-dt * 10.0);
+        sideScrollVisual += (sideScroll - sideScrollVisual) * scrollEase;
+        trackScrollVisual += (trackScroll - trackScrollVisual) * scrollEase;
+        if (Math.abs(sideScroll - sideScrollVisual) < 0.002) sideScrollVisual = sideScroll;
+        if (Math.abs(trackScroll - trackScrollVisual) < 0.002) trackScrollVisual = trackScroll;
+
+        // Smooth the visible volume and playhead independently from HTTP polling.
+        // The volume control therefore eases rather than jumping between stale snapshots.
+        double controlEase = 1.0 - Math.exp(-dt * 20.0);
+        displayedVolume += (snapshot.volume() - displayedVolume) * controlEase;
+        if (Math.abs(snapshot.volume() - displayedVolume) < 0.08) displayedVolume = snapshot.volume();
+
+        String trackUri = snapshot.track() == null ? "" : snapshot.track().uri();
+        long targetProgress = dragMode == DRAG_SEEK && lastDragSeekMs >= 0
+                ? lastDragSeekMs : snapshot.currentProgress();
+        if (!progressVisualInitialized || !trackUri.equals(displayedProgressTrackUri)) {
+            displayedProgressMs = targetProgress;
+            displayedProgressTrackUri = trackUri;
+            progressVisualInitialized = true;
+        } else {
+            double playheadEase = 1.0 - Math.exp(-dt * 24.0);
+            displayedProgressMs += (targetProgress - displayedProgressMs) * playheadEase;
+            if (Math.abs(targetProgress - displayedProgressMs) < 12.0) displayedProgressMs = targetProgress;
+        }
+
+        // Fade the playing-row accent in/out when Spotify changes tracks rather than
+        // swapping the highlight in one frame. Keep only the active/fading URI entries.
+        String playingUri = trackUri;
+        boolean playingTrackVisible = false;
+        if (items != null && !playingUri.isEmpty()) {
+            for (SpotifyClient.Item item : items) {
+                if (playingUri.equals(item.uri())) {
+                    playingTrackVisible = true;
+                    break;
+                }
+            }
+        }
+        if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.0);
+        double highlightEase = 1.0 - Math.exp(-dt * 15.0);
+        Iterator<Map.Entry<String, Double>> highlightIterator = playingHighlightAlpha.entrySet().iterator();
+        while (highlightIterator.hasNext()) {
+            Map.Entry<String, Double> entry = highlightIterator.next();
+            double target = playingTrackVisible && entry.getKey().equals(playingUri) ? 1.0 : 0.0;
+            double next = entry.getValue() + (target - entry.getValue()) * highlightEase;
+            if (Math.abs(target - next) < 0.004) next = target;
+            if (next <= 0.004 && target == 0.0) highlightIterator.remove();
+            else entry.setValue(next);
+        }
+
+        // Newly selected albums/playlists ease in with a subtle upward settle.
+        double transitionEase = 1.0 - Math.exp(-dt * 6.0);
+        viewTransition += (1.0 - viewTransition) * transitionEase;
+        if (viewTransition > 0.995) viewTransition = 1.0;
+    }
+
     private static int safeItemCount(String playlistId) {
         List<SpotifyClient.Item> loaded = SpotifyPanelMod.spotify.items(playlistId);
         return loaded == null ? 0 : loaded.size();
@@ -330,8 +434,15 @@ public final class WorldPanel {
         g.fillRect(0, 0, TEX_W, TEX_H);
 
         paintSidebar(g, libraryEntries, selected);
+        java.awt.Composite previousComposite = g.getComposite();
+        java.awt.geom.AffineTransform previousTransform = g.getTransform();
+        float transitionAlpha = (float) Math.max(0.0, Math.min(1.0, viewTransition));
+        g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, transitionAlpha));
+        g.translate(0, Math.round((1.0 - viewTransition) * 10.0));
         paintPlaylistHeader(g, selected, items);
         paintTrackTable(g, s, items, selected);
+        g.setTransform(previousTransform);
+        g.setComposite(previousComposite);
         paintNowPlaying(g, s);
         paintBottomPlayer(g, s);
 
@@ -356,13 +467,17 @@ public final class WorldPanel {
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
         drawUiText(g, "≡", libX + 8, libY + 21, g.getColor());
 
-        int shown = Math.min(7, Math.max(0, libraryEntries.size() - sideScroll));
+        int first = Math.max(0, (int) Math.floor(sideScrollVisual));
+        double fraction = sideScrollVisual - first;
+        int shown = Math.min(8, Math.max(0, libraryEntries.size() - first));
         int iconSize = Math.max(22, Math.min(34, right - left - 12));
         int x = left + (right - left - iconSize) / 2;
         int y0 = top + 53;
+        java.awt.Shape oldClip = g.getClip();
+        g.clipRect(left + 2, y0 - 4, right - left - 4, 7 * 46 + 8);
         for (int i = 0; i < shown; i++) {
-            SpotifyClient.LibraryEntry p = libraryEntries.get(sideScroll + i);
-            int y = y0 + i * 46;
+            SpotifyClient.LibraryEntry p = libraryEntries.get(first + i);
+            int y = y0 + (int) Math.round((i - fraction) * 46.0);
             int[] pixels = SpotifyPanelMod.spotify.pixels(p.coverUrl(), 32);
             drawCover(g, pixels, 32, x, y, iconSize);
             if (selected != null && p.key().equals(selected.key())) {
@@ -377,12 +492,13 @@ public final class WorldPanel {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
             drawUiText(g, p.iconMark(), x + iconSize - 11, y + iconSize - 3, g.getColor());
         }
-        if (sideScroll > 0) {
+        g.setClip(oldClip);
+        if (sideScrollVisual > 0.01) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
             drawUiText(g, "▲", left + 15, y0 - 8, g.getColor());
         }
-        if (sideScroll + shown < libraryEntries.size()) {
+        if (sideScrollVisual + 7.0 < libraryEntries.size()) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
             drawUiText(g, "▼", left + 15, y0 + 7 * 46 + 9, g.getColor());
@@ -500,26 +616,42 @@ public final class WorldPanel {
             return;
         }
 
-        int rows = Math.min(5, Math.max(0, items.size() - trackScroll));
+        int first = Math.max(0, Math.min(items.size(), (int) Math.floor(trackScrollVisual)));
+        double fraction = trackScrollVisual - first;
+        int rows = Math.min(6, Math.max(0, items.size() - first));
         int rowH = 42;
         int startY = y0 + 60;
+        java.awt.Shape oldClip = g.getClip();
+        g.clipRect(x0 + 4, startY - 19, x1 - x0 - 8, y1 - startY + 22);
         for (int i = 0; i < rows; i++) {
-            SpotifyClient.Item item = items.get(trackScroll + i);
-            int y = startY + i * rowH;
-            boolean active = snapshot.track() != null && safe(snapshot.track().title(), "").equalsIgnoreCase(safe(item.title(), ""));
-            if (active) {
-                g.setColor(new Color(30, 215, 96, 48));
-                g.fillRect(x0 + 7, y - 17, x1 - x0 - 14, rowH);
-                g.setColor(new Color(30, 215, 96));
-                g.fillRect(x0 + 7, y - 17, 3, rowH);
+            int itemIndex = first + i;
+            SpotifyClient.Item item = items.get(itemIndex);
+            int y = startY + (int) Math.round((i - fraction) * rowH);
+            SpotifyClient.Track current = snapshot.track();
+            boolean active = current != null && !current.uri().isBlank() && current.uri().equals(item.uri());
+            double highlight = Math.max(0.0, Math.min(1.0,
+                    playingHighlightAlpha.getOrDefault(item.uri(), 0.0)));
+            if (highlight > 0.002) {
+                // Exact URI matching plus a short fade makes the active row feel stable.
+                g.setColor(new Color(30, 215, 96, (int) Math.round(36 * highlight)));
+                g.fillRect(x0 + 7, y - 17, x1 - x0 - 14, rowH - 1);
+                g.setColor(new Color(30, 215, 96, (int) Math.round(205 * highlight)));
+                g.fillRect(x0 + 7, y - 17, 4, rowH - 1);
+                g.setColor(new Color(30, 215, 96, (int) Math.round(90 * highlight)));
+                g.drawRect(x0 + 12, y - 16, x1 - x0 - 24, rowH - 3);
             }
+            Color numberBase = new Color(163, 179, 168);
+            Color numberActive = new Color(30, 235, 105);
+            Color titleBase = Color.WHITE;
+            Color titleActive = new Color(220, 255, 232);
             g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
-            g.setColor(new Color(163, 179, 168));
-            drawReadableText(g, Integer.toString(i + 1), x0 + 15, y + 2, new Color(235, 240, 236));
+            g.setColor(blend(numberBase, numberActive, highlight));
+            drawReadableText(g, Integer.toString(itemIndex + 1), x0 + 15, y + 2,
+                    blend(new Color(235, 240, 236), numberActive, highlight));
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
-            g.setColor(active ? new Color(30, 235, 105) : new Color(250, 252, 250));
+            g.setColor(blend(titleBase, titleActive, highlight));
             drawReadableText(g, fit(g, safe(item.title(), "Без названия"), 210), x0 + 42, y - 1,
-                    active ? new Color(30, 245, 110) : Color.WHITE);
+                    blend(Color.WHITE, titleActive, highlight));
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
             g.setColor(new Color(235, 240, 236));
             drawReadableText(g, fit(g, safe(item.artists(), ""), 130), x0 + 265, y - 1, new Color(242, 246, 243));
@@ -532,6 +664,16 @@ public final class WorldPanel {
                 g.drawLine(x0 + 12, y + 9, x1 - 12, y + 9);
             }
         }
+        g.setClip(oldClip);
+    }
+
+    private static Color blend(Color from, Color to, double amount) {
+        double t = Math.max(0.0, Math.min(1.0, amount));
+        return new Color(
+                (int) Math.round(from.getRed() + (to.getRed() - from.getRed()) * t),
+                (int) Math.round(from.getGreen() + (to.getGreen() - from.getGreen()) * t),
+                (int) Math.round(from.getBlue() + (to.getBlue() - from.getBlue()) * t),
+                (int) Math.round(from.getAlpha() + (to.getAlpha() - from.getAlpha()) * t));
     }
 
     private static void paintNowPlaying(Graphics2D g, SpotifyClient.Snapshot s) {
@@ -603,7 +745,9 @@ public final class WorldPanel {
         drawNext(g, center + 45, y0 + 27);
 
         long duration = s.track() == null ? 0 : Math.max(0, s.track().durationMs());
-        long progress = duration == 0 ? 0 : Math.max(0, Math.min(duration, s.currentProgress()));
+        long visualProgress = progressVisualInitialized
+                ? Math.round(displayedProgressMs) : s.currentProgress();
+        long progress = duration == 0 ? 0 : Math.max(0, Math.min(duration, visualProgress));
         double fraction = duration == 0 ? 0 : progress / (double) duration;
         int barX = px(-4.0), barRight = px(2.7), barY = y1 - 12;
         g.setColor(new Color(103, 122, 109, 170));
@@ -621,12 +765,14 @@ public final class WorldPanel {
         g.setColor(new Color(248, 250, 248));
         drawReadableText(g, "ГРОМКОСТЬ", volX + 8, y0 + 21, new Color(250, 252, 250));
         g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        drawReadableText(g, Math.max(0, Math.min(100, s.volume())) + "%", volR - 33, y0 + 21, Color.WHITE);
+        int visualVolume = (int) Math.round(Math.max(0.0, Math.min(100.0,
+                volumeVisualInitialized ? displayedVolume : s.volume())));
+        drawReadableText(g, visualVolume + "%", volR - 33, y0 + 21, Color.WHITE);
         int vBarX = volX + 8, vBarR = volR - 8, vBarY = y0 + 34;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(vBarX, vBarY, vBarR - vBarX, 5);
         g.setColor(new Color(30, 215, 96));
-        g.fillRect(vBarX, vBarY, (int) ((vBarR - vBarX) * Math.max(0, Math.min(100, s.volume())) / 100.0), 5);
+        g.fillRect(vBarX, vBarY, (int) ((vBarR - vBarX) * visualVolume / 100.0), 5);
         g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         g.setColor(new Color(165, 184, 171));
         drawReadableText(g, "Зажми ЛКМ и тяни ползунок", vBarX, y0 + 57, new Color(235, 242, 237));
@@ -723,7 +869,10 @@ public final class WorldPanel {
 
         // If the chat closes while dragging, stop cleanly instead of keeping a stale drag state.
         if (!chatOpen) {
+            finishSeekDrag(SpotifyPanelMod.spotify);
             dragMode = DRAG_NONE;
+            lastDragSeekMs = -1;
+            lastDragVolume = -1;
             wasLeftDown = false;
             return;
         }
@@ -734,7 +883,12 @@ public final class WorldPanel {
         double my = mc.mouse.getY() * sh / (double) mc.getWindow().getHeight();
         Vec3d ray = mouseRay(mc, mx, my, sw, sh);
         if (ray == null) {
-            if (released) dragMode = DRAG_NONE;
+            if (released) {
+                finishSeekDrag(SpotifyPanelMod.spotify);
+                dragMode = DRAG_NONE;
+                lastDragSeekMs = -1;
+                lastDragVolume = -1;
+            }
             wasLeftDown = down;
             return;
         }
@@ -744,7 +898,12 @@ public final class WorldPanel {
         // outside the bar and still clamp to 0% / 100% without losing the drag.
         double[] uv = intersectUvUnbounded(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
         if (uv == null) {
-            if (released) dragMode = DRAG_NONE;
+            if (released) {
+                finishSeekDrag(SpotifyPanelMod.spotify);
+                dragMode = DRAG_NONE;
+                lastDragSeekMs = -1;
+                lastDragVolume = -1;
+            }
             wasLeftDown = down;
             return;
         }
@@ -756,11 +915,12 @@ public final class WorldPanel {
         int progressX0 = px(-4.0), progressX1 = px(2.7), progressY = bottomBottom - 12;
         int volumeX0 = px(3.5) + 8, volumeX1 = px(9.6) - 8, volumeY = bottomTop + 34;
 
-        // Continue changing the value every frame while LMB is held. Send requests at a
-        // modest rate and always send the final value on release to avoid flooding Spotify.
+        // Update the visual thumb on each frame. Seeking is committed only on release;
+        // volume is smoothed/coalesced by SpotifyClient while the pointer moves.
         if (dragMode != DRAG_NONE) {
-            if (down || released) updateDrag(client, tx, dragMode == DRAG_SEEK, released);
+            if (down || released) updateDrag(client, tx, dragMode == DRAG_SEEK);
             if (released) {
+                finishSeekDrag(client);
                 dragMode = DRAG_NONE;
                 lastDragSeekMs = -1;
                 lastDragVolume = -1;
@@ -781,8 +941,7 @@ public final class WorldPanel {
             if (track != null && track.durationMs() > 0) {
                 dragMode = DRAG_SEEK;
                 lastDragSeekMs = -1;
-                lastDragSendMs = 0;
-                updateDrag(client, tx, true, true);
+                updateDrag(client, tx, true);
                 wasLeftDown = down;
                 return;
             }
@@ -794,8 +953,7 @@ public final class WorldPanel {
             if (client.snapshot().status() == SpotifyClient.Status.ACTIVE) {
                 dragMode = DRAG_VOLUME;
                 lastDragVolume = -1;
-                lastDragSendMs = 0;
-                updateDrag(client, tx, false, true);
+                updateDrag(client, tx, false);
                 wasLeftDown = down;
                 return;
             }
@@ -808,9 +966,10 @@ public final class WorldPanel {
         }
 
         if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) + 45 && ty <= py(2.5)) {
-            int slot = Math.max(0, (ty - (py(12.8) + 53)) / 46);
-            int entryIndex = sideScroll + slot;
-            if (entryIndex < libraryEntries.size() && slot < 7) {
+            double relativeSlot = (ty - (py(12.8) + 53)) / 46.0;
+            int visibleSlot = Math.max(0, (int) Math.floor(relativeSlot));
+            int entryIndex = Math.max(0, (int) Math.floor(Math.max(0.0, relativeSlot) + sideScrollVisual));
+            if (visibleSlot < 7 && entryIndex < libraryEntries.size()) {
                 SpotifyClient.LibraryEntry clickedEntry = libraryEntries.get(entryIndex);
                 selectedLibraryKey = clickedEntry.key();
                 trackScroll = 0;
@@ -827,9 +986,8 @@ public final class WorldPanel {
         // Content rows inside the selected library section.
         if (selected != null && items != null && tx >= px(-8.4) && tx <= px(4.2)
                 && ty >= py(9.1) + 43 && ty <= py(2.5)) {
-            int row = (ty - (py(9.1) + 43)) / 42;
-            int itemIndex = trackScroll + row;
-            if (row >= 0 && itemIndex < Math.min(items.size(), trackScroll + 5)) {
+            int itemIndex = (int) Math.floor((ty - (py(9.1) + 43)) / 42.0 + trackScrollVisual);
+            if (itemIndex >= 0 && itemIndex < items.size()) {
                 client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
                 wasLeftDown = down;
                 return;
@@ -853,8 +1011,13 @@ public final class WorldPanel {
         wasLeftDown = down;
     }
 
-    private static void updateDrag(SpotifyClient client, int textureX, boolean seek, boolean force) {
-        long now = System.currentTimeMillis();
+    private static void finishSeekDrag(SpotifyClient client) {
+        if (dragMode == DRAG_SEEK && lastDragSeekMs >= 0) {
+            client.seek(lastDragSeekMs, SpotifyPanelMod::say);
+        }
+    }
+
+    private static void updateDrag(SpotifyClient client, int textureX, boolean seek) {
         if (seek) {
             SpotifyClient.Snapshot snapshot = client.snapshot();
             SpotifyClient.Track track = snapshot.track();
@@ -862,19 +1025,19 @@ public final class WorldPanel {
             int x0 = px(-4.0), x1 = px(2.7);
             double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
             long target = Math.max(0, Math.min(track.durationMs(), Math.round(track.durationMs() * fraction)));
-            if (target != lastDragSeekMs && (force || now - lastDragSendMs >= 250)) {
-                client.seek(target, SpotifyPanelMod::say);
+            if (target != lastDragSeekMs) {
+                // Scrub locally while dragging. Send a single seek when the mouse is released;
+                // issuing repeated remote seeks is what makes Spotify playback stutter.
                 lastDragSeekMs = target;
-                lastDragSendMs = now;
             }
         } else {
             int x0 = px(3.5) + 8, x1 = px(9.6) - 8;
             double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
             int target = (int) Math.round(fraction * 100.0);
-            if (target != lastDragVolume && (force || now - lastDragSendMs >= 180)) {
+            if (target != lastDragVolume) {
+                // Snapshot changes immediately; backend HTTP calls keep only the newest value.
                 client.volume(target, SpotifyPanelMod::say);
                 lastDragVolume = target;
-                lastDragSendMs = now;
             }
         }
     }

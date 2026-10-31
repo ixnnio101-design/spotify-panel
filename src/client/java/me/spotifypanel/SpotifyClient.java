@@ -132,7 +132,9 @@ public final class SpotifyClient {
     private final AtomicInteger pendingVolume = new AtomicInteger(-1);
     private final AtomicBoolean volumeFlushScheduled = new AtomicBoolean();
     private volatile long lastVolumeRequestAtMs;
-    private static final long MIN_VOLUME_REQUEST_INTERVAL_MS = 240;
+    private static final long MIN_VOLUME_REQUEST_INTERVAL_MS = 120;
+    private static final int MAX_VOLUME_RAMP_STEP = 8;
+    private final AtomicInteger volumeRampValue = new AtomicInteger(-1);
     /** До этого момента ответы опроса игнорируются: на экране то, что игрок только что нажал (без «отскока»). */
     private volatile long ignorePollUntil = 0;
     private volatile long lastLocalAt = 0;
@@ -296,6 +298,9 @@ public final class SpotifyClient {
 
         snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
+        if (pendingVolume.get() < 0 && !volumeFlushScheduled.get()) {
+            volumeRampValue.set(Math.max(0, Math.min(100, volume)));
+        }
     }
 
     private static String artistsOf(JsonObject item) {
@@ -976,7 +981,13 @@ public final class SpotifyClient {
      */
     public void volume(int percent, Consumer<String> err) {
         int v = Math.max(0, Math.min(100, percent));
-        local(s -> s.withVolume(v), 1500);
+        Snapshot before = snapshot;
+        if (volumeRampValue.get() < 0 && before.status() == Status.ACTIVE) {
+            volumeRampValue.compareAndSet(-1, Math.max(0, Math.min(100, before.volume())));
+        }
+        // The slider responds instantly; the real Spotify device is eased toward the
+        // requested value in small steps so the audible volume does not jump abruptly.
+        local(s -> s.withVolume(v), 1800);
         pendingVolume.set(v);
         scheduleVolumeFlush(err);
     }
@@ -990,22 +1001,36 @@ public final class SpotifyClient {
 
     private void flushPendingVolume(Consumer<String> err) {
         try {
-            int value = pendingVolume.getAndSet(-1);
-            if (value >= 0) {
+            int requested = pendingVolume.getAndSet(-1);
+            if (requested >= 0) {
+                int current = volumeRampValue.get();
+                if (current < 0) current = requested;
+                int delta = requested - current;
+                int step = Math.max(-MAX_VOLUME_RAMP_STEP, Math.min(MAX_VOLUME_RAMP_STEP, delta));
+                int next = Math.max(0, Math.min(100, current + step));
                 lastVolumeRequestAtMs = System.currentTimeMillis();
-                doControl("PUT", "/me/player/volume?volume_percent=" + value, null, err);
+                boolean success = doControl("PUT", "/me/player/volume?volume_percent=" + next, null, err);
+                if (success) {
+                    volumeRampValue.set(next);
+                    // Continue the ramp, unless a newer mouse value arrived while the
+                    // previous network request was in flight.
+                    if (next != requested) pendingVolume.compareAndSet(-1, requested);
+                } else {
+                    volumeRampValue.set(-1);
+                    pendingVolume.set(-1);
+                }
             }
         } finally {
             volumeFlushScheduled.set(false);
-            // If the user kept dragging while the previous HTTP request was running,
-            // send only the newest value after the minimum interval.
             if (pendingVolume.get() >= 0) scheduleVolumeFlush(err);
         }
     }
 
     public void seek(long ms, Consumer<String> err) {
-        long v = Math.max(0, ms);
-        local(s -> s.withProgress(v), 2000);
+        Snapshot current = snapshot;
+        long max = current.track() == null ? Long.MAX_VALUE : Math.max(0L, current.track().durationMs());
+        long v = Math.max(0L, Math.min(max, ms));
+        local(s -> s.withProgress(v), 1800);
         control("PUT", "/me/player/seek?position_ms=" + v, null, err);
     }
 
@@ -1042,7 +1067,7 @@ public final class SpotifyClient {
     }
 
     private void control(String method, String path, String body, Consumer<String> err) {
-        ctl.submit(() -> doControl(method, path, body, err));
+        ctl.submit(() -> { doControl(method, path, body, err); });
     }
 
     private void pollOnce(long delayMs) {
@@ -1060,24 +1085,27 @@ public final class SpotifyClient {
         exec.submit(this::poll);
     }
 
-    private void doControl(String method, String path, String body, Consumer<String> err) {
+    private boolean doControl(String method, String path, String body, Consumer<String> err) {
         try {
             if (!auth.isLoggedIn()) {
                 err.accept("Сначала войди: /spotify login");
                 revert();
-                return;
+                return false;
             }
             HttpResponse<String> r = send(method, path, body);
             int sc = r.statusCode();
             if (sc == 404) {
                 err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
                 revert();
+                return false;
             } else if (sc == 403) {
                 err.accept("Spotify отказал (нужен Premium или действие недоступно).");
                 revert();
+                return false;
             } else if (sc >= 300) {
                 err.accept("Spotify: HTTP " + sc);
                 revert();
+                return false;
             } else {
                 long wait = ignorePollUntil - System.currentTimeMillis();
                 if (wait > 0) {
@@ -1087,10 +1115,13 @@ public final class SpotifyClient {
                     exec.schedule(this::poll, 400, TimeUnit.MILLISECONDS);
                     exec.schedule(this::poll, 1300, TimeUnit.MILLISECONDS);
                 }
+                return true;
             }
         } catch (Exception e) {
             err.accept("Ошибка: " + errText(e));
             revert();
+            return false;
         }
+        return false;
     }
 }

@@ -24,3 +24,30 @@ World-space text/render cleanup
 - Reduced oversized heading/track typography and changed the table to five larger, better-spaced rows to fit the thin world-space panel.
 - Made text/table surfaces more opaque so background material cannot show through the lettering.
 - Moved the live overlay slightly farther in front of the Blockbench surfaces to reduce depth overlap.
+
+
+Smooth controls and scrolling
+
+- The visible volume and playhead are eased locally at frame rate, independently from Spotify polling, so the controls do not jump between snapshots.
+- Volume HTTP updates are coalesced and sent in smaller steps; seeking remains a local preview while dragging and commits once on mouse release to avoid repeated playback stutter.
+- The progress indicator stays locked to a smoothly interpolated mouse preview while the seek slider is held, rather than drifting forward with playback time.
+- Playlist/sidebar and track-table wheel scrolling now animate with slower frame-time easing and fractional row offsets for a softer glide.
+- Track row numbers use the absolute item index, so scrolling past the first page continues with 6, 7, 8, etc. instead of resetting to 1-5.
+- The playing-row highlight now matches the exact Spotify track URI, avoiding false matches on duplicate song titles, and uses a restrained full-row accent.
+- Switching between library entries fades and subtly slides the new header and track table in instead of replacing them abruptly.
+
+
+Final interaction polish
+
+- Seeking now behaves like a normal scrubber: the timeline preview follows the held mouse smoothly, and only one seek request is sent on release. This prevents repeated remote seeks from stuttering playback during the drag.
+- Volume changes are eased on the Spotify device in smaller 8-point steps, with a short request interval and latest-target coalescing. The visible on-panel value is separately interpolated for a smooth response.
+- The playback timeline locks to the dragged preview and does not creep forward underneath the cursor.
+- Both library and track lists use eased fractional scrolling; row numbers continue from the true item index after scrolling.
+- Now-playing row detection uses Spotify URIs rather than title-only matching, with a cleaner green row treatment.
+
+Additional animation polish
+
+- Visible volume and playhead values use frame-time interpolation; progress follows the local drag preview smoothly and is committed only once after release.
+- The now-playing row highlight fades between track URIs instead of abruptly switching its background, border and text tint.
+- Scroll easing was softened and selection changes now use a gentle fade plus a small vertical settle.
+- Dragging and scrolling refresh the world-space texture at up to 60 FPS; normal playback refresh stays lighter.
