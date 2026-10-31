@@ -527,8 +527,8 @@ public final class SpotifyClient {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
             HttpResponse<byte[]> r = Net.http().send(req, HttpResponse.BodyHandlers.ofByteArray());
             if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
-            int[] raw = decodeNative(r.body());
-            if (raw == null) raw = decodeAwt(r.body());
+            int[] raw = decodeAwt(r.body());
+            if (raw == null) raw = decodeNative(r.body());
             if (raw != null) {
                 rawCache.put(url, raw);
             } else {
