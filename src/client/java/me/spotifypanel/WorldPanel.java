@@ -17,7 +17,6 @@ import net.minecraft.client.texture.NativeImage;
 import net.minecraft.client.texture.NativeImageBackedTexture;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
@@ -157,10 +156,10 @@ public final class WorldPanel {
         Vec3d cameraPos = context.worldState().cameraRenderState.pos;
         float tickDelta = mc.getRenderTickCounter().getTickProgress(false);
         hookScroll(mc.getWindow().getHandle());
-        // Interpolate the BODY yaw between ticks. Never use camera/head yaw here: turning
-        // the mouse alone must not swing the panel. Interpolation also avoids tick-to-tick jitter.
+        // Use the BODY yaw getter available in Minecraft 1.21.11.
+        // Do not use camera/head yaw: moving the mouse alone must not swing the panel.
         Vec3d body = player.getLerpedPos(tickDelta);
-        double bodyYaw = MathHelper.lerpAngleDegrees(tickDelta, player.prevBodyYaw, player.bodyYaw);
+        double bodyYaw = player.getBodyYaw();
         long now = System.nanoTime();
 
         double bodyRad = Math.toRadians(bodyYaw);
