@@ -25,7 +25,6 @@ import org.lwjgl.glfw.GLFWScrollCallback;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Font;
-import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.RenderingHints;
@@ -39,8 +38,8 @@ import java.util.List;
 
 /**
  * Renders the user's flat, layered Blockbench Spotify panel in world space.
- * The .bbmodel provides thin planar parts; a transparent dynamic texture is
- * projected onto the front to show live Spotify data.
+ * The .bbmodel provides thin planar parts; a crisp antialiased dynamic texture is
+ * projected onto the front to show live Spotify data. Pixel styling is reserved for frames and controls.
  */
 public final class WorldPanel {
     public static final boolean ENABLED = true;
@@ -54,7 +53,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
-    private static final double MODEL_OVERLAY_X = -0.65;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 6.5;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -199,7 +198,7 @@ public final class WorldPanel {
             items = SpotifyPanelMod.spotify.items(selected.key());
         }
         sideScroll = Math.min(sideScroll, Math.max(0, libraryEntries.size() - 7));
-        if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 6));
+        if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 5));
 
         ensureOverlayTexture(mc);
         // Refresh more often while dragging so the on-panel slider follows the cursor
@@ -280,7 +279,7 @@ public final class WorldPanel {
         while (Math.abs(wheelDelta) >= 1.0) {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
-            else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - 6), trackScroll + direction));
+            else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - 5), trackScroll + direction));
             wheelDelta -= Math.signum(wheelDelta);
         }
     }
@@ -342,7 +341,7 @@ public final class WorldPanel {
 
     private static void paintSidebar(Graphics2D g, List<SpotifyClient.LibraryEntry> libraryEntries, SpotifyClient.LibraryEntry selected) {
         int left = px(-9.8), right = px(-8.6), top = py(12.8), bottom = py(2.5);
-        g.setColor(new Color(5, 9, 7, 232));
+        g.setColor(new Color(5, 9, 7, 250));
         g.fillRect(left, top, right - left, bottom - top);
         paintPixelFrame(g, left, top, right - left, bottom - top, new Color(30, 215, 96, 175), 2, 7);
         g.setColor(new Color(255, 255, 255, 18));
@@ -354,8 +353,8 @@ public final class WorldPanel {
         g.setColor(new Color(30, 215, 96));
         g.fillRect(libX, libY, Math.max(18, right - left - 16), 28);
         g.setColor(new Color(5, 18, 10));
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 26));
-        drawPixelText(g, "≡", libX + 8, libY + 21, g.getColor());
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+        drawUiText(g, "≡", libX + 8, libY + 21, g.getColor());
 
         int shown = Math.min(7, Math.max(0, libraryEntries.size() - sideScroll));
         int iconSize = Math.max(22, Math.min(34, right - left - 12));
@@ -375,18 +374,18 @@ public final class WorldPanel {
             g.setColor(new Color(5, 12, 8, 220));
             g.fillRect(x + iconSize - 13, y + iconSize - 13, 13, 13);
             g.setColor(new Color(235, 245, 238));
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
-            drawPixelText(g, p.iconMark(), x + iconSize - 11, y + iconSize - 3, g.getColor());
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
+            drawUiText(g, p.iconMark(), x + iconSize - 11, y + iconSize - 3, g.getColor());
         }
         if (sideScroll > 0) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
-            drawPixelText(g, "▲", left + 15, y0 - 8, g.getColor());
+            drawUiText(g, "▲", left + 15, y0 - 8, g.getColor());
         }
         if (sideScroll + shown < libraryEntries.size()) {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
             g.setColor(new Color(180, 204, 188));
-            drawPixelText(g, "▼", left + 15, y0 + 7 * 46 + 9, g.getColor());
+            drawUiText(g, "▼", left + 15, y0 + 7 * 46 + 9, g.getColor());
         }
     }
 
@@ -416,14 +415,14 @@ public final class WorldPanel {
 
         int textX = coverX + coverSize + 16;
         int textWidth = Math.max(80, x1 - textX - 16);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 17));
         g.setColor(new Color(250, 252, 250));
         drawReadableText(g, selected == null ? "МЕДИАТЕКА" : selected.kindLabel(), textX, y0 + 27, new Color(255, 255, 255));
         String title = selected == null ? "Твоя медиатека" : safe(selected.name(), "Элемент Spotify");
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 56));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 44));
         g.setColor(Color.WHITE);
         drawReadableText(g, fit(g, title, textWidth), textX, y0 + 76, Color.WHITE);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
         g.setColor(new Color(245, 248, 245, 245));
         String countLabel = selected == null ? "" : switch (selected.kind()) {
             case "artist" -> "релизов";
@@ -469,40 +468,40 @@ public final class WorldPanel {
     private static void paintTrackTable(Graphics2D g, SpotifyClient.Snapshot snapshot,
                                         List<SpotifyClient.Item> items, SpotifyClient.LibraryEntry selected) {
         int x0 = px(-8.4), x1 = px(4.2), y0 = py(9.1), y1 = py(2.5);
-        g.setColor(new Color(8, 12, 9, 215));
+        g.setColor(new Color(8, 12, 9, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
         g.setColor(new Color(248, 250, 248));
-        drawPixelText(g, "#", x0 + 14, y0 + 22, g.getColor());
-        drawPixelText(g, "НАЗВАНИЕ", x0 + 42, y0 + 22, g.getColor());
-        drawPixelText(g, "ИСПОЛНИТЕЛЬ / АВТОР", x0 + 265, y0 + 22, g.getColor());
-        drawPixelText(g, "ВРЕМЯ", x1 - 48, y0 + 22, g.getColor());
+        drawUiText(g, "#", x0 + 14, y0 + 22, g.getColor());
+        drawUiText(g, "НАЗВАНИЕ", x0 + 42, y0 + 22, g.getColor());
+        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 265, y0 + 22, g.getColor());
+        drawUiText(g, "ВРЕМЯ", x1 - 48, y0 + 22, g.getColor());
         g.setColor(new Color(255, 255, 255, 42));
         g.drawLine(x0 + 10, y0 + 30, x1 - 10, y0 + 30);
 
         if (selected == null) {
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 18));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
             g.setColor(new Color(205, 215, 208));
-            drawPixelText(g, "Выбери элемент своей медиатеки слева", x0 + 18, y0 + 70, g.getColor());
+            drawUiText(g, "Выбери элемент своей медиатеки слева", x0 + 18, y0 + 70, g.getColor());
             return;
         }
         if (items == null) {
             String error = SpotifyPanelMod.spotify.itemError(selected);
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 18));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
             g.setColor(new Color(205, 215, 208));
             String message = error.isEmpty() ? "Загружаю содержимое из Spotify…" : error;
-            drawPixelText(g, fit(g, message, x1 - x0 - 36), x0 + 18, y0 + 70, g.getColor());
+            drawUiText(g, fit(g, message, x1 - x0 - 36), x0 + 18, y0 + 70, g.getColor());
             return;
         }
         if (items.isEmpty()) {
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 17));
             g.setColor(new Color(205, 215, 208));
-            drawPixelText(g, "В этом разделе пока нет доступных элементов", x0 + 18, y0 + 70, g.getColor());
+            drawUiText(g, "В этом разделе пока нет доступных элементов", x0 + 18, y0 + 70, g.getColor());
             return;
         }
 
-        int rows = Math.min(6, Math.max(0, items.size() - trackScroll));
-        int rowH = 35;
+        int rows = Math.min(5, Math.max(0, items.size() - trackScroll));
+        int rowH = 42;
         int startY = y0 + 60;
         for (int i = 0; i < rows; i++) {
             SpotifyClient.Item item = items.get(trackScroll + i);
@@ -517,14 +516,14 @@ public final class WorldPanel {
             g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
             g.setColor(new Color(163, 179, 168));
             drawReadableText(g, Integer.toString(i + 1), x0 + 15, y + 2, new Color(235, 240, 236));
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 26));
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
             g.setColor(active ? new Color(30, 235, 105) : new Color(250, 252, 250));
             drawReadableText(g, fit(g, safe(item.title(), "Без названия"), 210), x0 + 42, y - 1,
                     active ? new Color(30, 245, 110) : Color.WHITE);
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 20));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
             g.setColor(new Color(235, 240, 236));
             drawReadableText(g, fit(g, safe(item.artists(), ""), 130), x0 + 265, y - 1, new Color(242, 246, 243));
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 17));
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
             g.setColor(new Color(245, 247, 245));
             String duration = formatTime(item.durationMs());
             drawReadableText(g, duration, x1 - 48, y - 1, new Color(245, 248, 246));
@@ -537,7 +536,7 @@ public final class WorldPanel {
 
     private static void paintNowPlaying(Graphics2D g, SpotifyClient.Snapshot s) {
         int x0 = px(4.4), x1 = px(9.8), y0 = py(12.8), y1 = py(2.5);
-        g.setColor(new Color(7, 11, 8, 238));
+        g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(255, 255, 255, 25), 1, 8);
         g.setColor(new Color(30, 215, 96, 175));
@@ -551,25 +550,25 @@ public final class WorldPanel {
         g.drawRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8);
 
         int textY = py(7.1);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 15));
         g.setColor(new Color(30, 235, 105));
         drawReadableText(g, "СЕЙЧАС ИГРАЕТ", coverX + 4, textY + 17, new Color(30, 245, 110));
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 34));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 27));
         g.setColor(Color.WHITE);
         String title = s.track() == null ? titleForInactive(s) : s.track().title();
         drawReadableText(g, fit(g, safe(title, "Ничего не играет"), x1 - x0 - 16), coverX + 4, textY + 49, Color.WHITE);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 23));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 17));
         g.setColor(new Color(248, 250, 248));
         String artist = s.track() == null ? statusDetail(s) : s.track().artists();
         drawReadableText(g, fit(g, safe(artist, ""), x1 - x0 - 16), coverX + 4, textY + 76, new Color(246, 248, 246));
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
         g.setColor(new Color(220, 230, 223));
         drawReadableText(g, s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА", coverX + 4, textY + 101, new Color(230, 238, 232));
     }
 
     private static void paintBottomPlayer(Graphics2D g, SpotifyClient.Snapshot s) {
         int x0 = px(-9.8), x1 = px(9.8), y0 = py(2.3), y1 = py(0.2);
-        g.setColor(new Color(4, 7, 5, 242));
+        g.setColor(new Color(4, 7, 5, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(30, 215, 96, 125), 1, 10);
         g.setColor(new Color(30, 215, 96, 170));
@@ -578,11 +577,11 @@ public final class WorldPanel {
         int leftCover = px(-9.4), leftY = y0 + 12;
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
         drawCover(g, cover, 48, leftCover, leftY, 50);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 24));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
         g.setColor(Color.WHITE);
         String bottomTitle = s.track() == null ? "Spotify" : s.track().title();
         drawReadableText(g, fit(g, bottomTitle, 190), leftCover + 58, leftY + 22, Color.WHITE);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 20));
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
         g.setColor(new Color(242, 245, 242));
         String bottomArtist = s.track() == null ? "Подключи аккаунт" : s.track().artists();
         drawReadableText(g, fit(g, bottomArtist, 190), leftCover + 58, leftY + 43, new Color(238, 242, 239));
@@ -611,24 +610,24 @@ public final class WorldPanel {
         g.fillRect(barX, barY, barRight - barX, 4);
         g.setColor(new Color(30, 215, 96));
         g.fillRect(barX, barY, (int) ((barRight - barX) * fraction), 4);
-        g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 15));
+        g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
         g.setColor(new Color(238, 242, 239));
-        drawPixelText(g, formatTime(progress), barX, barY - 5, g.getColor());
+        drawUiText(g, formatTime(progress), barX, barY - 5, g.getColor());
         String total = formatTime(duration);
-        drawPixelText(g, total, barRight - g.getFontMetrics().stringWidth(total), barY - 5, g.getColor());
+        drawUiText(g, total, barRight - g.getFontMetrics().stringWidth(total), barY - 5, g.getColor());
 
         int volX = px(3.5), volR = px(9.6);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
         g.setColor(new Color(248, 250, 248));
         drawReadableText(g, "ГРОМКОСТЬ", volX + 8, y0 + 21, new Color(250, 252, 250));
-        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
+        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         drawReadableText(g, Math.max(0, Math.min(100, s.volume())) + "%", volR - 33, y0 + 21, Color.WHITE);
         int vBarX = volX + 8, vBarR = volR - 8, vBarY = y0 + 34;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(vBarX, vBarY, vBarR - vBarX, 5);
         g.setColor(new Color(30, 215, 96));
         g.fillRect(vBarX, vBarY, (int) ((vBarR - vBarX) * Math.max(0, Math.min(100, s.volume())) / 100.0), 5);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         g.setColor(new Color(165, 184, 171));
         drawReadableText(g, "Зажми ЛКМ и тяни ползунок", vBarX, y0 + 57, new Color(235, 242, 237));
     }
@@ -827,10 +826,10 @@ public final class WorldPanel {
 
         // Content rows inside the selected library section.
         if (selected != null && items != null && tx >= px(-8.4) && tx <= px(4.2)
-                && ty >= py(9.1) + 48 && ty <= py(2.5)) {
-            int row = (ty - (py(9.1) + 60)) / 35;
+                && ty >= py(9.1) + 43 && ty <= py(2.5)) {
+            int row = (ty - (py(9.1) + 43)) / 42;
             int itemIndex = trackScroll + row;
-            if (row >= 0 && itemIndex < Math.min(items.size(), trackScroll + 6)) {
+            if (row >= 0 && itemIndex < Math.min(items.size(), trackScroll + 5)) {
                 client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
                 wasLeftDown = down;
                 return;
@@ -923,46 +922,34 @@ public final class WorldPanel {
 
     // -------------------------------------------------------------------- drawing helpers
 
-    /** Draws text on a half-resolution glyph grid and scales it with nearest-neighbour filtering.
-     * This gives every label a restrained pixel-font look without shipping external font files. */
-    private static void drawPixelText(Graphics2D target, String text, int x, int baselineY, Color color) {
+    /**
+     * Draw UI text directly at its final texture resolution.
+     * The previous half-resolution glyph rasterizer enlarged already aliased glyphs;
+     * at oblique world-space angles this created long blocky streaks and overlapping rows.
+     * Pixel character is now kept in the panels, frames and controls, not forced into text.
+     */
+    private static void drawUiText(Graphics2D target, String text, int x, int baselineY, Color color) {
         if (text == null || text.isEmpty()) return;
-        Font font = target.getFont();
-        FontMetrics fullMetrics = target.getFontMetrics(font);
-        // Chunkier 2x pixels for large labels; small metadata keeps single-pixel strokes
-        // so Cyrillic characters remain legible at Minecraft viewing distance.
-        final int scale = font.getSize2D() >= 18.0f ? 2 : 1;
-        Font pixelFont = font.deriveFont(Math.max(6.0f, font.getSize2D() / scale));
-        int width = Math.max(2, (int) Math.ceil(fullMetrics.stringWidth(text) / (double) scale) + 3);
-        int height = Math.max(4, (int) Math.ceil((fullMetrics.getAscent() + fullMetrics.getDescent() + 4) / (double) scale) + 2);
-        BufferedImage glyph = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D pg = glyph.createGraphics();
-        pg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-        pg.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-        pg.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_OFF);
-        pg.setFont(pixelFont);
-        pg.setColor(color == null ? Color.WHITE : color);
-        int pixelBaseline = pg.getFontMetrics().getAscent() + 1;
-        pg.drawString(text, 1, pixelBaseline);
-        pg.dispose();
-
-        Object oldInterpolation = target.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
-        target.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-        int outWidth = width * scale;
-        int outHeight = height * scale;
-        int top = baselineY - pixelBaseline * scale;
-        target.drawImage(glyph, x, top, x + outWidth, top + outHeight, null);
-        if (oldInterpolation != null) target.setRenderingHint(RenderingHints.KEY_INTERPOLATION, oldInterpolation);
+        Color oldColor = target.getColor();
+        Object oldTextAA = target.getRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING);
+        Object oldFractional = target.getRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS);
+        target.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        target.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
+        target.setColor(color == null ? oldColor : color);
+        target.drawString(text, x, baselineY);
+        target.setColor(oldColor);
+        if (oldTextAA != null) target.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, oldTextAA);
+        if (oldFractional != null) target.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, oldFractional);
     }
 
     private static void drawReadableText(Graphics2D g, String text, int x, int y, Color color) {
         if (text == null || text.isEmpty()) return;
         Color old = g.getColor();
-        drawPixelText(g, text, x + 2, y + 2, new Color(0, 0, 0, 225));
-        drawPixelText(g, text, x, y, color == null ? old : color);
+        drawUiText(g, text, x + 1, y + 1, new Color(0, 0, 0, 170));
+        drawUiText(g, text, x, y, color == null ? old : color);
     }
 
-    /** Square, stair-stepped corner frame used throughout the half-pixel interface. */
+    /** Square, stair-stepped corner frame; typography itself stays smooth and readable. */
     private static void paintPixelFrame(Graphics2D g, int x, int y, int w, int h, Color color, int thickness, int corner) {
         if (w <= 0 || h <= 0) return;
         Color old = g.getColor();
@@ -1000,9 +987,11 @@ public final class WorldPanel {
     }
 
     private static void prepare(Graphics2D g) {
+        g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
     }
 
     private static void drawCover(Graphics2D g, int[] pixels, int size, int x, int y, int target) {
