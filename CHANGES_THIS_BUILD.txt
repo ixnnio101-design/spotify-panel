@@ -51,3 +51,11 @@ Additional animation polish
 - The now-playing row highlight fades between track URIs instead of abruptly switching its background, border and text tint.
 - Scroll easing was softened and selection changes now use a gentle fade plus a small vertical settle.
 - Dragging and scrolling refresh the world-space texture at up to 60 FPS; normal playback refresh stays lighter.
+
+
+Playlist pagination and stable panel lighting
+
+- Changed Spotify library pagination to use the API-reported `total` together with manually generated `limit=50&offset=N` requests instead of stopping when Spotify's `next` URL is null. This avoids relying on the known February 2026 `/me/playlists` next-link regression.
+- Added a diagnostic log entry showing the number of playlists actually received versus the total reported by Spotify. If those numbers still differ, the log will expose whether the API is returning an incomplete page or only four total playlists.
+- Added repeated-page detection so a broken endpoint that ignores `offset` cannot duplicate entries or loop forever.
+- Kept the full-bright lightmap and changed both model and dynamic-overlay normals to a constant world-up normal, preventing orientation-dependent directional shading as the player turns.

@@ -391,12 +391,19 @@ public final class SpotifyClient {
 
     private record PageData(List<JsonObject> objects, int total) {}
 
-    /** Offset pagination used by Spotify's saved albums/tracks/shows/episodes/audiobooks endpoints. */
+    /**
+     * Offset pagination for Spotify library endpoints.
+     *
+     * Do not use the `next` URL as the stop condition: since Spotify's February 2026
+     * API migration, /me/playlists can return a broken next URL (and in some responses
+     * it can be null even though `total` says more results exist). Build every page
+     * from /me/playlists + offset ourselves and use `total` as the authoritative bound.
+     */
     private PageData fetchOffsetPages(String endpoint) throws Exception {
         List<JsonObject> out = new ArrayList<>();
+        Set<String> seenPages = new HashSet<>();
         int offset = 0;
-        int total = 0;
-        boolean first = true;
+        int total = -1;
         while (offset < 1000) {
             String separator = endpoint.contains("?") ? "&" : "?";
             HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
@@ -410,18 +417,42 @@ public final class SpotifyClient {
                 throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
             }
             JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
-            if (first) { total = (int) lng(page, "total"); first = false; }
-            JsonArray arr = page.has("items") && page.get("items").isJsonArray() ? page.getAsJsonArray("items") : new JsonArray();
-            int got = 0;
+            if (total < 0 && page.has("total") && !page.get("total").isJsonNull()) {
+                total = Math.max(0, (int) lng(page, "total"));
+            }
+            JsonArray arr = page.has("items") && page.get("items").isJsonArray()
+                    ? page.getAsJsonArray("items") : new JsonArray();
+            int got = arr.size();
+            if (got == 0) {
+                if (total > offset) LOG.warn("Spotify pagination returned an empty page for {} at offset {} (reported total {}).", endpoint, offset, total);
+                break;
+            }
+
+            // Guard against an endpoint/proxy that ignores the offset and repeats page 1.
+            String signature = arr.toString();
+            if (!seenPages.add(signature)) {
+                LOG.warn("Spotify pagination repeated a page for {} at offset {}; stopping to avoid duplicates.", endpoint, offset);
+                break;
+            }
             for (JsonElement el : arr) {
-                got++;
                 if (el.isJsonObject()) out.add(el.getAsJsonObject());
             }
-            boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
-            if (!hasNext || got == 0) break;
+
             offset += got;
+            if (total >= 0) {
+                if (offset >= total) break;
+                // Continue even when `next` is null: total is more reliable during
+                // the current /me/playlists migration than the returned next URL.
+            } else {
+                boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
+                if (!hasNext) break;
+            }
         }
-        return new PageData(out, total);
+        int reportedTotal = total < 0 ? out.size() : total;
+        if (reportedTotal > out.size()) {
+            LOG.warn("Spotify returned {} of {} items for {}.", out.size(), reportedTotal, endpoint);
+        }
+        return new PageData(out, reportedTotal);
     }
 
     private PageData fetchFollowedArtists() throws Exception {
@@ -543,12 +574,17 @@ public final class SpotifyClient {
         // Regular and private/collaborative playlists.
         try {
             PageData page = fetchOffsetPages("/me/playlists");
+            LOG.info("Spotify playlists loaded: {} of {} reported by /me/playlists.", page.objects().size(), page.total());
             for (JsonObject obj : page.objects()) {
                 Playlist p = parsePlaylist(obj);
                 if (p != null && seen.add("playlist:" + p.id())) {
                     playlistOnly.add(p);
                     all.add(asEntry(p));
                 }
+            }
+            if (page.total() > page.objects().size()) {
+                errors.add("Spotify вернул " + page.objects().size() + " из " + page.total()
+                        + " плейлистов; смотри latest.log для причины неполной пагинации");
             }
         } catch (Exception e) { errors.add("плейлисты: " + errText(e)); }
 
