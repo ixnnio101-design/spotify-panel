@@ -56,7 +56,9 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
-    private static final double MODEL_OVERLAY_X = -0.82;
+    // Dynamic content plane sits just ahead of the Blockbench foreground layer (x=-0.2),
+    // with ~1.5 cm separation to avoid z-fighting without looking detached.
+    private static final double MODEL_OVERLAY_X = -0.36;
     private static final double MODEL_CENTER_Y = 6.5;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
