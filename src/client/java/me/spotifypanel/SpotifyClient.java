@@ -149,6 +149,7 @@ public final class SpotifyClient {
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
     private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
+    private final Map<String, Integer> coverAccents = new ConcurrentHashMap<>();
     private final Set<String> coverLoading = ConcurrentHashMap.newKeySet();
     private final Set<String> coverFailed = ConcurrentHashMap.newKeySet();
 
@@ -795,6 +796,59 @@ public final class SpotifyClient {
         return m;
     }
 
+    /** Returns an artwork-derived accent color for the selected library header. */
+    public int coverAccentColor(String url) {
+        if (url == null || url.isBlank()) return 0xFF52635B;
+        Integer cached = coverAccents.get(url);
+        if (cached != null) return cached;
+        // Also starts the asynchronous artwork download if the cover is not cached yet.
+        pixels(url, 8);
+        int[] raw = rawCache.get(url);
+        if (raw == null) return 0xFF52635B;
+        int accent = extractAccentColor(raw);
+        coverAccents.put(url, accent);
+        return accent;
+    }
+
+    private static int extractAccentColor(int[] pixels) {
+        long allR = 0, allG = 0, allB = 0, allCount = 0;
+        double r = 0, g = 0, b = 0, weightSum = 0;
+        // Sample every fourth pixel. Saturated mid-range pixels get more weight than
+        // white borders, black shadows and nearly-neutral artwork.
+        for (int y = 0; y < RAW; y += 4) {
+            for (int x = 0; x < RAW; x += 4) {
+                int c = pixels[y * RAW + x];
+                int cr = (c >>> 16) & 255;
+                int cg = (c >>> 8) & 255;
+                int cb = c & 255;
+                allR += cr; allG += cg; allB += cb; allCount++;
+
+                int max = Math.max(cr, Math.max(cg, cb));
+                int min = Math.min(cr, Math.min(cg, cb));
+                double saturation = max == 0 ? 0 : (max - min) / (double) max;
+                double luminance = (0.2126 * cr + 0.7152 * cg + 0.0722 * cb) / 255.0;
+                double visibility = 0.30 + 0.70 * (1.0 - Math.abs(luminance - 0.52) / 0.52);
+                double weight = (0.18 + saturation * 2.2) * Math.max(0.20, visibility);
+                if (luminance < 0.035 || luminance > 0.97) weight *= 0.22;
+                r += cr * weight; g += cg * weight; b += cb * weight; weightSum += weight;
+            }
+        }
+        if (weightSum < 1 || allCount == 0) return 0xFF52635B;
+        int rr = (int) Math.round(r / weightSum);
+        int gg = (int) Math.round(g / weightSum);
+        int bb = (int) Math.round(b / weightSum);
+        // If the image is almost entirely monochrome, keep its neutral character.
+        double saturation = Math.max(rr, Math.max(gg, bb)) == 0 ? 0
+                : (Math.max(rr, Math.max(gg, bb)) - Math.min(rr, Math.min(gg, bb)))
+                / (double) Math.max(rr, Math.max(gg, bb));
+        if (saturation < 0.10) {
+            rr = (int) (allR / allCount);
+            gg = (int) (allG / allCount);
+            bb = (int) (allB / allCount);
+        }
+        return 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+    }
+
     private void loadRaw(String url) {
         try {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
@@ -804,6 +858,7 @@ public final class SpotifyClient {
             if (raw == null) raw = decodeNative(r.body());
             if (raw != null) {
                 rawCache.put(url, raw);
+                coverAccents.put(url, extractAccentColor(raw));
             } else {
                 coverFailed.add(url);
             }

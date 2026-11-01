@@ -17,7 +17,6 @@ import net.minecraft.client.texture.NativeImage;
 import net.minecraft.client.texture.NativeImageBackedTexture;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
@@ -71,6 +70,11 @@ public final class WorldPanel {
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
     private static boolean wasLeftDown;
+    private static final int DRAG_NONE = 0, DRAG_SEEK = 1, DRAG_VOLUME = 2;
+    private static int dragMode = DRAG_NONE;
+    private static long lastDragSendMs;
+    private static long lastDragSeekMs = -1;
+    private static int lastDragVolume = -1;
     private static String selectedLibraryKey = "";
     private static String lastRequestedLibraryKey = "";
     private static long lastItemsRequestNs;
@@ -142,6 +146,7 @@ public final class WorldPanel {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!SpotifyPanelMod.config.visible || mc.player == null || mc.world == null) {
             wasLeftDown = false;
+            dragMode = DRAG_NONE;
             return;
         }
         MatrixStack matrices = context.matrices();
@@ -151,10 +156,10 @@ public final class WorldPanel {
         Vec3d cameraPos = context.worldState().cameraRenderState.pos;
         float tickDelta = mc.getRenderTickCounter().getTickProgress(false);
         hookScroll(mc.getWindow().getHandle());
-        // Interpolate the BODY yaw between ticks. Never use camera/head yaw here: turning
-        // the mouse alone must not swing the panel. Interpolation also avoids tick-to-tick jitter.
+        // Use the BODY yaw getter available in Minecraft 1.21.11.
+        // Do not use camera/head yaw: moving the mouse alone must not swing the panel.
         Vec3d body = player.getLerpedPos(tickDelta);
-        double bodyYaw = MathHelper.lerpAngleDegrees(tickDelta, player.prevBodyYaw, player.bodyYaw);
+        double bodyYaw = player.getBodyYaw();
         long now = System.nanoTime();
 
         double bodyRad = Math.toRadians(bodyYaw);
@@ -225,6 +230,8 @@ public final class WorldPanel {
         if (scrollHooked) return;
         scrollHooked = true;
         previousScroll = GLFW.glfwSetScrollCallback(handle, (window, xOffset, yOffset) -> {
+            // Wheel is reserved for scrolling the library and track lists.
+            // Volume and seeking are controlled by holding the left mouse button on their sliders.
             if (scrollArea != 0) wheelDelta += yOffset;
             else if (previousScroll != null) previousScroll.invoke(window, xOffset, yOffset);
         });
@@ -233,7 +240,10 @@ public final class WorldPanel {
     private static void updateScrollArea(MinecraftClient mc, Vec3d cameraPos,
                                          double cx, double cy, double cz, double wx, double wz, double nx, double nz) {
         scrollArea = 0;
-        if (!(mc.currentScreen instanceof ChatScreen)) return;
+        if (!(mc.currentScreen instanceof ChatScreen)) {
+            wheelDelta = 0;
+            return;
+        }
         int sw = mc.getWindow().getScaledWidth();
         int sh = mc.getWindow().getScaledHeight();
         double mx = mc.mouse.getX() * sw / (double) mc.getWindow().getWidth();
@@ -245,11 +255,14 @@ public final class WorldPanel {
         if (uv == null) return;
         int tx = (int) (uv[0] * TEX_W);
         int ty = (int) (uv[1] * TEX_H);
+        // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
+        scrollArea = 3;
         if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) && ty <= py(2.5)) scrollArea = 1;
         else if (tx >= px(-8.4) && tx <= px(4.2) && ty >= py(9.1) && ty <= py(2.5)) scrollArea = 2;
     }
 
     private static void applyWheel(int playlistCount, int itemCount) {
+        // Unmodified wheel only scrolls the library and selected content list.
         while (Math.abs(wheelDelta) >= 1.0) {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
@@ -365,7 +378,10 @@ public final class WorldPanel {
 
     private static void paintPlaylistHeader(Graphics2D g, SpotifyClient.LibraryEntry selected, List<SpotifyClient.Item> items) {
         int x0 = px(-8.2), x1 = px(4.0), y0 = py(12.6), y1 = py(9.3);
-        g.setPaint(new GradientPaint(x0, y0, new Color(73, 43, 130, 232), x1, y1, new Color(20, 42, 29, 232)));
+        int accentRgb = selected == null ? 0xFF52635B
+                : SpotifyPanelMod.spotify.coverAccentColor(selected.coverUrl());
+        Color[] headerColors = headerGradient(accentRgb);
+        g.setPaint(new GradientPaint(0, y0, headerColors[0], 0, y1, headerColors[1]));
         g.fillRoundRect(x0, y0, x1 - x0, y1 - y0, 15, 15);
         paintLowPolyFacets(g, x0, y0, x1 - x0, y1 - y0, 1);
         g.setColor(new Color(255, 255, 255, 35));
@@ -405,6 +421,33 @@ public final class WorldPanel {
         String meta = selected == null ? "Подключи Spotify, чтобы увидеть медиатеку"
                 : safe(selected.owner(), "Spotify") + "  •  " + (items == null ? selected.total() : items.size()) + " " + countLabel;
         g.drawString(fit(g, meta, textWidth), textX + 2, y1 - 17);
+    }
+
+    /** Build Spotify-like top/bottom shades from the selected artwork's dominant hue. */
+    private static Color[] headerGradient(int argb) {
+        Color source = new Color(argb, true);
+        float[] hsb = Color.RGBtoHSB(source.getRed(), source.getGreen(), source.getBlue(), null);
+        float hue = hsb[0];
+        float saturation = hsb[1];
+        float brightness = hsb[2];
+
+        // Keep monochrome covers grey; boost colorful covers enough to read like Spotify's
+        // artwork-tinted header without turning them into a neon flat fill.
+        if (saturation < 0.12f) {
+            int neutralTop = Math.max(64, Math.min(142, Math.round(62 + brightness * 78)));
+            int neutralBottom = Math.max(24, Math.round(neutralTop * 0.34f));
+            return new Color[]{new Color(neutralTop, neutralTop, neutralTop, 238),
+                    new Color(neutralBottom, neutralBottom, neutralBottom, 238)};
+        }
+
+        float topSat = Math.max(0.56f, Math.min(0.92f, saturation * 1.48f));
+        float bottomSat = Math.max(0.62f, Math.min(0.96f, topSat * 1.08f));
+        float topBrightness = Math.max(0.48f, Math.min(0.82f, 0.46f + brightness * 0.40f));
+        float bottomBrightness = Math.max(0.16f, topBrightness * 0.34f);
+        Color top = new Color(Color.HSBtoRGB(hue, topSat, topBrightness));
+        Color bottom = new Color(Color.HSBtoRGB(hue, bottomSat, bottomBrightness));
+        return new Color[]{new Color(top.getRed(), top.getGreen(), top.getBlue(), 238),
+                new Color(bottom.getRed(), bottom.getGreen(), bottom.getBlue(), 238)};
     }
 
     private static void paintTrackTable(Graphics2D g, SpotifyClient.Snapshot snapshot,
@@ -567,6 +610,9 @@ public final class WorldPanel {
         g.fillRoundRect(vBarX, vBarY, vBarR - vBarX, 5, 4, 4);
         g.setColor(new Color(30, 215, 96));
         g.fillRoundRect(vBarX, vBarY, (int) ((vBarR - vBarX) * Math.max(0, Math.min(100, s.volume())) / 100.0), 5, 4, 4);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
+        g.setColor(new Color(165, 184, 171));
+        g.drawString("Зажми ЛКМ и тяни ползунок", vBarX, y0 + 57);
     }
 
     /** Subtle angular facets: a low-poly surface treatment that does not compete with labels. */
@@ -686,25 +732,95 @@ public final class WorldPanel {
         long windowHandle = mc.getWindow().getHandle();
         boolean down = chatOpen && GLFW.glfwGetMouseButton(windowHandle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
         boolean clicked = down && !wasLeftDown;
-        wasLeftDown = down;
-        if (!clicked) return;
+        boolean released = !down && wasLeftDown;
+
+        // If the chat closes while dragging, stop cleanly instead of keeping a stale drag state.
+        if (!chatOpen) {
+            dragMode = DRAG_NONE;
+            wasLeftDown = false;
+            return;
+        }
 
         int sw = mc.getWindow().getScaledWidth();
         int sh = mc.getWindow().getScaledHeight();
         double mx = mc.mouse.getX() * sw / (double) mc.getWindow().getWidth();
         double my = mc.mouse.getY() * sh / (double) mc.getWindow().getHeight();
         Vec3d ray = mouseRay(mc, mx, my, sw, sh);
-        if (ray == null) return;
+        if (ray == null) {
+            if (released) dragMode = DRAG_NONE;
+            wasLeftDown = down;
+            return;
+        }
 
         Vec3d faceCenter = modelPoint(MODEL_OVERLAY_X, MODEL_CENTER_Y, 0, cx, cy, cz, wx, wz, nx, nz);
-        double[] uv = intersectUv(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
-        if (uv == null) return;
-        int tx = (int) (uv[0] * TEX_W);
-        int ty = (int) (uv[1] * TEX_H);
+        // Unbounded intersection is used while dragging so the pointer can move slightly
+        // outside the bar and still clamp to 0% / 100% without losing the drag.
+        double[] uv = intersectUvUnbounded(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
+        if (uv == null) {
+            if (released) dragMode = DRAG_NONE;
+            wasLeftDown = down;
+            return;
+        }
+        int tx = (int) Math.round(uv[0] * TEX_W);
+        int ty = (int) Math.round(uv[1] * TEX_H);
         SpotifyClient client = SpotifyPanelMod.spotify;
 
-        int sideLeft = px(-9.8), sideRight = px(-8.6);
-        if (tx >= sideLeft && tx <= sideRight && ty >= py(12.8) + 45 && ty <= py(2.5)) {
+        int bottomTop = py(2.3), bottomBottom = py(0.2);
+        int progressX0 = px(-4.0), progressX1 = px(2.7), progressY = bottomBottom - 12;
+        int volumeX0 = px(3.5) + 8, volumeX1 = px(9.6) - 8, volumeY = bottomTop + 34;
+
+        // Continue changing the value every frame while LMB is held. Send requests at a
+        // modest rate and always send the final value on release to avoid flooding Spotify.
+        if (dragMode != DRAG_NONE) {
+            if (down || released) updateDrag(client, tx, dragMode == DRAG_SEEK, released);
+            if (released) {
+                dragMode = DRAG_NONE;
+                lastDragSeekMs = -1;
+                lastDragVolume = -1;
+            }
+            wasLeftDown = down;
+            return;
+        }
+
+        if (!clicked) {
+            wasLeftDown = down;
+            return;
+        }
+
+        // Begin dragging the progress bar.
+        if (ty >= progressY - 10 && ty <= progressY + 11
+                && tx >= progressX0 - 8 && tx <= progressX1 + 8) {
+            SpotifyClient.Track track = client.snapshot().track();
+            if (track != null && track.durationMs() > 0) {
+                dragMode = DRAG_SEEK;
+                lastDragSeekMs = -1;
+                lastDragSendMs = 0;
+                updateDrag(client, tx, true, true);
+                wasLeftDown = down;
+                return;
+            }
+        }
+
+        // Begin dragging the volume slider.
+        if (ty >= volumeY - 10 && ty <= volumeY + 12
+                && tx >= volumeX0 - 8 && tx <= volumeX1 + 8) {
+            if (client.snapshot().status() == SpotifyClient.Status.ACTIVE) {
+                dragMode = DRAG_VOLUME;
+                lastDragVolume = -1;
+                lastDragSendMs = 0;
+                updateDrag(client, tx, false, true);
+                wasLeftDown = down;
+                return;
+            }
+        }
+
+        // All remaining click actions must start inside the actual panel surface.
+        if (uv[0] < 0 || uv[0] > 1 || uv[1] < 0 || uv[1] > 1) {
+            wasLeftDown = down;
+            return;
+        }
+
+        if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) + 45 && ty <= py(2.5)) {
             int slot = Math.max(0, (ty - (py(12.8) + 53)) / 46);
             int entryIndex = sideScroll + slot;
             if (entryIndex < libraryEntries.size() && slot < 7) {
@@ -713,9 +829,9 @@ public final class WorldPanel {
                 trackScroll = 0;
                 lastRequestedLibraryKey = "";
                 client.requestItems(clickedEntry, false);
-                // Selecting a library icon also starts its context or saved collection.
                 client.playLibraryEntry(clickedEntry, SpotifyPanelMod::say);
             }
+            wasLeftDown = down;
             return;
         }
 
@@ -726,37 +842,51 @@ public final class WorldPanel {
             int itemIndex = trackScroll + row;
             if (row >= 0 && itemIndex < Math.min(items.size(), trackScroll + 7)) {
                 client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
+                wasLeftDown = down;
                 return;
             }
         }
 
-        // Bottom player controls and progress bar.
-        int bottomTop = py(2.3), bottomBottom = py(0.2);
-        int center = (px(-4.4) + px(3.1)) / 2;
+        // Bottom transport controls (progress and volume are handled by drag above).
         if (ty >= bottomTop && ty <= bottomBottom) {
-            if (ty >= bottomBottom - 20 && tx >= px(-4.0) && tx <= px(2.7)) {
-                SpotifyClient.Track track = client.snapshot().track();
-                if (track != null && track.durationMs() > 0) {
-                    double fraction = Math.max(0, Math.min(1, (tx - px(-4.0)) / (double) (px(2.7) - px(-4.0))));
-                    client.seek((long) (track.durationMs() * fraction), SpotifyPanelMod::say);
-                }
-                return;
-            }
+            int center = (px(-4.4) + px(3.1)) / 2;
             if (ty <= bottomTop + 46 && tx >= center - 70 && tx <= center + 70) {
                 if (tx < center - 22) client.previous(SpotifyPanelMod::say);
                 else if (tx > center + 25) client.next(SpotifyPanelMod::say);
                 else client.togglePlay(SpotifyPanelMod::say);
-                return;
-            }
-            if (tx >= px(3.5) && tx <= px(9.6)) {
-                double volume = Math.max(0, Math.min(1,
-                        (tx - (px(3.5) + 8)) / (double) (px(9.6) - px(3.5) - 16)));
-                client.volume((int) Math.round(volume * 100), SpotifyPanelMod::say);
+                wasLeftDown = down;
                 return;
             }
         }
         if (tx >= px(4.4) && ty >= py(7.4) && ty <= py(2.7)) {
             client.togglePlay(SpotifyPanelMod::say);
+        }
+        wasLeftDown = down;
+    }
+
+    private static void updateDrag(SpotifyClient client, int textureX, boolean seek, boolean force) {
+        long now = System.currentTimeMillis();
+        if (seek) {
+            SpotifyClient.Snapshot snapshot = client.snapshot();
+            SpotifyClient.Track track = snapshot.track();
+            if (track == null || track.durationMs() <= 0) return;
+            int x0 = px(-4.0), x1 = px(2.7);
+            double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
+            long target = Math.max(0, Math.min(track.durationMs(), Math.round(track.durationMs() * fraction)));
+            if (target != lastDragSeekMs && (force || now - lastDragSendMs >= 250)) {
+                client.seek(target, SpotifyPanelMod::say);
+                lastDragSeekMs = target;
+                lastDragSendMs = now;
+            }
+        } else {
+            int x0 = px(3.5) + 8, x1 = px(9.6) - 8;
+            double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
+            int target = (int) Math.round(fraction * 100.0);
+            if (target != lastDragVolume && (force || now - lastDragSendMs >= 180)) {
+                client.volume(target, SpotifyPanelMod::say);
+                lastDragVolume = target;
+                lastDragSendMs = now;
+            }
         }
     }
 
@@ -781,6 +911,14 @@ public final class WorldPanel {
     private static double[] intersectUv(Vec3d origin, Vec3d direction, Vec3d planeCenter,
                                         double wx, double wz, double nx, double nz,
                                         double width, double height) {
+        double[] uv = intersectUvUnbounded(origin, direction, planeCenter, wx, wz, nx, nz, width, height);
+        if (uv == null || uv[0] < 0 || uv[0] > 1 || uv[1] < 0 || uv[1] > 1) return null;
+        return uv;
+    }
+
+    private static double[] intersectUvUnbounded(Vec3d origin, Vec3d direction, Vec3d planeCenter,
+                                                 double wx, double wz, double nx, double nz,
+                                                 double width, double height) {
         Vec3d normal = new Vec3d(nx, 0, nz).normalize();
         double denominator = direction.dotProduct(normal);
         if (Math.abs(denominator) < 1e-7) return null;
@@ -790,7 +928,6 @@ public final class WorldPanel {
         Vec3d delta = hit.subtract(planeCenter);
         double localX = delta.x * wx + delta.z * wz;
         double localY = delta.y;
-        if (Math.abs(localX) > width / 2.0 || Math.abs(localY) > height / 2.0) return null;
         return new double[]{localX / width + 0.5, 0.5 - localY / height};
     }
 
