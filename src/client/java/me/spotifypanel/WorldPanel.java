@@ -56,7 +56,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 6.5;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -644,25 +644,37 @@ public final class WorldPanel {
             Color numberActive = new Color(30, 235, 105);
             Color titleBase = Color.WHITE;
             Color titleActive = new Color(220, 255, 232);
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
+            // Larger typography, centered in each column and vertically within the row.
+            // No horizontal row separators: they made the panel look visually split.
+            int textBaseline = y + 8;
+            int numberCenter = x0 + 25;
+            int titleLeft = x0 + 42, titleRight = x0 + 250;
+            int artistLeft = x0 + 258, artistRight = x1 - 55;
+            int durationLeft = x1 - 52, durationRight = x1 - 10;
+
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 18));
             g.setColor(blend(numberBase, numberActive, highlight));
-            drawReadableText(g, Integer.toString(itemIndex + 1), x0 + 15, y + 2,
-                    blend(new Color(235, 240, 236), numberActive, highlight));
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+            String number = Integer.toString(itemIndex + 1);
+            drawReadableText(g, number, numberCenter - g.getFontMetrics().stringWidth(number) / 2,
+                    textBaseline, blend(new Color(235, 240, 236), numberActive, highlight));
+
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 22));
             g.setColor(blend(titleBase, titleActive, highlight));
-            drawReadableText(g, fit(g, safe(item.title(), "Без названия"), 210), x0 + 42, y - 1,
-                    blend(Color.WHITE, titleActive, highlight));
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+            String title = fit(g, safe(item.title(), "Без названия"), titleRight - titleLeft);
+            drawReadableText(g, title, titleLeft + (titleRight - titleLeft - g.getFontMetrics().stringWidth(title)) / 2,
+                    textBaseline, blend(Color.WHITE, titleActive, highlight));
+
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 19));
             g.setColor(new Color(235, 240, 236));
-            drawReadableText(g, fit(g, safe(item.artists(), ""), 130), x0 + 265, y - 1, new Color(242, 246, 243));
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
+            String artists = fit(g, safe(item.artists(), ""), artistRight - artistLeft);
+            drawReadableText(g, artists, artistLeft + (artistRight - artistLeft - g.getFontMetrics().stringWidth(artists)) / 2,
+                    textBaseline, new Color(242, 246, 243));
+
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 20));
             g.setColor(new Color(245, 247, 245));
             String duration = formatTime(item.durationMs());
-            drawReadableText(g, duration, x1 - 48, y - 1, new Color(245, 248, 246));
-            if (i < rows - 1) {
-                g.setColor(new Color(255, 255, 255, 20));
-                g.drawLine(x0 + 12, y + 9, x1 - 12, y + 9);
-            }
+            drawReadableText(g, duration, durationLeft + (durationRight - durationLeft - g.getFontMetrics().stringWidth(duration)) / 2,
+                    textBaseline, new Color(245, 248, 246));
         }
         g.setClip(oldClip);
     }
