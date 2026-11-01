@@ -71,7 +71,11 @@ public final class SpotifyClient {
         }
     }
 
-    public record Item(String title, String artists, long durationMs, String uri) {}
+    public record Item(String title, String artists, long durationMs, String uri, String albumUri) {
+        public Item(String title, String artists, long durationMs, String uri) {
+            this(title, artists, durationMs, uri, "");
+        }
+    }
 
     public record Snapshot(Status status, boolean playing, Track track, long progressMs, long fetchedAtMs,
                            String device, int volume, boolean shuffle, String repeat, String error) {
@@ -126,6 +130,11 @@ public final class SpotifyClient {
     private final Object pollLock = new Object();
     private final AtomicBoolean pollPending = new AtomicBoolean();
     private final AtomicInteger pendingVolume = new AtomicInteger(-1);
+    private final AtomicBoolean volumeFlushScheduled = new AtomicBoolean();
+    private volatile long lastVolumeRequestAtMs;
+    private static final long MIN_VOLUME_REQUEST_INTERVAL_MS = 120;
+    private static final int MAX_VOLUME_RAMP_STEP = 8;
+    private final AtomicInteger volumeRampValue = new AtomicInteger(-1);
     /** До этого момента ответы опроса игнорируются: на экране то, что игрок только что нажал (без «отскока»). */
     private volatile long ignorePollUntil = 0;
     private volatile long lastLocalAt = 0;
@@ -289,6 +298,9 @@ public final class SpotifyClient {
 
         snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
+        if (pendingVolume.get() < 0 && !volumeFlushScheduled.get()) {
+            volumeRampValue.set(Math.max(0, Math.min(100, volume)));
+        }
     }
 
     private static String artistsOf(JsonObject item) {
@@ -509,7 +521,16 @@ public final class SpotifyClient {
     private static Item parseTrackItem(JsonObject item) {
         String uri = str(item, "uri");
         if (uri.isEmpty()) return null;
-        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri);
+        String albumUri = "";
+        if (item.has("album") && item.get("album").isJsonObject()) {
+            JsonObject album = item.getAsJsonObject("album");
+            albumUri = str(album, "uri");
+            if (albumUri.isEmpty()) {
+                String albumId = str(album, "id");
+                if (!albumId.isEmpty()) albumUri = "spotify:album:" + albumId;
+            }
+        }
+        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri, albumUri);
     }
 
     private void loadLibrary() {
@@ -529,7 +550,16 @@ public final class SpotifyClient {
                     all.add(asEntry(p));
                 }
             }
-        } catch (Exception e) { errors.add("плейлисты: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("плейлисты: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Saved albums.
         try {
@@ -538,7 +568,16 @@ public final class SpotifyClient {
                 LibraryEntry entry = albumEntry(nested(wrapper, "album"));
                 if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-        } catch (Exception e) { errors.add("альбомы: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("альбомы: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Followed artists (cursor pagination rather than offset pagination).
         try {
@@ -547,7 +586,16 @@ public final class SpotifyClient {
                 LibraryEntry entry = artistEntry(obj);
                 if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-        } catch (Exception e) { errors.add("исполнители: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("исполнители: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Liked songs are a synthetic collection backed by /me/tracks.
         try {
@@ -564,7 +612,16 @@ public final class SpotifyClient {
             items.put(key, liked);
             itemsTime.put(key, System.currentTimeMillis());
             all.add(new LibraryEntry("liked", "Любимые треки", "Твоя медиатека", page.total(), cover, "", "saved_tracks"));
-        } catch (Exception e) { errors.add("любимые треки: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("любимые треки: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Saved podcast shows.
         try {
@@ -573,7 +630,16 @@ public final class SpotifyClient {
                 LibraryEntry entry = showEntry(nested(wrapper, "show"));
                 if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-        } catch (Exception e) { errors.add("подкасты: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("подкасты: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Saved episodes as a single collection.
         try {
@@ -594,7 +660,16 @@ public final class SpotifyClient {
             items.put(key, savedEpisodes);
             itemsTime.put(key, System.currentTimeMillis());
             all.add(new LibraryEntry("episodes", "Сохранённые эпизоды", "Твоя медиатека", page.total(), cover, "", "saved_episodes"));
-        } catch (Exception e) { errors.add("эпизоды: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("эпизоды: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Audiobooks.
         try {
@@ -603,7 +678,16 @@ public final class SpotifyClient {
                 LibraryEntry entry = audiobookEntry(nested(wrapper, "audiobook"));
                 if (entry != null && seen.add(entry.key())) all.add(entry);
             }
-        } catch (Exception e) { errors.add("аудиокниги: " + errText(e)); }
+        } catch (Exception e) {
+            errors.add("аудиокниги: " + errText(e));
+            if (retryAfterMs > 0) {
+                // Spotify applies a shared API rate limit. Stop this refresh immediately
+                // instead of hammering every remaining library endpoint with HTTP 429.
+                playlistsError = "Spotify ограничил запросы (HTTP 429). Медиатека сохранена; повторная загрузка будет позже.";
+                SpotifyPanelMod.say(playlistsError + " Подожди и не запускай /spotify login повторно.");
+                return;
+            }
+        }
 
         // Extra playlists manually added by Spotify URL.
         for (String id : new ArrayList<>(SpotifyPanelMod.config.extraPlaylists)) {
@@ -747,9 +831,11 @@ public final class SpotifyClient {
                 err.accept("Сначала загружаю содержимое коллекции — нажми ещё раз через секунду.");
                 return;
             }
-            List<String> uris = loaded.stream().map(Item::uri).filter(u -> u != null && !u.isEmpty()).limit(100).toList();
-            if (uris.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
-            playUris(uris, err);
+            if (loaded.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
+            // Liked Songs is not a Spotify playback context. On some desktop clients,
+            // a bare `uris` playback request may clear the current player. Start the
+            // chosen saved track through its album context and exact track offset instead.
+            playTrackFromAlbum(loaded.get(0), err);
             return;
         }
         // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
@@ -772,7 +858,18 @@ public final class SpotifyClient {
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
+            case "saved_tracks" -> playTrackFromAlbum(item, err);
             default -> playUris(List.of(item.uri()), err);
+        }
+    }
+
+    private void playTrackFromAlbum(Item item, Consumer<String> err) {
+        if (item == null || item.uri().isEmpty()) return;
+        if (item.albumUri() != null && !item.albumUri().isEmpty()) {
+            playContext(item.albumUri(), item.uri(), err);
+        } else {
+            // Fallback for an incomplete API response. Most track objects include album.uri.
+            playUris(List.of(item.uri()), err);
         }
     }
 
@@ -940,20 +1037,63 @@ public final class SpotifyClient {
 
     public void previous(Consumer<String> err) { control("POST", "/me/player/previous", null, err); }
 
-    /** Можно вызывать хоть каждый кадр при перетаскивании: лишние значения склеиваются, уходит последнее. */
+    /**
+     * Update the visible value immediately, but coalesce rapid slider movements into
+     * at most one in-flight volume command plus one latest pending value. This prevents
+     * a long queue of stale Spotify requests while the player drags the slider.
+     */
     public void volume(int percent, Consumer<String> err) {
         int v = Math.max(0, Math.min(100, percent));
-        local(s -> s.withVolume(v), 1500);
+        Snapshot before = snapshot;
+        if (volumeRampValue.get() < 0 && before.status() == Status.ACTIVE) {
+            volumeRampValue.compareAndSet(-1, Math.max(0, Math.min(100, before.volume())));
+        }
+        // The slider responds instantly; the real Spotify device is eased toward the
+        // requested value in small steps so the audible volume does not jump abruptly.
+        local(s -> s.withVolume(v), 1800);
         pendingVolume.set(v);
-        ctl.submit(() -> {
-            int p = pendingVolume.getAndSet(-1);
-            if (p >= 0) doControl("PUT", "/me/player/volume?volume_percent=" + p, null, err);
-        });
+        scheduleVolumeFlush(err);
+    }
+
+    private void scheduleVolumeFlush(Consumer<String> err) {
+        if (!volumeFlushScheduled.compareAndSet(false, true)) return;
+        long elapsed = System.currentTimeMillis() - lastVolumeRequestAtMs;
+        long delay = Math.max(0, MIN_VOLUME_REQUEST_INTERVAL_MS - elapsed);
+        exec.schedule(() -> ctl.submit(() -> flushPendingVolume(err)), delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void flushPendingVolume(Consumer<String> err) {
+        try {
+            int requested = pendingVolume.getAndSet(-1);
+            if (requested >= 0) {
+                int current = volumeRampValue.get();
+                if (current < 0) current = requested;
+                int delta = requested - current;
+                int step = Math.max(-MAX_VOLUME_RAMP_STEP, Math.min(MAX_VOLUME_RAMP_STEP, delta));
+                int next = Math.max(0, Math.min(100, current + step));
+                lastVolumeRequestAtMs = System.currentTimeMillis();
+                boolean success = doControl("PUT", "/me/player/volume?volume_percent=" + next, null, err);
+                if (success) {
+                    volumeRampValue.set(next);
+                    // Continue the ramp, unless a newer mouse value arrived while the
+                    // previous network request was in flight.
+                    if (next != requested) pendingVolume.compareAndSet(-1, requested);
+                } else {
+                    volumeRampValue.set(-1);
+                    pendingVolume.set(-1);
+                }
+            }
+        } finally {
+            volumeFlushScheduled.set(false);
+            if (pendingVolume.get() >= 0) scheduleVolumeFlush(err);
+        }
     }
 
     public void seek(long ms, Consumer<String> err) {
-        long v = Math.max(0, ms);
-        local(s -> s.withProgress(v), 2000);
+        Snapshot current = snapshot;
+        long max = current.track() == null ? Long.MAX_VALUE : Math.max(0L, current.track().durationMs());
+        long v = Math.max(0L, Math.min(max, ms));
+        local(s -> s.withProgress(v), 1800);
         control("PUT", "/me/player/seek?position_ms=" + v, null, err);
     }
 
@@ -990,7 +1130,7 @@ public final class SpotifyClient {
     }
 
     private void control(String method, String path, String body, Consumer<String> err) {
-        ctl.submit(() -> doControl(method, path, body, err));
+        ctl.submit(() -> { doControl(method, path, body, err); });
     }
 
     private void pollOnce(long delayMs) {
@@ -1008,24 +1148,27 @@ public final class SpotifyClient {
         exec.submit(this::poll);
     }
 
-    private void doControl(String method, String path, String body, Consumer<String> err) {
+    private boolean doControl(String method, String path, String body, Consumer<String> err) {
         try {
             if (!auth.isLoggedIn()) {
                 err.accept("Сначала войди: /spotify login");
                 revert();
-                return;
+                return false;
             }
             HttpResponse<String> r = send(method, path, body);
             int sc = r.statusCode();
             if (sc == 404) {
                 err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
                 revert();
+                return false;
             } else if (sc == 403) {
                 err.accept("Spotify отказал (нужен Premium или действие недоступно).");
                 revert();
+                return false;
             } else if (sc >= 300) {
                 err.accept("Spotify: HTTP " + sc);
                 revert();
+                return false;
             } else {
                 long wait = ignorePollUntil - System.currentTimeMillis();
                 if (wait > 0) {
@@ -1035,10 +1178,13 @@ public final class SpotifyClient {
                     exec.schedule(this::poll, 400, TimeUnit.MILLISECONDS);
                     exec.schedule(this::poll, 1300, TimeUnit.MILLISECONDS);
                 }
+                return true;
             }
         } catch (Exception e) {
             err.accept("Ошибка: " + errText(e));
             revert();
+            return false;
         }
+        return false;
     }
 }
