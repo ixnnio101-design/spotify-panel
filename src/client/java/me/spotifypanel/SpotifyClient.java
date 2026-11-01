@@ -1122,6 +1122,5 @@ public final class SpotifyClient {
             revert();
             return false;
         }
-        return false;
     }
 }
