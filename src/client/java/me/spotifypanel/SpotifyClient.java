@@ -121,6 +121,15 @@ public final class SpotifyClient {
         return t;
     });
 
+    // All Spotify Web API calls share one request gate. This prevents the player poll,
+    // library refresh and user controls from bursting the same app-wide rate limit.
+    private final Object apiRequestLock = new Object();
+    private long nextApiRequestAtMs;
+    private long apiCooldownUntilMs;
+    private static final long MIN_API_REQUEST_GAP_MS = 900;
+    private static final long DEFAULT_RETRY_AFTER_MS = 15_000;
+    private static final long MAX_RETRY_AFTER_MS = 5 * 60_000L;
+
     /** Команды управления идут строго по очереди, чтобы громкость/перемотка не приходили в перепутанном порядке. */
     private final ExecutorService ctl = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "spotifypanel-ctl");
@@ -167,7 +176,7 @@ public final class SpotifyClient {
     }
 
     public void start() {
-        exec.scheduleWithFixedDelay(this::poll, 1, 2, TimeUnit.SECONDS);
+        exec.scheduleWithFixedDelay(this::poll, 1, 4, TimeUnit.SECONDS);
     }
 
     public Snapshot snapshot() { return snapshot; }
@@ -191,15 +200,54 @@ public final class SpotifyClient {
     // ------------------------------------------------------------- HTTP
 
     private HttpResponse<String> send(String method, String path, String jsonBody) throws Exception {
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
-                .header("Authorization", "Bearer " + auth.accessToken())
-                .timeout(Duration.ofSeconds(10));
-        if (jsonBody == null) {
-            b.method(method, HttpRequest.BodyPublishers.noBody());
-        } else {
-            b.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofString(jsonBody));
+        synchronized (apiRequestLock) {
+            long now = System.currentTimeMillis();
+            long waitUntil = Math.max(nextApiRequestAtMs, apiCooldownUntilMs);
+            long waitMs = waitUntil - now;
+            if (waitMs > 0) Thread.sleep(waitMs);
+
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
+                    .header("Authorization", "Bearer " + auth.accessToken())
+                    .timeout(Duration.ofSeconds(15));
+            if (jsonBody == null) {
+                b.method(method, HttpRequest.BodyPublishers.noBody());
+            } else {
+                b.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofString(jsonBody));
+            }
+
+            HttpResponse<String> response;
+            try {
+                response = Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
+            } finally {
+                // Even failed requests leave a small gap before the next API call.
+                nextApiRequestAtMs = System.currentTimeMillis() + MIN_API_REQUEST_GAP_MS;
+            }
+
+            if (response.statusCode() == 429) {
+                long retryMs = parseRetryAfterMillis(response);
+                long retryUntil = System.currentTimeMillis() + retryMs;
+                apiCooldownUntilMs = Math.max(apiCooldownUntilMs, retryUntil);
+                retryAfterMs = Math.max(retryAfterMs, retryMs);
+                LOG.warn("Spotify API rate limit (429) on {}. Pausing all Web API requests for {} seconds (Retry-After).",
+                        path, Math.max(1, retryMs / 1000));
+            }
+            return response;
         }
-        return Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static long parseRetryAfterMillis(HttpResponse<?> response) {
+        String value = response.headers().firstValue("Retry-After").orElse("").trim();
+        if (!value.isEmpty()) {
+            try {
+                double seconds = Double.parseDouble(value);
+                long millis = (long) Math.ceil(seconds * 1000.0);
+                return Math.max(1_000L, Math.min(MAX_RETRY_AFTER_MS, millis));
+            } catch (NumberFormatException ignored) {
+                // Spotify normally sends a number of seconds. Fall back safely if
+                // a proxy or future API version returns an unexpected value.
+            }
+        }
+        return DEFAULT_RETRY_AFTER_MS;
     }
 
     private static String errText(Throwable e) {
@@ -227,6 +275,10 @@ public final class SpotifyClient {
 
             long now = System.currentTimeMillis();
             if (now >= nextPlaylistTry) tryLoadPlaylists();
+
+            // The library refresh makes a sequence of requests. Pause the recurring
+            // player poll until it finishes so both jobs do not compete for the quota.
+            if (playlistsLoading.get()) return;
 
             long started = System.currentTimeMillis();
             HttpResponse<String> r = send("GET", "/me/player", null);
@@ -941,10 +993,18 @@ public final class SpotifyClient {
     }
 
     private static int[] decodeNative(byte[] bytes) {
+        // NativeImage.read expects PNG. ImageIO above handles common formats such as
+        // JPEG; do not feed HTML/error bodies or non-PNG formats into the PNG decoder.
+        if (bytes == null || bytes.length < 8
+                || (bytes[0] & 0xFF) != 0x89 || bytes[1] != 0x50 || bytes[2] != 0x4E
+                || bytes[3] != 0x47 || bytes[4] != 0x0D || bytes[5] != 0x0A
+                || bytes[6] != 0x1A || bytes[7] != 0x0A) {
+            return null;
+        }
         try (NativeImage img = NativeImage.read(new ByteArrayInputStream(bytes))) {
             return downsample(img.getWidth(), img.getHeight(), img::getColorArgb, RAW);
         } catch (Throwable e) {
-            LOG.warn("NativeImage decode failed", e);
+            LOG.debug("PNG artwork decode failed: {}", e.toString());
             return null;
         }
     }

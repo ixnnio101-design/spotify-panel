@@ -59,3 +59,9 @@ Playlist pagination and stable panel lighting
 - Added a diagnostic log entry showing the number of playlists actually received versus the total reported by Spotify. If those numbers still differ, the log will expose whether the API is returning an incomplete page or only four total playlists.
 - Added repeated-page detection so a broken endpoint that ignores `offset` cannot duplicate entries or loop forever.
 - Kept the full-bright lightmap and changed both model and dynamic-overlay normals to a constant world-up normal, preventing orientation-dependent directional shading as the player turns.
+
+Rate-limit handling update (2026-11-01):
+- Serialize all Spotify Web API requests through one shared request gate.
+- Respect Retry-After after HTTP 429 and apply a small gap between requests.
+- Pause the periodic player poll while the library is loading; reduce background polling to once every 4 seconds.
+- Avoid feeding non-PNG response bodies into Minecraft's PNG decoder (the ImageIO decoder is tried first).
