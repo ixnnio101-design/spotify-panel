@@ -56,9 +56,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
-    // Dynamic content plane sits just ahead of the Blockbench foreground layer (x=-0.2),
-    // with ~1.5 cm separation to avoid z-fighting without looking detached.
-    private static final double MODEL_OVERLAY_X = -0.36;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 6.5;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -792,11 +790,10 @@ public final class WorldPanel {
         Vec3d bottomRight = modelPoint(planeX, part.y0(), part.z1(), cx, cy, cz, wx, wz, nx, nz);
         Vec3d topRight = modelPoint(planeX, part.y1(), part.z1(), cx, cy, cz, wx, wz, nx, nz);
         Vec3d topLeft = modelPoint(planeX, part.y1(), part.z0(), cx, cy, cz, wx, wz, nx, nz);
-        // Keep a constant world-up normal. The panel already uses the full-bright
-        // lightmap; rotating its normal with body yaw still lets the entity shader's
-        // directional diffuse term change brightness as the player turns.
+        // Correct vertical-plane normal plus full-bright lightmap keeps the surface
+        // consistently lit while the player's body turns.
         drawMaterialQuad(vc, matrix, bottomLeft, bottomRight, topRight, topLeft,
-                part.frontColor(), 0.0, 1.0, 0.0);
+                part.frontColor(), nx, 0, nz);
     }
 
     private static Vec3d modelPoint(double localX, double localY, double localZ,
@@ -842,20 +839,20 @@ public final class WorldPanel {
         Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 13, -10, cx, cy, cz, wx, wz, nx, nz);
         // The overlay is offset forward from the model surfaces and emitted once,
         // avoiding coplanar alpha blending and the resulting sparkle/flicker.
-        overlayVertex(vc, entry, p0, 0, 1, 0.0, 1.0, 0.0);
-        overlayVertex(vc, entry, p1, 1, 1, 0.0, 1.0, 0.0);
-        overlayVertex(vc, entry, p2, 1, 0, 0.0, 1.0, 0.0);
-        overlayVertex(vc, entry, p3, 0, 0, 0.0, 1.0, 0.0);
+        overlayVertex(vc, entry, p0, 0, 1, nx, nz);
+        overlayVertex(vc, entry, p1, 1, 1, nx, nz);
+        overlayVertex(vc, entry, p2, 1, 0, nx, nz);
+        overlayVertex(vc, entry, p3, 0, 0, nx, nz);
     }
 
     private static void overlayVertex(VertexConsumer vc, MatrixStack.Entry entry, Vec3d p,
-                                      float u, float v, double nx, double ny, double nz) {
+                                      float u, float v, double nx, double nz) {
         vc.vertex(entry, (float) p.x, (float) p.y, (float) p.z)
                 .color(255, 255, 255, 255)
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
                 .light(FULL_BRIGHT)
-                .normal(entry, (float) nx, (float) ny, (float) nz);
+                .normal(entry, (float) nx, 0.0f, (float) nz);
     }
 
     // -------------------------------------------------------------------- click handling against the model's world-space front
