@@ -38,6 +38,7 @@ public final class SpotifyCommands {
                         }))
                         .then(ClientCommandManager.literal("logout").executes(ctx -> {
                             SpotifyPanelMod.auth.logout();
+                            if (SpotifyPanelMod.spotify != null) SpotifyPanelMod.spotify.clearLibraryCache();
                             SpotifyPanelMod.say("Вышел из Spotify.");
                             return 1;
                         }))

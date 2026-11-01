@@ -31,7 +31,7 @@ import java.util.function.Consumer;
 public final class SpotifyAuth {
     public static final int PORT = 8888;
     public static final String REDIRECT = "http://127.0.0.1:" + PORT + "/callback";
-    private static final String SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative user-library-read user-follow-read";
+    private static final String SCOPES = "user-read-playback-state user-modify-playback-state playlist-read-private playlist-read-collaborative user-library-read";
 
     private final Config config;
     private final SecureRandom random = new SecureRandom();

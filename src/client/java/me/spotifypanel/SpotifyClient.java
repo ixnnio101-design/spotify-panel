@@ -36,6 +36,7 @@ import java.util.function.UnaryOperator;
 public final class SpotifyClient {
     private static final Logger LOG = LoggerFactory.getLogger("spotifypanel");
     private static final int RAW = 256; // обложка хранится как 256x256, из неё считаются картинки любого размера
+    private static final int MAX_PLAYLISTS = 100; // жёсткий лимит плейлистов, включая добавленные вручную
 
     public enum Status { NO_CLIENT_ID, LOGGED_OUT, IDLE, ACTIVE, ERROR }
 
@@ -126,9 +127,10 @@ public final class SpotifyClient {
     private final Object apiRequestLock = new Object();
     private long nextApiRequestAtMs;
     private long apiCooldownUntilMs;
-    private static final long MIN_API_REQUEST_GAP_MS = 900;
+    private static final long MIN_API_REQUEST_GAP_MS = 3_000;
     private static final long DEFAULT_RETRY_AFTER_MS = 15_000;
-    private static final long MAX_RETRY_AFTER_MS = 5 * 60_000L;
+    private static final long MAX_RETRY_AFTER_MS = 30 * 60_000L;
+    private static final long LIBRARY_CACHE_TTL_MS = 10 * 60_000L;
 
     /** Команды управления идут строго по очереди, чтобы громкость/перемотка не приходили в перепутанном порядке. */
     private final ExecutorService ctl = Executors.newSingleThreadExecutor(r -> {
@@ -159,6 +161,15 @@ public final class SpotifyClient {
     private volatile long retryAfterMs = 0;
     private volatile int playlistFails = 0;
     private final java.util.concurrent.atomic.AtomicBoolean playlistsLoading = new java.util.concurrent.atomic.AtomicBoolean();
+    private final AtomicBoolean forceLibraryRefresh = new AtomicBoolean(false);
+    private volatile boolean playlistsCacheLoaded;
+    private volatile boolean albumsCacheLoaded;
+    private volatile boolean likedTracksCacheLoaded;
+    private volatile long playlistsCacheAtMs;
+    private volatile long albumsCacheAtMs;
+    private volatile long likedTracksCacheAtMs;
+    private volatile List<LibraryEntry> albumsCache = List.of();
+    private volatile LibraryEntry likedTracksEntry;
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
@@ -176,7 +187,7 @@ public final class SpotifyClient {
     }
 
     public void start() {
-        exec.scheduleWithFixedDelay(this::poll, 1, 4, TimeUnit.SECONDS);
+        exec.scheduleWithFixedDelay(this::poll, 1, 8, TimeUnit.SECONDS);
     }
 
     public Snapshot snapshot() { return snapshot; }
@@ -199,12 +210,32 @@ public final class SpotifyClient {
 
     // ------------------------------------------------------------- HTTP
 
+    private static final class RateLimitException extends IOException {
+        private final long retryAfterMs;
+        RateLimitException(long retryAfterMs) {
+            super("Spotify ограничил запросы. Повтор через " + Math.max(1, (retryAfterMs + 999) / 1000) + " сек.");
+            this.retryAfterMs = retryAfterMs;
+        }
+        long retryAfterMs() { return retryAfterMs; }
+    }
+
     private HttpResponse<String> send(String method, String path, String jsonBody) throws Exception {
         synchronized (apiRequestLock) {
             long now = System.currentTimeMillis();
-            long waitUntil = Math.max(nextApiRequestAtMs, apiCooldownUntilMs);
-            long waitMs = waitUntil - now;
-            if (waitMs > 0) Thread.sleep(waitMs);
+            if (apiCooldownUntilMs > now) {
+                long remaining = apiCooldownUntilMs - now;
+                retryAfterMs = Math.max(retryAfterMs, remaining);
+                throw new RateLimitException(remaining);
+            }
+
+            long spacing = nextApiRequestAtMs - now;
+            if (spacing > 0) Thread.sleep(spacing);
+            now = System.currentTimeMillis();
+            if (apiCooldownUntilMs > now) {
+                long remaining = apiCooldownUntilMs - now;
+                retryAfterMs = Math.max(retryAfterMs, remaining);
+                throw new RateLimitException(remaining);
+            }
 
             HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
                     .header("Authorization", "Bearer " + auth.accessToken())
@@ -219,17 +250,16 @@ public final class SpotifyClient {
             try {
                 response = Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
             } finally {
-                // Even failed requests leave a small gap before the next API call.
                 nextApiRequestAtMs = System.currentTimeMillis() + MIN_API_REQUEST_GAP_MS;
             }
 
             if (response.statusCode() == 429) {
                 long retryMs = parseRetryAfterMillis(response);
-                long retryUntil = System.currentTimeMillis() + retryMs;
-                apiCooldownUntilMs = Math.max(apiCooldownUntilMs, retryUntil);
+                apiCooldownUntilMs = Math.max(apiCooldownUntilMs, System.currentTimeMillis() + retryMs);
                 retryAfterMs = Math.max(retryAfterMs, retryMs);
-                LOG.warn("Spotify API rate limit (429) on {}. Pausing all Web API requests for {} seconds (Retry-After).",
+                LOG.warn("Spotify API rate limit (429) on {}. Will resume automatically in {} seconds; no further requests will be sent meanwhile.",
                         path, Math.max(1, retryMs / 1000));
+                throw new RateLimitException(retryMs);
             }
             return response;
         }
@@ -274,11 +304,14 @@ public final class SpotifyClient {
             }
 
             long now = System.currentTimeMillis();
-            if (now >= nextPlaylistTry) tryLoadPlaylists();
+            if (now >= apiCooldownUntilMs && now >= nextPlaylistTry) tryLoadPlaylists();
 
-            // The library refresh makes a sequence of requests. Pause the recurring
-            // player poll until it finishes so both jobs do not compete for the quota.
+            // Library requests have priority. During a Spotify cooldown (including the
+            // small safety margin before the scheduled library retry), do not poll the
+            // player or generate another request immediately after the 429 expires.
             if (playlistsLoading.get()) return;
+            if (System.currentTimeMillis() < apiCooldownUntilMs) return;
+            if (playlistsError.contains("(429)") && System.currentTimeMillis() < nextPlaylistTry) return;
 
             long started = System.currentTimeMillis();
             HttpResponse<String> r = send("GET", "/me/player", null);
@@ -405,8 +438,25 @@ public final class SpotifyClient {
 
     /** Перезагрузить все разделы медиатеки после авторизации или изменения списка. */
     public void reloadPlaylists() {
+        forceLibraryRefresh.set(true);
         nextPlaylistTry = 0;
         tryLoadPlaylists();
+    }
+
+    /** Clears the in-memory library cache when the user disconnects the Spotify account. */
+    public void clearLibraryCache() {
+        playlists = List.of();
+        library = List.of();
+        albumsCache = List.of();
+        likedTracksEntry = null;
+        playlistsCacheLoaded = false;
+        albumsCacheLoaded = false;
+        likedTracksCacheLoaded = false;
+        playlistsCacheAtMs = albumsCacheAtMs = likedTracksCacheAtMs = 0;
+        items.clear();
+        itemsTime.clear();
+        itemErrors.clear();
+        playlistsError = "";
     }
 
     public int playlistFails() { return playlistFails; }
@@ -422,10 +472,11 @@ public final class SpotifyClient {
                 long now = System.currentTimeMillis();
                 if (playlistsError.isEmpty()) {
                     playlistFails = 0;
-                    nextPlaylistTry = now + 120_000;
+                    nextPlaylistTry = now + LIBRARY_CACHE_TTL_MS;
                 } else {
                     playlistFails++;
-                    nextPlaylistTry = now + Math.max(60_000, retryAfterMs);
+                    long backoff = retryAfterMs > 0 ? retryAfterMs + 2_000 : LIBRARY_CACHE_TTL_MS;
+                    nextPlaylistTry = now + Math.max(60_000, backoff);
                 }
                 playlistsLoading.set(false);
             }
@@ -452,13 +503,20 @@ public final class SpotifyClient {
      * from /me/playlists + offset ourselves and use `total` as the authoritative bound.
      */
     private PageData fetchOffsetPages(String endpoint) throws Exception {
+        return fetchOffsetPages(endpoint, 1000);
+    }
+
+    /** Offset pagination with an explicit per-section item cap. */
+    private PageData fetchOffsetPages(String endpoint, int maxItems) throws Exception {
+        int itemCap = Math.max(0, maxItems);
         List<JsonObject> out = new ArrayList<>();
         Set<String> seenPages = new HashSet<>();
         int offset = 0;
         int total = -1;
-        while (offset < 1000) {
+        while (offset < itemCap) {
+            int requestLimit = Math.min(50, itemCap - offset);
             String separator = endpoint.contains("?") ? "&" : "?";
-            HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
+            HttpResponse<String> r = send("GET", endpoint + separator + "limit=" + requestLimit + "&offset=" + offset, null);
             if (r.statusCode() != 200) {
                 if (r.statusCode() == 429) {
                     String ra = r.headers().firstValue("Retry-After").orElse("5");
@@ -487,10 +545,12 @@ public final class SpotifyClient {
                 break;
             }
             for (JsonElement el : arr) {
+                if (out.size() >= itemCap) break;
                 if (el.isJsonObject()) out.add(el.getAsJsonObject());
             }
 
             offset += got;
+            if (out.size() >= itemCap) break;
             if (total >= 0) {
                 if (offset >= total) break;
                 // Continue even when `next` is null: total is more reliable during
@@ -501,42 +561,13 @@ public final class SpotifyClient {
             }
         }
         int reportedTotal = total < 0 ? out.size() : total;
-        if (reportedTotal > out.size()) {
-            LOG.warn("Spotify returned {} of {} items for {}.", out.size(), reportedTotal, endpoint);
+        if (reportedTotal > out.size() && out.size() < itemCap) {
+            LOG.warn("Spotify returned {} of {} items for {} before the configured cap of {}.",
+                    out.size(), reportedTotal, endpoint, itemCap);
         }
         return new PageData(out, reportedTotal);
     }
 
-    private PageData fetchFollowedArtists() throws Exception {
-        List<JsonObject> out = new ArrayList<>();
-        String after = "";
-        int total = 0;
-        boolean first = true;
-        while (out.size() < 1000) {
-            String path = "/me/following?type=artist&limit=50" + (after.isEmpty() ? "" : "&after=" + after);
-            HttpResponse<String> r = send("GET", path, null);
-            if (r.statusCode() != 200) {
-                if (r.statusCode() == 429) {
-                    String ra = r.headers().firstValue("Retry-After").orElse("5");
-                    try { retryAfterMs = Math.max(retryAfterMs, Long.parseLong(ra.trim()) * 1000L); }
-                    catch (NumberFormatException ignored) { retryAfterMs = Math.max(retryAfterMs, 5_000); }
-                }
-                if (r.statusCode() == 401) auth.invalidate();
-                throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
-            }
-            JsonObject root = JsonParser.parseString(r.body()).getAsJsonObject();
-            JsonObject artists = root.has("artists") && root.get("artists").isJsonObject() ? root.getAsJsonObject("artists") : new JsonObject();
-            if (first) { total = (int) lng(artists, "total"); first = false; }
-            JsonArray arr = artists.has("items") && artists.get("items").isJsonArray() ? artists.getAsJsonArray("items") : new JsonArray();
-            int got = 0;
-            for (JsonElement el : arr) { got++; if (el.isJsonObject()) out.add(el.getAsJsonObject()); }
-            JsonObject cursors = artists.has("cursors") && artists.get("cursors").isJsonObject() ? artists.getAsJsonObject("cursors") : new JsonObject();
-            String nextAfter = str(cursors, "after");
-            if (got == 0 || nextAfter.isEmpty() || nextAfter.equals(after)) break;
-            after = nextAfter;
-        }
-        return new PageData(out, total);
-    }
 
     private Playlist parsePlaylist(JsonObject p) {
         String id = str(p, "id");
@@ -566,40 +597,6 @@ public final class SpotifyClient {
                 (int) lng(album, "total_tracks"), bestImage(album), uri, "album");
     }
 
-    private static LibraryEntry artistEntry(JsonObject artist) {
-        String id = str(artist, "id");
-        if (id.isEmpty()) return null;
-        String uri = str(artist, "uri");
-        if (uri.isEmpty()) uri = "spotify:artist:" + id;
-        return new LibraryEntry(id, str(artist, "name"), "Исполнитель", 0, bestImage(artist), uri, "artist");
-    }
-
-    private static LibraryEntry showEntry(JsonObject show) {
-        String id = str(show, "id");
-        if (id.isEmpty()) return null;
-        String uri = str(show, "uri");
-        if (uri.isEmpty()) uri = "spotify:show:" + id;
-        return new LibraryEntry(id, str(show, "name"), "Подкаст",
-                (int) lng(show, "total_episodes"), bestImage(show), uri, "show");
-    }
-
-    private static LibraryEntry audiobookEntry(JsonObject book) {
-        String id = str(book, "id");
-        if (id.isEmpty()) return null;
-        String uri = str(book, "uri");
-        if (uri.isEmpty()) uri = "spotify:audiobook:" + id;
-        String author = "";
-        if (book.has("authors") && book.get("authors").isJsonArray()) {
-            for (JsonElement el : book.getAsJsonArray("authors")) {
-                if (el.isJsonObject()) {
-                    if (!author.isEmpty()) author += ", ";
-                    author += str(el.getAsJsonObject(), "name");
-                }
-            }
-        }
-        return new LibraryEntry(id, str(book, "name"), author,
-                (int) lng(book, "total_chapters"), bestImage(book), uri, "audiobook");
-    }
 
     private static Item parseTrackItem(JsonObject item) {
         String uri = str(item, "uri");
@@ -618,131 +615,142 @@ public final class SpotifyClient {
 
     private void loadLibrary() {
         List<LibraryEntry> previousLibrary = library;
-        List<LibraryEntry> all = new ArrayList<>();
-        List<Playlist> playlistOnly = new ArrayList<>();
         List<String> errors = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
+        long now = System.currentTimeMillis();
+        boolean force = forceLibraryRefresh.getAndSet(false);
+        boolean hitRateLimit = false;
 
-        // Regular and private/collaborative playlists.
-        try {
-            PageData page = fetchOffsetPages("/me/playlists");
-            LOG.info("Spotify playlists loaded: {} of {} reported by /me/playlists.", page.objects().size(), page.total());
-            for (JsonObject obj : page.objects()) {
-                Playlist p = parsePlaylist(obj);
-                if (p != null && seen.add("playlist:" + p.id())) {
-                    playlistOnly.add(p);
-                    all.add(asEntry(p));
+        // 1) Playlists. Keep previously loaded data if a refresh is rate-limited.
+        if (force || !playlistsCacheLoaded || now - playlistsCacheAtMs >= LIBRARY_CACHE_TTL_MS) {
+            try {
+                PageData page = fetchOffsetPages("/me/playlists", MAX_PLAYLISTS);
+                List<Playlist> loaded = new ArrayList<>();
+                Set<String> ids = new HashSet<>();
+                for (JsonObject obj : page.objects()) {
+                    Playlist p = parsePlaylist(obj);
+                    if (p != null && ids.add(p.id())) loaded.add(p);
+                }
+                if (page.total() > page.objects().size() && page.objects().size() < MAX_PLAYLISTS) {
+                    errors.add("плейлисты: получено " + page.objects().size() + " из " + page.total());
+                }
+                playlists = List.copyOf(loaded);
+                // Reaching the configured cap is a successful complete load for this mod.
+                playlistsCacheLoaded = page.total() <= page.objects().size() || page.objects().size() >= MAX_PLAYLISTS;
+                playlistsCacheAtMs = System.currentTimeMillis();
+                LOG.info("Spotify playlists loaded: {} of {} reported by /me/playlists (mod cap: {}).",
+                        page.objects().size(), page.total(), MAX_PLAYLISTS);
+            } catch (Exception e) {
+                errors.add("плейлисты: " + errText(e));
+                if (e instanceof RateLimitException rl) {
+                    retryAfterMs = Math.max(retryAfterMs, rl.retryAfterMs());
+                    hitRateLimit = true;
                 }
             }
-            if (page.total() > page.objects().size()) {
-                errors.add("Spotify вернул " + page.objects().size() + " из " + page.total()
-                        + " плейлистов; смотри latest.log для причины неполной пагинации");
-            }
-        } catch (Exception e) { errors.add("плейлисты: " + errText(e)); }
-
-        // Saved albums.
-        try {
-            PageData page = fetchOffsetPages("/me/albums");
-            for (JsonObject wrapper : page.objects()) {
-                LibraryEntry entry = albumEntry(nested(wrapper, "album"));
-                if (entry != null && seen.add(entry.key())) all.add(entry);
-            }
-        } catch (Exception e) { errors.add("альбомы: " + errText(e)); }
-
-        // Followed artists (cursor pagination rather than offset pagination).
-        try {
-            PageData page = fetchFollowedArtists();
-            for (JsonObject obj : page.objects()) {
-                LibraryEntry entry = artistEntry(obj);
-                if (entry != null && seen.add(entry.key())) all.add(entry);
-            }
-        } catch (Exception e) { errors.add("исполнители: " + errText(e)); }
-
-        // Liked songs are a synthetic collection backed by /me/tracks.
-        try {
-            PageData page = fetchOffsetPages("/me/tracks");
-            List<Item> liked = new ArrayList<>();
-            String cover = "";
-            for (JsonObject wrapper : page.objects()) {
-                JsonObject track = nested(wrapper, "track");
-                Item item = parseTrackItem(track);
-                if (item != null) liked.add(item);
-                if (cover.isEmpty() && track.has("album") && track.get("album").isJsonObject()) cover = bestImage(track.getAsJsonObject("album"));
-            }
-            String key = "saved_tracks:liked";
-            items.put(key, liked);
-            itemsTime.put(key, System.currentTimeMillis());
-            all.add(new LibraryEntry("liked", "Любимые треки", "Твоя медиатека", page.total(), cover, "", "saved_tracks"));
-        } catch (Exception e) { errors.add("любимые треки: " + errText(e)); }
-
-        // Saved podcast shows.
-        try {
-            PageData page = fetchOffsetPages("/me/shows");
-            for (JsonObject wrapper : page.objects()) {
-                LibraryEntry entry = showEntry(nested(wrapper, "show"));
-                if (entry != null && seen.add(entry.key())) all.add(entry);
-            }
-        } catch (Exception e) { errors.add("подкасты: " + errText(e)); }
-
-        // Saved episodes as a single collection.
-        try {
-            PageData page = fetchOffsetPages("/me/episodes");
-            List<Item> savedEpisodes = new ArrayList<>();
-            String cover = "";
-            for (JsonObject wrapper : page.objects()) {
-                JsonObject episode = nested(wrapper, "episode");
-                String uri = str(episode, "uri");
-                if (uri.isEmpty()) continue;
-                String showName = episode.has("show") && episode.get("show").isJsonObject()
-                        ? str(episode.getAsJsonObject("show"), "name") : "Подкаст";
-                savedEpisodes.add(new Item(str(episode, "name"), showName, lng(episode, "duration_ms"), uri));
-                if (cover.isEmpty() && episode.has("images")) cover = bestImage(episode);
-                if (cover.isEmpty() && episode.has("show") && episode.get("show").isJsonObject()) cover = bestImage(episode.getAsJsonObject("show"));
-            }
-            String key = "saved_episodes:episodes";
-            items.put(key, savedEpisodes);
-            itemsTime.put(key, System.currentTimeMillis());
-            all.add(new LibraryEntry("episodes", "Сохранённые эпизоды", "Твоя медиатека", page.total(), cover, "", "saved_episodes"));
-        } catch (Exception e) { errors.add("эпизоды: " + errText(e)); }
-
-        // Audiobooks.
-        try {
-            PageData page = fetchOffsetPages("/me/audiobooks");
-            for (JsonObject wrapper : page.objects()) {
-                LibraryEntry entry = audiobookEntry(nested(wrapper, "audiobook"));
-                if (entry != null && seen.add(entry.key())) all.add(entry);
-            }
-        } catch (Exception e) { errors.add("аудиокниги: " + errText(e)); }
-
-        // Extra playlists manually added by Spotify URL.
-        for (String id : new ArrayList<>(SpotifyPanelMod.config.extraPlaylists)) {
-            if (!seen.add("playlist:" + id)) continue;
-            Playlist p = null;
-            try {
-                HttpResponse<String> r = send("GET", "/playlists/" + id, null);
-                if (r.statusCode() == 200) p = parsePlaylist(JsonParser.parseString(r.body()).getAsJsonObject());
-            } catch (Exception ignored) {}
-            if (p == null) p = new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())), "", 0, "", "spotify:playlist:" + id);
-            playlistOnly.add(p);
-            all.add(asEntry(p));
         }
 
+        // Preserve manually-added playlist IDs without making one extra API call per ID.
+        // If the playlist was not in /me/playlists, show a placeholder entry; its content
+        // can still be fetched on demand when the user opens it.
+        List<Playlist> playlistOnly = new ArrayList<>(playlists);
+        Set<String> seenPlaylistIds = new HashSet<>();
+        for (Playlist p : playlistOnly) seenPlaylistIds.add(p.id());
+        for (String id : new ArrayList<>(SpotifyPanelMod.config.extraPlaylists)) {
+            if (playlistOnly.size() >= MAX_PLAYLISTS) break;
+            if (id == null || id.isBlank() || !seenPlaylistIds.add(id)) continue;
+            playlistOnly.add(new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())),
+                    "", 0, "", "spotify:playlist:" + id));
+        }
         playlists = List.copyOf(playlistOnly);
-        String newError = errors.isEmpty() ? "" : "Часть медиатеки недоступна: " + String.join("; ", errors);
+
+        // 2) Saved albums. No artists, podcasts, episodes or audiobook endpoints.
+        if (!hitRateLimit && (force || !albumsCacheLoaded || now - albumsCacheAtMs >= LIBRARY_CACHE_TTL_MS)) {
+            try {
+                PageData page = fetchOffsetPages("/me/albums");
+                List<LibraryEntry> loaded = new ArrayList<>();
+                Set<String> ids = new HashSet<>();
+                for (JsonObject wrapper : page.objects()) {
+                    LibraryEntry entry = albumEntry(nested(wrapper, "album"));
+                    if (entry != null && ids.add(entry.key())) loaded.add(entry);
+                }
+                albumsCache = List.copyOf(loaded);
+                albumsCacheLoaded = page.total() <= page.objects().size();
+                albumsCacheAtMs = System.currentTimeMillis();
+                if (page.total() > page.objects().size()) {
+                    errors.add("альбомы: получено " + page.objects().size() + " из " + page.total());
+                }
+                LOG.info("Spotify saved albums loaded: {} of {}.", page.objects().size(), page.total());
+            } catch (Exception e) {
+                errors.add("альбомы: " + errText(e));
+                if (e instanceof RateLimitException rl) {
+                    retryAfterMs = Math.max(retryAfterMs, rl.retryAfterMs());
+                    hitRateLimit = true;
+                }
+            }
+        }
+
+        // 3) Liked Songs. It is a saved-track collection, not a playback context.
+        final String likedKey = "saved_tracks:liked";
+        if (!hitRateLimit && (force || !likedTracksCacheLoaded || now - likedTracksCacheAtMs >= LIBRARY_CACHE_TTL_MS)) {
+            try {
+                PageData page = fetchOffsetPages("/me/tracks");
+                List<Item> liked = new ArrayList<>();
+                String cover = "";
+                for (JsonObject wrapper : page.objects()) {
+                    JsonObject track = nested(wrapper, "track");
+                    Item item = parseTrackItem(track);
+                    if (item != null) liked.add(item);
+                    if (cover.isEmpty() && track.has("album") && track.get("album").isJsonObject()) {
+                        cover = bestImage(track.getAsJsonObject("album"));
+                    }
+                }
+                items.put(likedKey, List.copyOf(liked));
+                itemsTime.put(likedKey, System.currentTimeMillis());
+                likedTracksEntry = new LibraryEntry("liked", "Любимые треки", "Твоя медиатека",
+                        page.total(), cover, "", "saved_tracks");
+                likedTracksCacheLoaded = page.total() <= page.objects().size();
+                likedTracksCacheAtMs = System.currentTimeMillis();
+                if (page.total() > page.objects().size()) {
+                    errors.add("любимые треки: получено " + page.objects().size() + " из " + page.total());
+                }
+                LOG.info("Spotify liked tracks loaded: {} of {}.", page.objects().size(), page.total());
+            } catch (Exception e) {
+                errors.add("любимые треки: " + errText(e));
+                if (e instanceof RateLimitException rl) {
+                    retryAfterMs = Math.max(retryAfterMs, rl.retryAfterMs());
+                    hitRateLimit = true;
+                }
+            }
+        }
+
+        // Compose the UI from fresh data plus any valid cached sections.
+        List<LibraryEntry> all = new ArrayList<>();
+        if (likedTracksEntry != null) all.add(likedTracksEntry);
+        for (Playlist p : playlists) all.add(asEntry(p));
+        all.addAll(albumsCache);
+        all.sort((a, b) -> Integer.compare(libraryOrder(a.kind()), libraryOrder(b.kind())));
+        library = List.copyOf(all);
+
+        String newError = errors.isEmpty() ? "" : String.join("; ", errors);
+        if (hitRateLimit) {
+            long seconds = Math.max(1, (retryAfterMs + 999) / 1000);
+            newError = "Spotify временно ограничил запросы (429). Продолжу загрузку автоматически примерно через " + seconds + " сек.";
+        }
         if (!newError.equals(playlistsError)) {
             if (!newError.isEmpty()) LOG.warn("Spotify library partially unavailable: {}", newError);
             playlistsError = newError;
-            if (!newError.isEmpty()) SpotifyPanelMod.say(newError + ". Проверь права /spotify login; доступные разделы всё равно показаны.");
+            if (!newError.isEmpty()) SpotifyPanelMod.say(newError);
         }
-        // Keep the special "Liked Songs" collection at the top, then show the user's
-        // playlists, albums, followed artists, podcasts, saved episodes and audiobooks.
-        all.sort((a, b) -> Integer.compare(libraryOrder(a.kind()), libraryOrder(b.kind())));
-        library = List.copyOf(all);
-        if (!all.isEmpty() || errors.isEmpty()) {
-            if (previousLibrary.isEmpty() || previousLibrary.size() != all.size()
-                    || !previousLibrary.stream().map(LibraryEntry::key).toList().equals(all.stream().map(LibraryEntry::key).toList())) {
-                SpotifyPanelMod.say("Медиатека обновлена: " + all.size() + " элементов — любимые треки, плейлисты, альбомы, исполнители, подкасты и аудиокниги.");
-            }
+
+        if (!all.isEmpty() && (previousLibrary.isEmpty()
+                || !previousLibrary.stream().map(LibraryEntry::key).toList().equals(all.stream().map(LibraryEntry::key).toList()))) {
+            int playlistCount = playlists.size();
+            int albumCount = albumsCache.size();
+            int likedCount = items.getOrDefault(likedKey, List.of()).size();
+            SpotifyPanelMod.say("Медиатека: " + playlistCount + " плейлистов, " + albumCount
+                    + " альбомов, " + likedCount + " любимых треков.");
+        }
+        if (hitRateLimit) {
+            LOG.info("Spotify library loading paused safely; cached sections remain visible and retry is scheduled after Retry-After.");
         }
     }
 
@@ -751,11 +759,7 @@ public final class SpotifyClient {
             case "saved_tracks" -> 0;
             case "playlist" -> 1;
             case "album" -> 2;
-            case "artist" -> 3;
-            case "show" -> 4;
-            case "saved_episodes" -> 5;
-            case "audiobook" -> 6;
-            default -> 7;
+            default -> 3;
         };
     }
 
@@ -782,6 +786,7 @@ public final class SpotifyClient {
         if (!force && t != null && now - t < 60_000) return;
         if (!itemsLoading.add(key)) return;
         exec.submit(() -> {
+            boolean retryScheduled = false;
             try {
                 List<Item> out = new ArrayList<>();
                 int offset = 0;
@@ -790,9 +795,6 @@ public final class SpotifyClient {
                     switch (entry.kind()) {
                         case "playlist" -> endpoint = "/playlists/" + entry.id() + "/items";
                         case "album" -> endpoint = "/albums/" + entry.id() + "/tracks";
-                        case "artist" -> endpoint = "/artists/" + entry.id() + "/albums?include_groups=album,single,compilation";
-                        case "show" -> endpoint = "/shows/" + entry.id() + "/episodes";
-                        case "audiobook" -> endpoint = "/audiobooks/" + entry.id() + "/chapters";
                         default -> { itemErrors.put(key, "Для этого раздела список элементов не поддерживается."); return; }
                     }
                     String separator = endpoint.contains("?") ? "&" : "?";
@@ -811,24 +813,14 @@ public final class SpotifyClient {
                         got++;
                         if (!el.isJsonObject()) continue;
                         JsonObject wrapper = el.getAsJsonObject();
-                        JsonObject obj = switch (entry.kind()) {
-                            case "playlist" -> nested(wrapper, "item").equals(wrapper) ? nested(wrapper, "track") : nested(wrapper, "item");
-                            case "show" -> nested(wrapper, "episode");
-                            default -> wrapper;
-                        };
+                        JsonObject obj = "playlist".equals(entry.kind())
+                                ? (wrapper.has("item") && wrapper.get("item").isJsonObject()
+                                    ? wrapper.getAsJsonObject("item") : nested(wrapper, "track"))
+                                : wrapper;
                         String uri = str(obj, "uri");
                         if (uri.isEmpty()) continue;
-                        if ("artist".equals(entry.kind())) {
-                            out.add(new Item(str(obj, "name"), artistsOf(obj), 0, uri));
-                        } else if ("show".equals(entry.kind())) {
-                            String showName = entry.name();
-                            out.add(new Item(str(obj, "name"), showName, lng(obj, "duration_ms"), uri));
-                        } else if ("audiobook".equals(entry.kind())) {
-                            out.add(new Item(str(obj, "name"), entry.owner(), lng(obj, "duration_ms"), uri));
-                        } else {
-                            Item item = parseTrackItem(obj);
-                            if (item != null) out.add(item);
-                        }
+                        Item item = parseTrackItem(obj);
+                        if (item != null) out.add(item);
                     }
                     items.put(key, new ArrayList<>(out));
                     itemErrors.remove(key);
@@ -840,9 +832,18 @@ public final class SpotifyClient {
                 itemErrors.remove(key);
                 itemsTime.put(key, System.currentTimeMillis());
             } catch (Exception e) {
-                itemErrors.put(key, "Содержимое: " + errText(e));
+                if (e instanceof RateLimitException rl) {
+                    itemErrors.put(key, "Spotify временно ограничил запросы. Содержимое будет загружено автоматически после паузы.");
+                    retryScheduled = true;
+                    exec.schedule(() -> {
+                        itemsLoading.remove(key);
+                        requestItems(entry, true);
+                    }, rl.retryAfterMs() + 2_000, TimeUnit.MILLISECONDS);
+                } else {
+                    itemErrors.put(key, "Содержимое: " + errText(e));
+                }
             } finally {
-                itemsLoading.remove(key);
+                if (!retryScheduled) itemsLoading.remove(key);
             }
         });
     }
@@ -863,18 +864,6 @@ public final class SpotifyClient {
             playTrackFromAlbum(loaded.get(0), err);
             return;
         }
-        // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
-        // but not for show/audiobook objects. For those, play the first loaded episode/chapter.
-        if ("show".equals(entry.kind()) || "audiobook".equals(entry.kind())) {
-            List<Item> loaded = items(entry);
-            if (loaded == null) {
-                err.accept("Загружаю эпизоды/главы. Нажми на обложку ещё раз через секунду.");
-                return;
-            }
-            if (loaded.isEmpty()) { err.accept("В этом разделе пока нет доступных эпизодов или глав."); return; }
-            playLibraryItem(entry, loaded.get(0), err);
-            return;
-        }
         if (!entry.uri().isEmpty()) playContext(entry.uri(), "", err);
     }
 
@@ -882,9 +871,8 @@ public final class SpotifyClient {
         if (entry == null || item == null || item.uri().isEmpty()) return;
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
-            case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
             case "saved_tracks" -> playTrackFromAlbum(item, err);
-            default -> playUris(List.of(item.uri()), err);
+            default -> err.accept("Этот тип элемента медиатеки не поддерживается.");
         }
     }
 
