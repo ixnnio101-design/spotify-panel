@@ -56,7 +56,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 6.5;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -843,7 +843,7 @@ public final class WorldPanel {
     private static void drawOverlay(WorldRenderContext context, MatrixStack matrices,
                                     double cx, double cy, double cz, double wx, double wz, double nx, double nz) {
         if (overlayTexture == null) return;
-        VertexConsumer vc = context.consumers().getBuffer(RenderLayers.entityTranslucent(OVERLAY_TEXTURE_ID));
+        VertexConsumer vc = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(OVERLAY_TEXTURE_ID));
         MatrixStack.Entry entry = matrices.peek();
         Vec3d p0 = modelPoint(MODEL_OVERLAY_X, 0, -10, cx, cy, cz, wx, wz, nx, nz);
         Vec3d p1 = modelPoint(MODEL_OVERLAY_X, 0, 10, cx, cy, cz, wx, wz, nx, nz);
