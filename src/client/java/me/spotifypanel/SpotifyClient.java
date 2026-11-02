@@ -855,22 +855,10 @@ public final class SpotifyClient {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
             case "saved_tracks" -> {
-                // Keep playback inside the user's Liked Songs list. Starting the track
-                // through its album context would make Next jump to non-liked songs.
-                List<Item> liked = items(entry);
-                if (liked == null || liked.isEmpty()) {
-                    playUris(List.of(item.uri()), err);
-                    break;
-                }
-                int selectedIndex = -1;
-                for (int i = 0; i < liked.size(); i++) {
-                    if (item.uri().equals(liked.get(i).uri())) { selectedIndex = i; break; }
-                }
-                // Send only the selected track first. Sending the whole saved-track
-                // tail can be rejected or handled inconsistently by some Spotify
-                // clients/devices; a single URI makes the clicked track explicit.
-                // Keep playback selection deterministic and let the user choose Next
-                // from Spotify's own player afterward.
+                // A row click must start exactly the selected track. Liked Songs is not
+                // a playable Spotify context, so send the selected track URI directly.
+                // Do not send the entire saved-track list: the API can reject it or
+                // fail to start the clicked item on some playback targets.
                 playUris(List.of(item.uri()), err);
             }
             default -> playUris(List.of(item.uri()), err);

@@ -370,11 +370,17 @@ public final class WorldPanel {
                 }
             }
         }
-        // Highlight follows the current Spotify track URI directly. Avoid a
-        // per-row fade map: delayed player polling could make the old URI fade
-        // out and the new URI fade in repeatedly, causing flicker or no highlight.
-        playingHighlightAlpha.clear();
-        if (playingTrackVisible) playingHighlightAlpha.put(playingUri, 1.0);
+        if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.0);
+        double highlightEase = 1.0 - Math.exp(-dt * 15.0);
+        Iterator<Map.Entry<String, Double>> highlightIterator = playingHighlightAlpha.entrySet().iterator();
+        while (highlightIterator.hasNext()) {
+            Map.Entry<String, Double> entry = highlightIterator.next();
+            double target = playingTrackVisible && entry.getKey().equals(playingUri) ? 1.0 : 0.0;
+            double next = entry.getValue() + (target - entry.getValue()) * highlightEase;
+            if (Math.abs(target - next) < 0.004) next = target;
+            if (next <= 0.004 && target == 0.0) highlightIterator.remove();
+            else entry.setValue(next);
+        }
 
         // Newly selected albums/playlists ease in with a subtle upward settle.
         double transitionEase = 1.0 - Math.exp(-dt * 6.0);
