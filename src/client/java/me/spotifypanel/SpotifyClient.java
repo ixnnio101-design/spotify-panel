@@ -855,10 +855,9 @@ public final class SpotifyClient {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
             case "saved_tracks" -> {
-                // A row click must start exactly the selected track. Liked Songs is not
-                // a playable Spotify context, so send the selected track URI directly.
-                // Do not send the entire saved-track list: the API can reject it or
-                // fail to start the clicked item on some playback targets.
+                // A row click must start exactly the clicked song. Sending a URI array
+                // (especially a sliced Liked Songs list) can be rejected or leave the
+                // player in an inconsistent state on Spotify playback devices.
                 playUris(List.of(item.uri()), err);
             }
             default -> playUris(List.of(item.uri()), err);
