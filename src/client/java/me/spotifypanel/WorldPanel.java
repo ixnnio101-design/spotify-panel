@@ -837,7 +837,8 @@ public final class WorldPanel {
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
                 .light(FULL_BRIGHT)
-                .normal((float) nx, (float) ny, (float) nz);
+                // Constant normal prevents diffuse shading from changing with player yaw.
+                .normal(0.0f, 1.0f, 0.0f);
     }
 
     private static void drawOverlay(WorldRenderContext context, MatrixStack matrices,
@@ -864,7 +865,8 @@ public final class WorldPanel {
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
                 .light(FULL_BRIGHT)
-                .normal(entry, (float) nx, 0.0f, (float) nz);
+                // Constant normal prevents yaw-dependent diffuse shading on the overlay.
+                .normal(entry, 0.0f, 1.0f, 0.0f);
     }
 
     // -------------------------------------------------------------------- click handling against the model's world-space front

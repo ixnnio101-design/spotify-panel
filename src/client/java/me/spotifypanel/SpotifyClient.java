@@ -133,8 +133,6 @@ public final class SpotifyClient {
     private final AtomicBoolean volumeFlushScheduled = new AtomicBoolean();
     private volatile long lastVolumeRequestAtMs;
     private static final long MIN_VOLUME_REQUEST_INTERVAL_MS = 120;
-    private static final int MAX_VOLUME_RAMP_STEP = 8;
-    private final AtomicInteger volumeRampValue = new AtomicInteger(-1);
     /** До этого момента ответы опроса игнорируются: на экране то, что игрок только что нажал (без «отскока»). */
     private volatile long ignorePollUntil = 0;
     private volatile long lastLocalAt = 0;
@@ -298,9 +296,6 @@ public final class SpotifyClient {
 
         snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
-        if (pendingVolume.get() < 0 && !volumeFlushScheduled.get()) {
-            volumeRampValue.set(Math.max(0, Math.min(100, volume)));
-        }
     }
 
     private static String artistsOf(JsonObject item) {
@@ -855,12 +850,22 @@ public final class SpotifyClient {
 
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
+        optimisticTrack(item);
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
             case "saved_tracks" -> playTrackFromAlbum(item, err);
             default -> playUris(List.of(item.uri()), err);
         }
+    }
+
+    private void optimisticTrack(Item item) {
+        Snapshot current = snapshot;
+        String cover = current.track() == null ? "" : current.track().coverUrl();
+        Track selected = new Track(item.title(), item.artists(), cover, item.durationMs(), item.uri());
+        Snapshot next = new Snapshot(Status.ACTIVE, true, selected, 0, System.currentTimeMillis(),
+                current.device(), current.volume(), current.shuffle(), current.repeat(), "");
+        local(ignored -> next, 250);
     }
 
     private void playTrackFromAlbum(Item item, Consumer<String> err) {
@@ -1037,20 +1042,10 @@ public final class SpotifyClient {
 
     public void previous(Consumer<String> err) { control("POST", "/me/player/previous", null, err); }
 
-    /**
-     * Update the visible value immediately, but coalesce rapid slider movements into
-     * at most one in-flight volume command plus one latest pending value. This prevents
-     * a long queue of stale Spotify requests while the player drags the slider.
-     */
+    /** Update the slider immediately and send only the latest requested volume to Spotify. */
     public void volume(int percent, Consumer<String> err) {
         int v = Math.max(0, Math.min(100, percent));
-        Snapshot before = snapshot;
-        if (volumeRampValue.get() < 0 && before.status() == Status.ACTIVE) {
-            volumeRampValue.compareAndSet(-1, Math.max(0, Math.min(100, before.volume())));
-        }
-        // The slider responds instantly; the real Spotify device is eased toward the
-        // requested value in small steps so the audible volume does not jump abruptly.
-        local(s -> s.withVolume(v), 1800);
+        local(s -> s.withVolume(v), 650);
         pendingVolume.set(v);
         scheduleVolumeFlush(err);
     }
@@ -1066,22 +1061,9 @@ public final class SpotifyClient {
         try {
             int requested = pendingVolume.getAndSet(-1);
             if (requested >= 0) {
-                int current = volumeRampValue.get();
-                if (current < 0) current = requested;
-                int delta = requested - current;
-                int step = Math.max(-MAX_VOLUME_RAMP_STEP, Math.min(MAX_VOLUME_RAMP_STEP, delta));
-                int next = Math.max(0, Math.min(100, current + step));
                 lastVolumeRequestAtMs = System.currentTimeMillis();
-                boolean success = doControl("PUT", "/me/player/volume?volume_percent=" + next, null, err);
-                if (success) {
-                    volumeRampValue.set(next);
-                    // Continue the ramp, unless a newer mouse value arrived while the
-                    // previous network request was in flight.
-                    if (next != requested) pendingVolume.compareAndSet(-1, requested);
-                } else {
-                    volumeRampValue.set(-1);
-                    pendingVolume.set(-1);
-                }
+                // Direct target volume: no artificial multi-request fade/ramp.
+                doControl("PUT", "/me/player/volume?volume_percent=" + requested, null, err);
             }
         } finally {
             volumeFlushScheduled.set(false);
@@ -1174,9 +1156,10 @@ public final class SpotifyClient {
                 if (wait > 0) {
                     pollOnce(wait + 100); // подтянуть настоящее состояние, когда «окно игнора» кончится
                 } else {
-                    // смена трека у Spotify занимает время — спрашиваем два раза
-                    exec.schedule(this::poll, 400, TimeUnit.MILLISECONDS);
-                    exec.schedule(this::poll, 1300, TimeUnit.MILLISECONDS);
+                    // Pull player state promptly after transport/playback commands.
+                    exec.schedule(this::poll, 140, TimeUnit.MILLISECONDS);
+                    exec.schedule(this::poll, 420, TimeUnit.MILLISECONDS);
+                    exec.schedule(this::poll, 850, TimeUnit.MILLISECONDS);
                 }
                 return true;
             }
