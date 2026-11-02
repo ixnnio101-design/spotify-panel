@@ -827,10 +827,10 @@ public final class SpotifyClient {
                 return;
             }
             if (loaded.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
-            // Liked Songs is not a Spotify playback context. On some desktop clients,
-            // a bare `uris` playback request may clear the current player. Start the
-            // chosen saved track through its album context and exact track offset instead.
-            playTrackFromAlbum(loaded.get(0), err);
+            // Liked Songs is not a Spotify playback context. Play the saved URI list
+            // directly so Next continues through liked tracks instead of the selected
+            // track's album. Spotify accepts up to 100 URIs in one playback request.
+            playUris(loaded.stream().map(Item::uri).filter(uri -> uri != null && !uri.isEmpty()).limit(100).toList(), err);
             return;
         }
         // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
@@ -854,7 +854,22 @@ public final class SpotifyClient {
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
-            case "saved_tracks" -> playTrackFromAlbum(item, err);
+            case "saved_tracks" -> {
+                // Keep playback inside the user's Liked Songs list. Starting the track
+                // through its album context would make Next jump to non-liked songs.
+                List<Item> liked = items(entry);
+                if (liked == null || liked.isEmpty()) {
+                    playUris(List.of(item.uri()), err);
+                    break;
+                }
+                int selectedIndex = -1;
+                for (int i = 0; i < liked.size(); i++) {
+                    if (item.uri().equals(liked.get(i).uri())) { selectedIndex = i; break; }
+                }
+                List<String> uris = (selectedIndex >= 0 ? liked.subList(selectedIndex, liked.size()) : List.of(item))
+                        .stream().map(Item::uri).filter(uri -> uri != null && !uri.isEmpty()).limit(100).toList();
+                playUris(uris, err);
+            }
             default -> playUris(List.of(item.uri()), err);
         }
     }
