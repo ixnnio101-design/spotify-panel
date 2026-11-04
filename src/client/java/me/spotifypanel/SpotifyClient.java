@@ -796,7 +796,7 @@ public final class SpotifyClient {
         return future;
     }
 
-    private void loadItems(LibraryEntry entry, String key) {
+    private void loadItems(LibraryEntry entry, String key) throws Exception {
         List<Item> out = new ArrayList<>();
         int offset = 0;
         while (offset < 1000) {
