@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -151,7 +152,9 @@ public final class SpotifyClient {
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
-    private final Set<String> itemsLoading = ConcurrentHashMap.newKeySet();
+    private final Map<String, CompletableFuture<List<Item>>> itemLoads = new ConcurrentHashMap<>();
+    private record LikedPlayback(List<Item> items, int index) {}
+    private volatile LikedPlayback likedPlayback;
 
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
@@ -745,79 +748,119 @@ public final class SpotifyClient {
     }
 
     public void requestItems(LibraryEntry entry, boolean force) {
-        if (entry == null || "saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) return;
-        String key = entry.key();
-        long now = System.currentTimeMillis();
-        Long t = itemsTime.get(key);
-        if (!force && t != null && now - t < 60_000) return;
-        if (!itemsLoading.add(key)) return;
-        exec.submit(() -> {
-            try {
-                List<Item> out = new ArrayList<>();
-                int offset = 0;
-                while (offset < 1000) {
-                    String endpoint;
-                    switch (entry.kind()) {
-                        case "playlist" -> endpoint = "/playlists/" + entry.id() + "/items";
-                        case "album" -> endpoint = "/albums/" + entry.id() + "/tracks";
-                        case "artist" -> endpoint = "/artists/" + entry.id() + "/albums?include_groups=album,single,compilation";
-                        case "show" -> endpoint = "/shows/" + entry.id() + "/episodes";
-                        case "audiobook" -> endpoint = "/audiobooks/" + entry.id() + "/chapters";
-                        default -> { itemErrors.put(key, "Для этого раздела список элементов не поддерживается."); return; }
-                    }
-                    String separator = endpoint.contains("?") ? "&" : "?";
-                    HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
-                    if (r.statusCode() != 200) {
-                        if (offset == 0) {
-                            String detail = apiMessage(r.body());
-                            itemErrors.put(key, "Не удалось загрузить содержимое: HTTP " + r.statusCode() + (detail.isEmpty() ? "" : " — " + detail));
-                        }
-                        break;
-                    }
-                    JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
-                    JsonArray arr = page.has("items") && page.get("items").isJsonArray() ? page.getAsJsonArray("items") : new JsonArray();
-                    int got = 0;
-                    for (JsonElement el : arr) {
-                        got++;
-                        if (!el.isJsonObject()) continue;
-                        JsonObject wrapper = el.getAsJsonObject();
-                        JsonObject obj = switch (entry.kind()) {
-                            case "playlist" -> nested(wrapper, "item").equals(wrapper) ? nested(wrapper, "track") : nested(wrapper, "item");
-                            case "show" -> nested(wrapper, "episode");
-                            default -> wrapper;
-                        };
-                        String uri = str(obj, "uri");
-                        if (uri.isEmpty()) continue;
-                        if ("artist".equals(entry.kind())) {
-                            out.add(new Item(str(obj, "name"), artistsOf(obj), 0, uri));
-                        } else if ("show".equals(entry.kind())) {
-                            String showName = entry.name();
-                            out.add(new Item(str(obj, "name"), showName, lng(obj, "duration_ms"), uri));
-                        } else if ("audiobook".equals(entry.kind())) {
-                            out.add(new Item(str(obj, "name"), entry.owner(), lng(obj, "duration_ms"), uri));
-                        } else {
-                            Item item = parseTrackItem(obj);
-                            if (item != null) out.add(item);
-                        }
-                    }
-                    items.put(key, new ArrayList<>(out));
-                    itemErrors.remove(key);
-                    boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
-                    if (!hasNext || got == 0) break;
-                    offset += got;
-                }
-                items.put(key, out);
-                itemErrors.remove(key);
-                itemsTime.put(key, System.currentTimeMillis());
-            } catch (Exception e) {
-                itemErrors.put(key, "Содержимое: " + errText(e));
-            } finally {
-                itemsLoading.remove(key);
-            }
-        });
+        requestItemsAsync(entry, force);
     }
 
-    /** Запустить контекст медиатеки или конкретную строку. */
+    /** Выполняет callback после загрузки содержимого, повторно используя уже идущий запрос. */
+    public void requestItemsAndThen(LibraryEntry entry, boolean force, Consumer<List<Item>> callback) {
+        if (callback == null) {
+            requestItems(entry, force);
+            return;
+        }
+        requestItemsAsync(entry, force).thenAccept(callback);
+    }
+
+    private CompletableFuture<List<Item>> requestItemsAsync(LibraryEntry entry, boolean force) {
+        if (entry == null) return CompletableFuture.completedFuture(null);
+        if ("saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) {
+            return CompletableFuture.completedFuture(items(entry));
+        }
+
+        String key = entry.key();
+        long now = System.currentTimeMillis();
+        Long cachedAt = itemsTime.get(key);
+        List<Item> cached = items.get(key);
+        if (!force && cached != null && cachedAt != null && now - cachedAt < 60_000) {
+            return CompletableFuture.completedFuture(cached);
+        }
+
+        AtomicBoolean shouldStart = new AtomicBoolean(false);
+        CompletableFuture<List<Item>> future = itemLoads.compute(key, (ignored, current) -> {
+            if (current != null && !current.isDone()) return current;
+            shouldStart.set(true);
+            return new CompletableFuture<>();
+        });
+
+        if (shouldStart.get()) {
+            exec.submit(() -> {
+                try {
+                    loadItems(entry, key);
+                } catch (Exception e) {
+                    itemErrors.put(key, "Содержимое: " + errText(e));
+                } finally {
+                    future.complete(items.get(key));
+                    itemLoads.remove(key, future);
+                }
+            });
+        }
+        return future;
+    }
+
+    private void loadItems(LibraryEntry entry, String key) {
+        List<Item> out = new ArrayList<>();
+        int offset = 0;
+        while (offset < 1000) {
+            String endpoint;
+            switch (entry.kind()) {
+                case "playlist" -> endpoint = "/playlists/" + entry.id() + "/items";
+                case "album" -> endpoint = "/albums/" + entry.id() + "/tracks";
+                case "artist" -> endpoint = "/artists/" + entry.id() + "/albums?include_groups=album,single,compilation";
+                case "show" -> endpoint = "/shows/" + entry.id() + "/episodes";
+                case "audiobook" -> endpoint = "/audiobooks/" + entry.id() + "/chapters";
+                default -> {
+                    itemErrors.put(key, "Для этого раздела список элементов не поддерживается.");
+                    return;
+                }
+            }
+            String separator = endpoint.contains("?") ? "&" : "?";
+            HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
+            if (r.statusCode() != 200) {
+                if (offset == 0) {
+                    String detail = apiMessage(r.body());
+                    itemErrors.put(key, "Не удалось загрузить содержимое: HTTP " + r.statusCode()
+                            + (detail.isEmpty() ? "" : " — " + detail));
+                }
+                break;
+            }
+            JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
+            JsonArray arr = page.has("items") && page.get("items").isJsonArray()
+                    ? page.getAsJsonArray("items") : new JsonArray();
+            int got = 0;
+            for (JsonElement el : arr) {
+                got++;
+                if (!el.isJsonObject()) continue;
+                JsonObject wrapper = el.getAsJsonObject();
+                JsonObject obj = switch (entry.kind()) {
+                    case "playlist" -> nested(wrapper, "item").equals(wrapper)
+                            ? nested(wrapper, "track") : nested(wrapper, "item");
+                    case "show" -> nested(wrapper, "episode");
+                    default -> wrapper;
+                };
+                String uri = str(obj, "uri");
+                if (uri.isEmpty()) continue;
+                if ("artist".equals(entry.kind())) {
+                    out.add(new Item(str(obj, "name"), artistsOf(obj), 0, uri));
+                } else if ("show".equals(entry.kind())) {
+                    out.add(new Item(str(obj, "name"), entry.name(), lng(obj, "duration_ms"), uri));
+                } else if ("audiobook".equals(entry.kind())) {
+                    out.add(new Item(str(obj, "name"), entry.owner(), lng(obj, "duration_ms"), uri));
+                } else {
+                    Item item = parseTrackItem(obj);
+                    if (item != null) out.add(item);
+                }
+            }
+            items.put(key, new ArrayList<>(out));
+            itemErrors.remove(key);
+            boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
+            if (!hasNext || got == 0) break;
+            offset += got;
+        }
+        items.put(key, List.copyOf(out));
+        itemErrors.remove(key);
+        itemsTime.put(key, System.currentTimeMillis());
+    }
+
+    /** Запустить контекст медиатеки или первый элемент коллекции. */
     public void playLibraryEntry(LibraryEntry entry, Consumer<String> err) {
         if (entry == null) return;
         if ("saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) {
@@ -827,14 +870,18 @@ public final class SpotifyClient {
                 return;
             }
             if (loaded.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
-            // Liked Songs is not a Spotify playback context. On some desktop clients,
-            // a bare `uris` playback request may clear the current player. Start the
-            // chosen saved track through its album context and exact track offset instead.
-            playTrackFromAlbum(loaded.get(0), err);
+            if ("saved_tracks".equals(entry.kind())) {
+                playLibraryItem(entry, loaded.get(0), err);
+            } else {
+                likedPlayback = null;
+                playLibraryItem(entry, loaded.get(0), err);
+            }
             return;
         }
-        // Spotify's playback endpoint accepts contexts for albums, artists and playlists,
-        // but not for show/audiobook objects. For those, play the first loaded episode/chapter.
+
+        // Spotify accepts playlist, album and artist contexts, but not show/audiobook contexts.
+        // A different library entry ends the special Liked Songs navigation session.
+        likedPlayback = null;
         if ("show".equals(entry.kind()) || "audiobook".equals(entry.kind())) {
             List<Item> loaded = items(entry);
             if (loaded == null) {
@@ -851,12 +898,39 @@ public final class SpotifyClient {
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
         optimisticTrack(item);
+        if ("saved_tracks".equals(entry.kind())) {
+            List<Item> saved = items(entry);
+            int selectedIndex = -1;
+            if (saved != null) {
+                for (int i = 0; i < saved.size(); i++) {
+                    if (item.uri().equals(saved.get(i).uri())) {
+                        selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+            likedPlayback = saved != null && selectedIndex >= 0
+                    ? new LikedPlayback(List.copyOf(saved), selectedIndex) : null;
+            playTrackFromAlbum(item, err);
+            return;
+        }
+
+        likedPlayback = null;
         switch (entry.kind()) {
             case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
             case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
-            case "saved_tracks" -> playTrackFromAlbum(item, err);
             default -> playUris(List.of(item.uri()), err);
         }
+    }
+
+    private void playLikedItem(LikedPlayback queue, int index, Consumer<String> err) {
+        if (queue == null || queue.items() == null || index < 0 || index >= queue.items().size()) return;
+        Item item = queue.items().get(index);
+        likedPlayback = new LikedPlayback(queue.items(), index);
+        optimisticTrack(item);
+        // Liked Songs itself is not a playable Spotify context. The album context keeps
+        // playback working on desktop; our Next/Previous controls preserve the saved-list order.
+        playTrackFromAlbum(item, err);
     }
 
     private void optimisticTrack(Item item) {
@@ -871,7 +945,7 @@ public final class SpotifyClient {
     private void playTrackFromAlbum(Item item, Consumer<String> err) {
         if (item == null || item.uri().isEmpty()) return;
         if (item.albumUri() != null && !item.albumUri().isEmpty()) {
-            playContext(item.albumUri(), item.uri(), err);
+            playContextInternal(item.albumUri(), item.uri(), err);
         } else {
             // Fallback for an incomplete API response. Most track objects include album.uri.
             playUris(List.of(item.uri()), err);
@@ -1038,9 +1112,42 @@ public final class SpotifyClient {
 
     public void pause(Consumer<String> err) { control("PUT", "/me/player/pause", null, err); }
 
-    public void next(Consumer<String> err) { control("POST", "/me/player/next", null, err); }
+    public void next(Consumer<String> err) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.items().isEmpty()) {
+            control("POST", "/me/player/next", null, err);
+            return;
+        }
+        if ("track".equals(snapshot.repeat())) {
+            playLikedItem(queue, queue.index(), err);
+        } else if (queue.index() + 1 < queue.items().size()) {
+            playLikedItem(queue, queue.index() + 1, err);
+        } else if ("context".equals(snapshot.repeat())) {
+            playLikedItem(queue, 0, err);
+        } else {
+            // Keep the Liked Songs session active, so repeated presses cannot fall
+            // through to the current album and unexpectedly leave the collection.
+            pause(err);
+            err.accept("Это последний трек в «Любимых треках».");
+        }
+    }
 
-    public void previous(Consumer<String> err) { control("POST", "/me/player/previous", null, err); }
+    public void previous(Consumer<String> err) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.items().isEmpty()) {
+            control("POST", "/me/player/previous", null, err);
+            return;
+        }
+        if ("track".equals(snapshot.repeat()) || snapshot.currentProgress() > 3_000) {
+            playLikedItem(queue, queue.index(), err);
+        } else if (queue.index() > 0) {
+            playLikedItem(queue, queue.index() - 1, err);
+        } else if ("context".equals(snapshot.repeat())) {
+            playLikedItem(queue, queue.items().size() - 1, err);
+        } else {
+            playLikedItem(queue, 0, err);
+        }
+    }
 
     /** Update the slider immediately and send only the latest requested volume to Spotify. */
     public void volume(int percent, Consumer<String> err) {
@@ -1089,8 +1196,14 @@ public final class SpotifyClient {
         control("PUT", "/me/player/repeat?state=" + mode, null, err);
     }
 
-    /** Играть плейлист целиком или с конкретного трека (trackUri может быть пустым). */
+    /** Играть плейлист/альбом/исполнителя; внешний запуск завершает навигацию по избранному. */
     public void playContext(String contextUri, String trackUri, Consumer<String> err) {
+        likedPlayback = null;
+        playContextInternal(contextUri, trackUri, err);
+    }
+
+    /** Внутренний запрос контекста, который не сбрасывает навигацию по «Любимым трекам». */
+    private void playContextInternal(String contextUri, String trackUri, Consumer<String> err) {
         JsonObject body = new JsonObject();
         body.addProperty("context_uri", contextUri);
         if (trackUri != null && !trackUri.isEmpty()) {
