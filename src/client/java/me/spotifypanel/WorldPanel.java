@@ -989,9 +989,8 @@ public final class WorldPanel {
                 trackScroll = 0;
                 lastRequestedLibraryKey = "";
                 client.requestItems(clickedEntry, false);
-                // Clicking a library icon starts that collection. Playlists and albums
-                // begin at their first item; saved tracks start with the liked URI list.
-                client.playLibraryEntry(clickedEntry, SpotifyPanelMod::say);
+                // Selecting a library item should only open it. Playback starts from
+                // the header play control or by clicking an individual track row.
 
             }
             wasLeftDown = down;
