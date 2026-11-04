@@ -988,23 +988,10 @@ public final class WorldPanel {
                 selectedLibraryKey = clickedEntry.key();
                 trackScroll = 0;
                 lastRequestedLibraryKey = "";
-                if ("playlist".equals(clickedEntry.kind())) {
-                    // A playlist-icon click starts its first available track as soon as
-                    // the contents have loaded. The selected panel section is still updated above.
-                    client.requestItemsAndThen(clickedEntry, false, loaded -> {
-                        if (loaded == null) {
-                            String detail = client.itemError(clickedEntry);
-                            SpotifyPanelMod.say(detail.isEmpty()
-                                    ? "Не удалось загрузить треки этого плейлиста." : detail);
-                        } else if (loaded.isEmpty()) {
-                            SpotifyPanelMod.say("В этом плейлисте нет доступных для воспроизведения треков.");
-                        } else {
-                            client.playLibraryItem(clickedEntry, loaded.get(0), SpotifyPanelMod::say);
-                        }
-                    });
-                } else {
-                    client.requestItems(clickedEntry, false);
-                }
+                // Clicking any library icon (playlist, album, liked songs, artist,
+                // podcast or audiobook) starts that section instead of only selecting it.
+                // SpotifyClient loads the first item asynchronously where needed.
+                client.playLibraryEntry(clickedEntry, SpotifyPanelMod::say);
 
             }
             wasLeftDown = down;

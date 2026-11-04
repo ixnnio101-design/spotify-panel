@@ -860,39 +860,58 @@ public final class SpotifyClient {
         itemsTime.put(key, System.currentTimeMillis());
     }
 
-    /** Запустить контекст медиатеки или первый элемент коллекции. */
+    /**
+     * Запускает выбранный раздел медиатеки с его первого доступного элемента.
+     * Для плейлистов и альбомов передаём Spotify URI первого трека, когда список
+     * доступен; если чтение списка не удалось, запускаем сам контекст как запасной вариант.
+     */
     public void playLibraryEntry(LibraryEntry entry, Consumer<String> err) {
         if (entry == null) return;
-        if ("saved_tracks".equals(entry.kind()) || "saved_episodes".equals(entry.kind())) {
-            List<Item> loaded = items(entry);
-            if (loaded == null) {
-                err.accept("Сначала загружаю содержимое коллекции — нажми ещё раз через секунду.");
-                return;
-            }
-            if (loaded.isEmpty()) { err.accept("В этой коллекции пока нет доступных элементов."); return; }
-            if ("saved_tracks".equals(entry.kind())) {
-                playLibraryItem(entry, loaded.get(0), err);
+
+        if ("artist".equals(entry.kind())) {
+            likedPlayback = null;
+            requestItems(entry, false); // список альбомов нужен для отображения раздела
+            if (entry.uri() != null && !entry.uri().isEmpty()) {
+                playContext(entry.uri(), "", err);
             } else {
-                likedPlayback = null;
-                playLibraryItem(entry, loaded.get(0), err);
+                err.accept("Не удалось определить исполнителя для воспроизведения.");
             }
             return;
         }
 
-        // Spotify accepts playlist, album and artist contexts, but not show/audiobook contexts.
-        // A different library entry ends the special Liked Songs navigation session.
-        likedPlayback = null;
-        if ("show".equals(entry.kind()) || "audiobook".equals(entry.kind())) {
-            List<Item> loaded = items(entry);
-            if (loaded == null) {
-                err.accept("Загружаю эпизоды/главы. Нажми на обложку ещё раз через секунду.");
-                return;
+        switch (entry.kind()) {
+            case "playlist", "album" -> requestItemsAndThen(entry, false, loaded -> {
+                if (loaded != null && !loaded.isEmpty()) {
+                    playLibraryItem(entry, loaded.get(0), err);
+                } else if (entry.uri() != null && !entry.uri().isEmpty()) {
+                    // The collection context can still play even if loading its visible
+                    // track list failed (for example because Spotify throttled that request).
+                    playContext(entry.uri(), "", err);
+                } else {
+                    err.accept("Не удалось загрузить содержимое этого раздела Spotify.");
+                }
+            });
+            case "saved_tracks", "saved_episodes", "show", "audiobook" ->
+                    requestItemsAndThen(entry, false, loaded -> {
+                        if (loaded == null) {
+                            String detail = itemError(entry);
+                            err.accept(detail.isEmpty()
+                                    ? "Не удалось загрузить содержимое этого раздела Spotify." : detail);
+                        } else if (loaded.isEmpty()) {
+                            err.accept("В этом разделе пока нет доступных для воспроизведения элементов.");
+                        } else {
+                            playLibraryItem(entry, loaded.get(0), err);
+                        }
+                    });
+            default -> {
+                likedPlayback = null;
+                if (entry.uri() != null && !entry.uri().isEmpty()) {
+                    playContext(entry.uri(), "", err);
+                } else {
+                    err.accept("У этого раздела нет адреса воспроизведения Spotify.");
+                }
             }
-            if (loaded.isEmpty()) { err.accept("В этом разделе пока нет доступных эпизодов или глав."); return; }
-            playLibraryItem(entry, loaded.get(0), err);
-            return;
         }
-        if (!entry.uri().isEmpty()) playContext(entry.uri(), "", err);
     }
 
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
