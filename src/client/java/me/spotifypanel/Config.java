@@ -3,6 +3,8 @@ package me.spotifypanel;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -11,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class Config {
+    private static final Logger LOG = LoggerFactory.getLogger("spotifypanel");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
     public String clientId = "";
@@ -32,7 +35,8 @@ public final class Config {
                 Config c = GSON.fromJson(Files.readString(p), Config.class);
                 if (c != null) return c.fix();
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            LOG.warn("Не удалось прочитать конфигурацию Spotify Panel; используются настройки по умолчанию.", e);
         }
         return new Config();
     }
@@ -48,7 +52,8 @@ public final class Config {
     public synchronized void save() {
         try {
             Files.writeString(file(), GSON.toJson(this));
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            LOG.error("Не удалось сохранить конфигурацию Spotify Panel.", e);
         }
     }
 }

@@ -68,6 +68,10 @@ public final class WorldPanel {
     private static final Identifier OVERLAY_TEXTURE_ID = Identifier.of("spotify-panel", "dynamic/model_overlay");
     private static NativeImageBackedTexture overlayTexture;
     private static long lastOverlayUpdateNs;
+    // Reuse these buffers instead of allocating a 768x500 image on every UI refresh.
+    // Rendering happens on the client render thread, so these buffers are not shared concurrently.
+    private static final BufferedImage OVERLAY_IMAGE = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
+    private static final Map<Integer, BufferedImage> COVER_IMAGE_BUFFERS = new HashMap<>();
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
     private static boolean wasLeftDown;
@@ -162,10 +166,17 @@ public final class WorldPanel {
         if (!SpotifyPanelMod.config.visible || mc.player == null || mc.world == null) {
             wasLeftDown = false;
             dragMode = DRAG_NONE;
+            // Do not keep consuming the game's mouse wheel while the panel is hidden or unavailable.
+            scrollArea = 0;
+            wheelDelta = 0;
             return;
         }
         MatrixStack matrices = context.matrices();
-        if (matrices == null || context.consumers() == null) return;
+        if (matrices == null || context.consumers() == null) {
+            scrollArea = 0;
+            wheelDelta = 0;
+            return;
+        }
 
         ClientPlayerEntity player = mc.player;
         Vec3d cameraPos = context.worldState().cameraRenderState.pos;
@@ -273,9 +284,12 @@ public final class WorldPanel {
         if (scrollHooked) return;
         scrollHooked = true;
         previousScroll = GLFW.glfwSetScrollCallback(handle, (window, xOffset, yOffset) -> {
-            // Wheel is reserved for scrolling the library and track lists.
-            // Volume and seeking are controlled by holding the left mouse button on their sliders.
-            if (scrollArea != 0) wheelDelta += yOffset;
+            // Wheel is reserved for scrolling the library and track lists only while
+            // the panel is visible in a world with chat open. Otherwise pass it to Minecraft.
+            MinecraftClient mc = MinecraftClient.getInstance();
+            boolean panelInputActive = SpotifyPanelMod.config.visible && mc.player != null
+                    && mc.world != null && mc.currentScreen instanceof ChatScreen;
+            if (panelInputActive && scrollArea != 0) wheelDelta += yOffset;
             else if (previousScroll != null) previousScroll.invoke(window, xOffset, yOffset);
         });
     }
@@ -427,11 +441,14 @@ public final class WorldPanel {
 
     private static BufferedImage paintOverlay(SpotifyClient.Snapshot s, List<SpotifyClient.LibraryEntry> libraryEntries,
                                               SpotifyClient.LibraryEntry selected, List<SpotifyClient.Item> items) {
-        BufferedImage image = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
+        BufferedImage image = OVERLAY_IMAGE;
         Graphics2D g = image.createGraphics();
-        prepare(g);
-        g.setColor(new Color(0, 0, 0, 0));
+        // A reused image must be explicitly cleared; drawing transparent SRC_OVER pixels
+        // would otherwise leave fragments from the previous frame.
+        g.setComposite(java.awt.AlphaComposite.Clear);
         g.fillRect(0, 0, TEX_W, TEX_H);
+        g.setComposite(java.awt.AlphaComposite.SrcOver);
+        prepare(g);
 
         paintSidebar(g, libraryEntries, selected);
         java.awt.Composite previousComposite = g.getComposite();
@@ -610,15 +627,18 @@ public final class WorldPanel {
             return;
         }
         if (items.isEmpty()) {
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 17));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
             g.setColor(new Color(205, 215, 208));
-            drawUiText(g, "В этом разделе пока нет доступных элементов", x0 + 18, y0 + 70, g.getColor());
+            String error = SpotifyPanelMod.spotify.itemError(selected);
+            String message = error.isEmpty()
+                    ? "В этом разделе пока нет доступных элементов" : error;
+            drawUiText(g, fit(g, message, x1 - x0 - 36), x0 + 18, y0 + 70, g.getColor());
             return;
         }
 
         int first = Math.max(0, Math.min(items.size(), (int) Math.floor(trackScrollVisual)));
         double fraction = trackScrollVisual - first;
-        int rows = Math.min(6, Math.max(0, items.size() - first));
+        int rows = Math.min(5, Math.max(0, items.size() - first));
         int rowH = 42;
         int startY = y0 + 60;
         java.awt.Shape oldClip = g.getClip();
@@ -1175,7 +1195,8 @@ public final class WorldPanel {
     private static void drawCover(Graphics2D g, int[] pixels, int size, int x, int y, int target) {
         if (target <= 0) return;
         if (pixels != null && pixels.length >= size * size) {
-            BufferedImage cover = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+            BufferedImage cover = COVER_IMAGE_BUFFERS.computeIfAbsent(size,
+                    imageSize -> new BufferedImage(imageSize, imageSize, BufferedImage.TYPE_INT_ARGB));
             cover.setRGB(0, 0, size, size, pixels, 0, size);
             g.drawImage(cover, x, y, target, target, null);
         } else {

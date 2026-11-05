@@ -147,7 +147,13 @@ public final class SpotifyClient {
     private volatile String playlistsError = "";
     private volatile long nextPlaylistTry = 0;
     private volatile long retryAfterMs = 0;
+    // Shared Spotify API cooldown after HTTP 429; all background requests honor Retry-After.
+    private volatile long apiCooldownUntilMs = 0;
     private volatile int playlistFails = 0;
+
+    private synchronized void extendApiCooldown(long untilMs) {
+        apiCooldownUntilMs = Math.max(apiCooldownUntilMs, untilMs);
+    }
     private final java.util.concurrent.atomic.AtomicBoolean playlistsLoading = new java.util.concurrent.atomic.AtomicBoolean();
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
@@ -192,6 +198,12 @@ public final class SpotifyClient {
     // ------------------------------------------------------------- HTTP
 
     private HttpResponse<String> send(String method, String path, String jsonBody) throws Exception {
+        long remainingCooldown = apiCooldownUntilMs - System.currentTimeMillis();
+        if (remainingCooldown > 0) {
+            throw new IOException("Spotify временно ограничил запросы. Повтори через "
+                    + Math.max(1, (remainingCooldown + 999) / 1000) + " сек.");
+        }
+
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
                 .header("Authorization", "Bearer " + auth.accessToken())
                 .timeout(Duration.ofSeconds(10));
@@ -200,7 +212,18 @@ public final class SpotifyClient {
         } else {
             b.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofString(jsonBody));
         }
-        return Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() == 429) {
+            String retryAfter = response.headers().firstValue("Retry-After").orElse("5");
+            long delayMs;
+            try {
+                delayMs = Math.max(1_000L, Long.parseLong(retryAfter.trim()) * 1_000L);
+            } catch (NumberFormatException ignored) {
+                delayMs = 5_000L;
+            }
+            extendApiCooldown(System.currentTimeMillis() + delayMs);
+        }
+        return response;
     }
 
     private static String errText(Throwable e) {
@@ -227,6 +250,14 @@ public final class SpotifyClient {
             }
 
             long now = System.currentTimeMillis();
+            if (now < apiCooldownUntilMs) {
+                // Keep the last known playback card visible during the cooldown.
+                // Only show an unavailable state when there is no active snapshot to preserve.
+                if (snapshot.status() != Status.ACTIVE) {
+                    snapshot = Snapshot.error("Spotify временно ограничил запросы. Повторная проверка позже.");
+                }
+                return;
+            }
             if (now >= nextPlaylistTry) tryLoadPlaylists();
 
             long started = System.currentTimeMillis();
@@ -240,7 +271,14 @@ public final class SpotifyClient {
             } else if (sc == 401) {
                 auth.invalidate();
             } else if (sc == 429) {
-                snapshot = Snapshot.error("Слишком много запросов (429)");
+                Snapshot current = snapshot;
+                if (current.status() == Status.ACTIVE) {
+                    snapshot = new Snapshot(current.status(), current.playing(), current.track(),
+                            current.progressMs(), current.fetchedAtMs(), current.device(), current.volume(),
+                            current.shuffle(), current.repeat(), "Слишком много запросов (429)");
+                } else {
+                    snapshot = Snapshot.error("Слишком много запросов (429)");
+                }
             } else if (sc != 200) {
                 snapshot = Snapshot.error("HTTP " + sc);
             } else {
@@ -799,6 +837,7 @@ public final class SpotifyClient {
     private void loadItems(LibraryEntry entry, String key) throws Exception {
         List<Item> out = new ArrayList<>();
         int offset = 0;
+        boolean failed = false;
         while (offset < 1000) {
             String endpoint;
             switch (entry.kind()) {
@@ -815,11 +854,13 @@ public final class SpotifyClient {
             String separator = endpoint.contains("?") ? "&" : "?";
             HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
             if (r.statusCode() != 200) {
-                if (offset == 0) {
-                    String detail = apiMessage(r.body());
-                    itemErrors.put(key, "Не удалось загрузить содержимое: HTTP " + r.statusCode()
-                            + (detail.isEmpty() ? "" : " — " + detail));
-                }
+                String detail = apiMessage(r.body());
+                String prefix = offset == 0
+                        ? "Не удалось загрузить содержимое: HTTP "
+                        : "Не удалось загрузить оставшиеся элементы: HTTP ";
+                itemErrors.put(key, prefix + r.statusCode()
+                        + (detail.isEmpty() ? "" : " — " + detail));
+                failed = true;
                 break;
             }
             JsonObject page = JsonParser.parseString(r.body()).getAsJsonObject();
@@ -850,14 +891,19 @@ public final class SpotifyClient {
                 }
             }
             items.put(key, new ArrayList<>(out));
-            itemErrors.remove(key);
             boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
             if (!hasNext || got == 0) break;
             offset += got;
         }
-        items.put(key, List.copyOf(out));
-        itemErrors.remove(key);
-        itemsTime.put(key, System.currentTimeMillis());
+        if (!failed) {
+            items.put(key, List.copyOf(out));
+            itemErrors.remove(key);
+            itemsTime.put(key, System.currentTimeMillis());
+        } else if (!out.isEmpty()) {
+            // Keep successfully fetched pages visible, but retain the API error and do not
+            // mark the incomplete result as a fresh cache entry.
+            items.put(key, List.copyOf(out));
+        }
     }
 
     /**
@@ -1277,6 +1323,10 @@ public final class SpotifyClient {
                 return false;
             } else if (sc == 403) {
                 err.accept("Spotify отказал (нужен Premium или действие недоступно).");
+                revert();
+                return false;
+            } else if (sc == 429) {
+                err.accept("Spotify временно ограничил запросы. Подожди перед повторной попыткой.");
                 revert();
                 return false;
             } else if (sc >= 300) {

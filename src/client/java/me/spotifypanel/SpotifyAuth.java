@@ -19,6 +19,7 @@ import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -98,6 +99,7 @@ public final class SpotifyAuth {
 
     private JsonObject tokenRequest(Map<String, String> form) throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder(URI.create("https://accounts.spotify.com/api/token"))
+                .timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(encode(form)))
                 .build();
