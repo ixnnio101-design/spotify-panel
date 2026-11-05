@@ -962,7 +962,9 @@ public final class SpotifyClient {
 
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
-        optimisticTrack(item);
+        // Do not publish the clicked row as "now playing" before Spotify confirms it.
+        // Playback commands are asynchronous; optimistic snapshots could disagree with the
+        // actual Spotify player and make the row highlight jump to a track that never started.
         if ("saved_tracks".equals(entry.kind())) {
             List<Item> saved = items(entry);
             int selectedIndex = -1;
@@ -992,19 +994,11 @@ public final class SpotifyClient {
         if (queue == null || queue.items() == null || index < 0 || index >= queue.items().size()) return;
         Item item = queue.items().get(index);
         likedPlayback = new LikedPlayback(queue.items(), index);
-        optimisticTrack(item);
+        // Keep the last confirmed Spotify snapshot until the next poll confirms this track.
+        // This avoids showing a false now-playing row when the remote command is rejected.
         // Liked Songs itself is not a playable Spotify context. The album context keeps
         // playback working on desktop; our Next/Previous controls preserve the saved-list order.
         playTrackFromAlbum(item, err);
-    }
-
-    private void optimisticTrack(Item item) {
-        Snapshot current = snapshot;
-        String cover = current.track() == null ? "" : current.track().coverUrl();
-        Track selected = new Track(item.title(), item.artists(), cover, item.durationMs(), item.uri());
-        Snapshot next = new Snapshot(Status.ACTIVE, true, selected, 0, System.currentTimeMillis(),
-                current.device(), current.volume(), current.shuffle(), current.repeat(), "");
-        local(ignored -> next, 250);
     }
 
     private void playTrackFromAlbum(Item item, Consumer<String> err) {

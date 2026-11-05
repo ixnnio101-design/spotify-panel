@@ -98,6 +98,11 @@ public final class WorldPanel {
     private static boolean progressVisualInitialized;
     private static String displayedProgressTrackUri = "";
     private static final Map<String, Double> playingHighlightAlpha = new HashMap<>();
+    // Debounce playback URI changes: brief empty/stale API snapshots during track transitions
+    // must not make the green playing-row highlight flicker or disappear.
+    private static String stablePlayingTrackUri = "";
+    private static String candidatePlayingTrackUri = "";
+    private static long candidatePlayingTrackSinceNs;
     private static volatile int scrollArea;
     private static volatile double wheelDelta;
     private static boolean scrollHooked;
@@ -372,28 +377,45 @@ public final class WorldPanel {
             if (Math.abs(targetProgress - displayedProgressMs) < 12.0) displayedProgressMs = targetProgress;
         }
 
-        // Fade the playing-row accent in/out when Spotify changes tracks rather than
-        // swapping the highlight in one frame. Keep only the active/fading URI entries.
-        String playingUri = trackUri;
-        boolean playingTrackVisible = false;
-        if (items != null && !playingUri.isEmpty()) {
-            for (SpotifyClient.Item item : items) {
-                if (playingUri.equals(item.uri())) {
-                    playingTrackVisible = true;
-                    break;
+        // Smooth and stabilize the confirmed Spotify track URI before animating the row.
+        // A brief 204/empty snapshot is common around track transitions; keep the previous
+        // URI during that gap, and accept a new non-empty URI after it remains stable briefly.
+        if (!trackUri.equals(candidatePlayingTrackUri)) {
+            candidatePlayingTrackUri = trackUri;
+            candidatePlayingTrackSinceNs = now;
+        }
+        long candidateAgeNs = Math.max(0L, now - candidatePlayingTrackSinceNs);
+        long settleNs = candidatePlayingTrackUri.isEmpty()
+                ? 2_500_000_000L : 300_000_000L;
+        if (candidateAgeNs >= settleNs) {
+            stablePlayingTrackUri = candidatePlayingTrackUri;
+        }
+
+        // Fade the playing-row accent between confirmed track URIs. If the item list is
+        // temporarily loading, preserve the current alpha instead of fading the highlight
+        // away and making it pop back in when the same list finishes loading.
+        String playingUri = stablePlayingTrackUri;
+        if (items != null) {
+            boolean playingTrackVisible = false;
+            if (!playingUri.isEmpty()) {
+                for (SpotifyClient.Item item : items) {
+                    if (playingUri.equals(item.uri())) {
+                        playingTrackVisible = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.0);
-        double highlightEase = 1.0 - Math.exp(-dt * 15.0);
-        Iterator<Map.Entry<String, Double>> highlightIterator = playingHighlightAlpha.entrySet().iterator();
-        while (highlightIterator.hasNext()) {
-            Map.Entry<String, Double> entry = highlightIterator.next();
-            double target = playingTrackVisible && entry.getKey().equals(playingUri) ? 1.0 : 0.0;
-            double next = entry.getValue() + (target - entry.getValue()) * highlightEase;
-            if (Math.abs(target - next) < 0.004) next = target;
-            if (next <= 0.004 && target == 0.0) highlightIterator.remove();
-            else entry.setValue(next);
+            if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.0);
+            double highlightEase = 1.0 - Math.exp(-dt * 15.0);
+            Iterator<Map.Entry<String, Double>> highlightIterator = playingHighlightAlpha.entrySet().iterator();
+            while (highlightIterator.hasNext()) {
+                Map.Entry<String, Double> entry = highlightIterator.next();
+                double target = playingTrackVisible && entry.getKey().equals(playingUri) ? 1.0 : 0.0;
+                double next = entry.getValue() + (target - entry.getValue()) * highlightEase;
+                if (Math.abs(target - next) < 0.004) next = target;
+                if (next <= 0.004 && target == 0.0) highlightIterator.remove();
+                else entry.setValue(next);
+            }
         }
 
         // Newly selected albums/playlists ease in with a subtle upward settle.
@@ -647,8 +669,6 @@ public final class WorldPanel {
             int itemIndex = first + i;
             SpotifyClient.Item item = items.get(itemIndex);
             int y = startY + (int) Math.round((i - fraction) * rowH);
-            SpotifyClient.Track current = snapshot.track();
-            boolean active = current != null && !current.uri().isBlank() && current.uri().equals(item.uri());
             double highlight = Math.max(0.0, Math.min(1.0,
                     playingHighlightAlpha.getOrDefault(item.uri(), 0.0)));
             if (highlight > 0.002) {

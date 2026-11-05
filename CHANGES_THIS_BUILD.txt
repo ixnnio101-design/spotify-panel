@@ -51,3 +51,9 @@ Additional animation polish
 - The now-playing row highlight fades between track URIs instead of abruptly switching its background, border and text tint.
 - Scroll easing was softened and selection changes now use a gentle fade plus a small vertical settle.
 - Dragging and scrolling refresh the world-space texture at up to 60 FPS; normal playback refresh stays lighter.
+
+
+Playback status and highlight stability (5 Nov 2026)
+- Removed optimistic now-playing snapshots for clicked songs. The panel now shows/highlights a track only after Spotify confirms the actual player state, preventing the Minecraft panel from showing a clicked song while Spotify Desktop is still playing a different one.
+- Debounced current-track URI changes: non-empty changes settle for 300 ms; empty states must persist for 2.5 seconds before clearing the playing highlight. This prevents flicker across transient empty API responses.
+- While a library item list is temporarily loading, preserve the current highlight animation state instead of fading it out and abruptly bringing it back when the list returns.
