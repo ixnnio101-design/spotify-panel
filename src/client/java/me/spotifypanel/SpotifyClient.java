@@ -26,9 +26,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.IntBinaryOperator;
 import java.util.function.UnaryOperator;
@@ -130,6 +132,11 @@ public final class SpotifyClient {
     });
     private final Object pollLock = new Object();
     private final AtomicBoolean pollPending = new AtomicBoolean();
+    // Track/collection clicks are debounced: rapid clicks collapse into the latest intent.
+    private static final long PLAYBACK_DEBOUNCE_MS = 120;
+    private final AtomicLong playbackIntentSequence = new AtomicLong();
+    private final Object playbackScheduleLock = new Object();
+    private ScheduledFuture<?> pendingPlaybackCommand;
     private final AtomicInteger pendingVolume = new AtomicInteger(-1);
     private final AtomicBoolean volumeFlushScheduled = new AtomicBoolean();
     private volatile long lastVolumeRequestAtMs;
@@ -239,6 +246,8 @@ public final class SpotifyClient {
     }
 
     private void pollInner() {
+        // A poll started before/during a track-selection burst must not overwrite newer state.
+        long playbackIntentAtStart = playbackIntentSequence.get();
         try {
             if (auth.clientId().isEmpty()) {
                 snapshot = Snapshot.of(Status.NO_CLIENT_ID);
@@ -263,8 +272,13 @@ public final class SpotifyClient {
             long started = System.currentTimeMillis();
             HttpResponse<String> r = send("GET", "/me/player", null);
             int sc = r.statusCode();
-            if ((sc == 200 || sc == 204) && (started < lastLocalAt || System.currentTimeMillis() < ignorePollUntil)) {
-                return; // ответ устарел относительно только что нажатой кнопки
+            if (playbackIntentAtStart != playbackIntentSequence.get()) {
+                return; // новый выбор трека произошёл, пока этот запрос был в пути
+            }
+            if ((sc == 200 || sc == 204)
+                    && (started < lastLocalAt || started < ignorePollUntil
+                    || System.currentTimeMillis() < ignorePollUntil)) {
+                return; // ответ относится к переходу между треками или к старому состоянию
             }
             if (sc == 204) {
                 snapshot = Snapshot.of(Status.IDLE);
@@ -908,18 +922,19 @@ public final class SpotifyClient {
 
     /**
      * Запускает выбранный раздел медиатеки с его первого доступного элемента.
-     * Для плейлистов и альбомов передаём Spotify URI первого трека, когда список
-     * доступен; если чтение списка не удалось, запускаем сам контекст как запасной вариант.
+     * Повторные клики во время загрузки списка заменяют предыдущее намерение.
      */
     public void playLibraryEntry(LibraryEntry entry, Consumer<String> err) {
         if (entry == null) return;
+        long intentId = beginPlaybackIntent();
 
         if ("artist".equals(entry.kind())) {
             likedPlayback = null;
             requestItems(entry, false); // список альбомов нужен для отображения раздела
             if (entry.uri() != null && !entry.uri().isEmpty()) {
-                playContext(entry.uri(), "", err);
-            } else {
+                schedulePlaybackControl(intentId, "PUT", "/me/player/play",
+                        contextBody(entry.uri(), ""), err);
+            } else if (isPlaybackIntentCurrent(intentId)) {
                 err.accept("Не удалось определить исполнителя для воспроизведения.");
             }
             return;
@@ -927,18 +942,20 @@ public final class SpotifyClient {
 
         switch (entry.kind()) {
             case "playlist", "album" -> requestItemsAndThen(entry, false, loaded -> {
+                if (!isPlaybackIntentCurrent(intentId)) return;
                 if (loaded != null && !loaded.isEmpty()) {
-                    playLibraryItem(entry, loaded.get(0), err);
+                    playLibraryItem(entry, loaded.get(0), err, intentId);
                 } else if (entry.uri() != null && !entry.uri().isEmpty()) {
-                    // The collection context can still play even if loading its visible
-                    // track list failed (for example because Spotify throttled that request).
-                    playContext(entry.uri(), "", err);
+                    // The collection context can still play if reading its visible list failed.
+                    schedulePlaybackControl(intentId, "PUT", "/me/player/play",
+                            contextBody(entry.uri(), ""), err);
                 } else {
                     err.accept("Не удалось загрузить содержимое этого раздела Spotify.");
                 }
             });
             case "saved_tracks", "saved_episodes", "show", "audiobook" ->
                     requestItemsAndThen(entry, false, loaded -> {
+                        if (!isPlaybackIntentCurrent(intentId)) return;
                         if (loaded == null) {
                             String detail = itemError(entry);
                             err.accept(detail.isEmpty()
@@ -946,14 +963,15 @@ public final class SpotifyClient {
                         } else if (loaded.isEmpty()) {
                             err.accept("В этом разделе пока нет доступных для воспроизведения элементов.");
                         } else {
-                            playLibraryItem(entry, loaded.get(0), err);
+                            playLibraryItem(entry, loaded.get(0), err, intentId);
                         }
                     });
             default -> {
                 likedPlayback = null;
                 if (entry.uri() != null && !entry.uri().isEmpty()) {
-                    playContext(entry.uri(), "", err);
-                } else {
+                    schedulePlaybackControl(intentId, "PUT", "/me/player/play",
+                            contextBody(entry.uri(), ""), err);
+                } else if (isPlaybackIntentCurrent(intentId)) {
                     err.accept("У этого раздела нет адреса воспроизведения Spotify.");
                 }
             }
@@ -962,9 +980,12 @@ public final class SpotifyClient {
 
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
-        // Do not publish the clicked row as "now playing" before Spotify confirms it.
-        // Playback commands are asynchronous; optimistic snapshots could disagree with the
-        // actual Spotify player and make the row highlight jump to a track that never started.
+        playLibraryItem(entry, item, err, beginPlaybackIntent());
+    }
+
+    private void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err, long intentId) {
+        if (!isPlaybackIntentCurrent(intentId) || entry == null || item == null || item.uri().isEmpty()) return;
+
         if ("saved_tracks".equals(entry.kind())) {
             List<Item> saved = items(entry);
             int selectedIndex = -1;
@@ -978,36 +999,34 @@ public final class SpotifyClient {
             }
             likedPlayback = saved != null && selectedIndex >= 0
                     ? new LikedPlayback(List.copyOf(saved), selectedIndex) : null;
-            playTrackFromAlbum(item, err);
+            playTrackFromAlbum(item, err, intentId);
             return;
         }
 
         likedPlayback = null;
         switch (entry.kind()) {
-            case "playlist", "album" -> playContext(entry.uri(), item.uri(), err);
-            case "artist" -> playContext(item.uri(), "", err); // artist row is one of that artist's albums
-            default -> playUris(List.of(item.uri()), err);
+            case "playlist", "album" -> playContextInternal(entry.uri(), item.uri(), err, intentId);
+            case "artist" -> schedulePlaybackControl(intentId, "PUT", "/me/player/play",
+                    contextBody(item.uri(), ""), err); // artist row is one of that artist's albums
+            default -> playUris(List.of(item.uri()), err, intentId);
         }
     }
 
     private void playLikedItem(LikedPlayback queue, int index, Consumer<String> err) {
         if (queue == null || queue.items() == null || index < 0 || index >= queue.items().size()) return;
+        long intentId = beginPlaybackIntent();
         Item item = queue.items().get(index);
         likedPlayback = new LikedPlayback(queue.items(), index);
-        // Keep the last confirmed Spotify snapshot until the next poll confirms this track.
-        // This avoids showing a false now-playing row when the remote command is rejected.
-        // Liked Songs itself is not a playable Spotify context. The album context keeps
-        // playback working on desktop; our Next/Previous controls preserve the saved-list order.
-        playTrackFromAlbum(item, err);
+        playTrackFromAlbum(item, err, intentId);
     }
 
-    private void playTrackFromAlbum(Item item, Consumer<String> err) {
-        if (item == null || item.uri().isEmpty()) return;
+    private void playTrackFromAlbum(Item item, Consumer<String> err, long intentId) {
+        if (!isPlaybackIntentCurrent(intentId) || item == null || item.uri().isEmpty()) return;
         if (item.albumUri() != null && !item.albumUri().isEmpty()) {
-            playContextInternal(item.albumUri(), item.uri(), err);
+            playContextInternal(item.albumUri(), item.uri(), err, intentId);
         } else {
             // Fallback for an incomplete API response. Most track objects include album.uri.
-            playUris(List.of(item.uri()), err);
+            playUris(List.of(item.uri()), err, intentId);
         }
     }
 
@@ -1258,11 +1277,16 @@ public final class SpotifyClient {
     /** Играть плейлист/альбом/исполнителя; внешний запуск завершает навигацию по избранному. */
     public void playContext(String contextUri, String trackUri, Consumer<String> err) {
         likedPlayback = null;
-        playContextInternal(contextUri, trackUri, err);
+        long intentId = beginPlaybackIntent();
+        playContextInternal(contextUri, trackUri, err, intentId);
     }
 
     /** Внутренний запрос контекста, который не сбрасывает навигацию по «Любимым трекам». */
-    private void playContextInternal(String contextUri, String trackUri, Consumer<String> err) {
+    private void playContextInternal(String contextUri, String trackUri, Consumer<String> err, long intentId) {
+        schedulePlaybackControl(intentId, "PUT", "/me/player/play", contextBody(contextUri, trackUri), err);
+    }
+
+    private String contextBody(String contextUri, String trackUri) {
         JsonObject body = new JsonObject();
         body.addProperty("context_uri", contextUri);
         if (trackUri != null && !trackUri.isEmpty()) {
@@ -1270,20 +1294,79 @@ public final class SpotifyClient {
             off.addProperty("uri", trackUri);
             body.add("offset", off);
         }
-        control("PUT", "/me/player/play", body.toString(), err);
+        return body.toString();
     }
 
     /** Запускает отдельные сохранённые треки/эпизоды через список URI (Spotify принимает до 100 URI). */
     public void playUris(List<String> uris, Consumer<String> err) {
+        playUris(uris, err, beginPlaybackIntent());
+    }
+
+    private void playUris(List<String> uris, Consumer<String> err, long intentId) {
         JsonArray array = new JsonArray();
         if (uris != null) for (String uri : uris) if (uri != null && !uri.isEmpty() && array.size() < 100) array.add(uri);
-        if (array.isEmpty()) { err.accept("Нет доступных элементов для запуска."); return; }
+        if (array.isEmpty()) {
+            if (isPlaybackIntentCurrent(intentId)) err.accept("Нет доступных элементов для запуска.");
+            return;
+        }
         JsonObject body = new JsonObject();
         body.add("uris", array);
-        control("PUT", "/me/player/play", body.toString(), err);
+        schedulePlaybackControl(intentId, "PUT", "/me/player/play", body.toString(), err);
+    }
+
+    private boolean isPlaybackIntentCurrent(long intentId) {
+        return playbackIntentSequence.get() == intentId;
+    }
+
+    /** Begin a new user playback choice and cancel any not-yet-sent older choice. */
+    private long beginPlaybackIntent() {
+        long intentId = playbackIntentSequence.incrementAndGet();
+        synchronized (playbackScheduleLock) {
+            if (pendingPlaybackCommand != null) {
+                pendingPlaybackCommand.cancel(false);
+                pendingPlaybackCommand = null;
+            }
+        }
+        long now = System.currentTimeMillis();
+        lastLocalAt = now;
+        // Ignore transient player snapshots while Spotify is switching to the chosen track.
+        ignorePollUntil = now + PLAYBACK_DEBOUNCE_MS + 450;
+        return intentId;
+    }
+
+    private void invalidatePendingPlayback() {
+        playbackIntentSequence.incrementAndGet();
+        synchronized (playbackScheduleLock) {
+            if (pendingPlaybackCommand != null) {
+                pendingPlaybackCommand.cancel(false);
+                pendingPlaybackCommand = null;
+            }
+        }
+    }
+
+    /** Trailing-edge debounce: only the last rapid track click is sent to Spotify. */
+    private void schedulePlaybackControl(long intentId, String method, String path, String body,
+                                         Consumer<String> err) {
+        synchronized (playbackScheduleLock) {
+            if (!isPlaybackIntentCurrent(intentId)) return;
+            if (pendingPlaybackCommand != null) pendingPlaybackCommand.cancel(false);
+            pendingPlaybackCommand = exec.schedule(() -> {
+                synchronized (playbackScheduleLock) {
+                    if (!isPlaybackIntentCurrent(intentId)) return;
+                    pendingPlaybackCommand = null;
+                }
+                ctl.submit(() -> {
+                    if (isPlaybackIntentCurrent(intentId)) {
+                        doControl(method, path, body, err, intentId);
+                    }
+                });
+            }, PLAYBACK_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+        }
     }
 
     private void control(String method, String path, String body, Consumer<String> err) {
+        // An explicit transport/control action supersedes a pending not-yet-sent track click.
+        invalidatePendingPlayback();
         ctl.submit(() -> { doControl(method, path, body, err); });
     }
 
@@ -1303,13 +1386,31 @@ public final class SpotifyClient {
     }
 
     private boolean doControl(String method, String path, String body, Consumer<String> err) {
+        return doControl(method, path, body, err, -1L);
+    }
+
+    private boolean doControl(String method, String path, String body, Consumer<String> err, long guardedIntentId) {
+        boolean guarded = guardedIntentId >= 0;
         try {
+            if (guarded && !isPlaybackIntentCurrent(guardedIntentId)) return false;
             if (!auth.isLoggedIn()) {
-                err.accept("Сначала войди: /spotify login");
-                revert();
+                if (!guarded || isPlaybackIntentCurrent(guardedIntentId)) {
+                    err.accept("Сначала войди: /spotify login");
+                    revert();
+                }
                 return false;
             }
+            if (guarded) {
+                // Refresh the transition guard when the actual Spotify request starts.
+                // This also invalidates any older /me/player response already in flight.
+                long commandStartedAt = System.currentTimeMillis();
+                lastLocalAt = commandStartedAt;
+                ignorePollUntil = commandStartedAt + 450;
+            }
             HttpResponse<String> r = send(method, path, body);
+            // If another track was clicked while this HTTP request was in flight, its response
+            // must not show an obsolete error or schedule polls for the previous choice.
+            if (guarded && !isPlaybackIntentCurrent(guardedIntentId)) return false;
             int sc = r.statusCode();
             if (sc == 404) {
                 err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
@@ -1330,7 +1431,23 @@ public final class SpotifyClient {
             } else {
                 long wait = ignorePollUntil - System.currentTimeMillis();
                 if (wait > 0) {
-                    pollOnce(wait + 100); // подтянуть настоящее состояние, когда «окно игнора» кончится
+                    if (guarded) {
+                        exec.schedule(() -> {
+                            if (isPlaybackIntentCurrent(guardedIntentId)) poll();
+                        }, wait + 100, TimeUnit.MILLISECONDS);
+                    } else {
+                        pollOnce(wait + 100); // подтянуть настоящее состояние, когда «окно игнора» кончится
+                    }
+                } else if (guarded) {
+                    exec.schedule(() -> {
+                        if (isPlaybackIntentCurrent(guardedIntentId)) poll();
+                    }, 140, TimeUnit.MILLISECONDS);
+                    exec.schedule(() -> {
+                        if (isPlaybackIntentCurrent(guardedIntentId)) poll();
+                    }, 420, TimeUnit.MILLISECONDS);
+                    exec.schedule(() -> {
+                        if (isPlaybackIntentCurrent(guardedIntentId)) poll();
+                    }, 850, TimeUnit.MILLISECONDS);
                 } else {
                     // Pull player state promptly after transport/playback commands.
                     exec.schedule(this::poll, 140, TimeUnit.MILLISECONDS);
@@ -1340,8 +1457,10 @@ public final class SpotifyClient {
                 return true;
             }
         } catch (Exception e) {
-            err.accept("Ошибка: " + errText(e));
-            revert();
+            if (!guarded || isPlaybackIntentCurrent(guardedIntentId)) {
+                err.accept("Ошибка: " + errText(e));
+                revert();
+            }
             return false;
         }
     }

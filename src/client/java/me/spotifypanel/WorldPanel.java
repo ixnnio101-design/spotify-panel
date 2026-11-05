@@ -385,8 +385,11 @@ public final class WorldPanel {
             candidatePlayingTrackSinceNs = now;
         }
         long candidateAgeNs = Math.max(0L, now - candidatePlayingTrackSinceNs);
-        long settleNs = candidatePlayingTrackUri.isEmpty()
-                ? 2_500_000_000L : 300_000_000L;
+        // SpotifyClient already rejects stale /me/player responses after a newer click.
+        // Accept a real non-empty track URI immediately so the row highlight changes in
+        // the same render update as the now-playing cover/title. Keep only the longer
+        // empty-state grace period to avoid flicker during Spotify's brief 204 transitions.
+        long settleNs = candidatePlayingTrackUri.isEmpty() ? 2_500_000_000L : 0L;
         if (candidateAgeNs >= settleNs) {
             stablePlayingTrackUri = candidatePlayingTrackUri;
         }
@@ -405,8 +408,11 @@ public final class WorldPanel {
                     }
                 }
             }
-            if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.0);
-            double highlightEase = 1.0 - Math.exp(-dt * 15.0);
+            // Start with a faint visible accent on the exact frame the now-playing
+            // snapshot changes, then finish the fade quickly. This keeps the row and
+            // the cover/title update visually in sync instead of making the highlight lag.
+            if (playingTrackVisible) playingHighlightAlpha.putIfAbsent(playingUri, 0.10);
+            double highlightEase = 1.0 - Math.exp(-dt * 22.0);
             Iterator<Map.Entry<String, Double>> highlightIterator = playingHighlightAlpha.entrySet().iterator();
             while (highlightIterator.hasNext()) {
                 Map.Entry<String, Double> entry = highlightIterator.next();

@@ -57,3 +57,17 @@ Playback status and highlight stability (5 Nov 2026)
 - Removed optimistic now-playing snapshots for clicked songs. The panel now shows/highlights a track only after Spotify confirms the actual player state, preventing the Minecraft panel from showing a clicked song while Spotify Desktop is still playing a different one.
 - Debounced current-track URI changes: non-empty changes settle for 300 ms; empty states must persist for 2.5 seconds before clearing the playing highlight. This prevents flicker across transient empty API responses.
 - While a library item list is temporarily loading, preserve the current highlight animation state instead of fading it out and abruptly bringing it back when the list returns.
+
+Rapid track switching guard (5 Nov 2026)
+- Added a 240 ms trailing-edge debounce for track and library playback selections. When several tracks are clicked quickly, pending commands are replaced so the last selected item wins.
+- Added playback-intent sequence checks so stale asynchronous library-loading callbacks and queued playback commands cannot override a newer selection.
+- Playback polling now ignores responses that started before a newer selection or during the transition window, preventing stale track metadata/highlights from jumping back after rapid clicks.
+- Old in-flight responses no longer display obsolete errors or schedule follow-up polls after a newer track has been selected.
+- A single click incurs only a short non-blocking delay; no render-thread sleep or blocking wait was added.
+
+
+Playback click and highlight synchronization (5 Nov 2026)
+- Reduced trailing-edge playback debounce from 240 ms to 120 ms. Rapid clicks are still coalesced and the newest selection still wins.
+- Removed the extra 300 ms confirmation delay for a new non-empty Spotify track URI. Stale API responses are already rejected by playback-intent guards, so the playing-row highlight can switch on the same render update as the now-playing cover/title.
+- Kept the longer empty-state grace period to prevent brief 204 responses from making the playing highlight flicker.
+- The green row accent now becomes faintly visible immediately and completes its fade more quickly, keeping the transition smooth without a noticeable late flash.
