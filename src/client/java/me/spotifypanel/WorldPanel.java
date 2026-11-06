@@ -365,6 +365,8 @@ public final class WorldPanel {
         if (Math.abs(snapshot.volume() - displayedVolume) < 0.08) displayedVolume = snapshot.volume();
 
         String trackUri = snapshot.track() == null ? "" : snapshot.track().uri();
+        String optimisticUri = SpotifyPanelMod.spotify.optimisticTrackUri();
+        if (!optimisticUri.isEmpty()) trackUri = optimisticUri;
         long targetProgress = dragMode == DRAG_SEEK && lastDragSeekMs >= 0
                 ? lastDragSeekMs : snapshot.currentProgress();
         if (!progressVisualInitialized || !trackUri.equals(displayedProgressTrackUri)) {
@@ -397,7 +399,7 @@ public final class WorldPanel {
         // Fade the playing-row accent between confirmed track URIs. If the item list is
         // temporarily loading, preserve the current alpha instead of fading the highlight
         // away and making it pop back in when the same list finishes loading.
-        String playingUri = stablePlayingTrackUri;
+        String playingUri = !optimisticUri.isEmpty() ? optimisticUri : stablePlayingTrackUri;
         if (items != null) {
             boolean playingTrackVisible = false;
             if (!playingUri.isEmpty()) {

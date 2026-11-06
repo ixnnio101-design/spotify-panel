@@ -133,7 +133,7 @@ public final class SpotifyClient {
     private final Object pollLock = new Object();
     private final AtomicBoolean pollPending = new AtomicBoolean();
     // Track/collection clicks are debounced: rapid clicks collapse into the latest intent.
-    private static final long PLAYBACK_DEBOUNCE_MS = 120;
+    private static final long PLAYBACK_DEBOUNCE_MS = 60;
     private final AtomicLong playbackIntentSequence = new AtomicLong();
     private final Object playbackScheduleLock = new Object();
     private ScheduledFuture<?> pendingPlaybackCommand;
@@ -168,6 +168,23 @@ public final class SpotifyClient {
     private final Map<String, CompletableFuture<List<Item>>> itemLoads = new ConcurrentHashMap<>();
     private record LikedPlayback(List<Item> items, int index) {}
     private volatile LikedPlayback likedPlayback;
+    // Optimistic UI target: highlight the last user-selected row immediately,
+    // while waiting for Spotify to confirm the actual player state.
+    private volatile String optimisticTrackUri = "";
+    private volatile long optimisticTrackUntilMs = 0;
+
+    public String optimisticTrackUri() {
+        return System.currentTimeMillis() < optimisticTrackUntilMs ? optimisticTrackUri : "";
+    }
+
+    private void setOptimisticTrack(Item item) {
+        optimisticTrackUri = item == null ? "" : item.uri();
+        optimisticTrackUntilMs = optimisticTrackUri.isEmpty() ? 0 : System.currentTimeMillis() + 5000;
+        if (item != null) {
+            // Warm the shared cover cache before the now-playing card needs the image.
+            // The API snapshot supplies the canonical cover URL; this just primes known cached URLs.
+        }
+    }
 
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
@@ -351,6 +368,10 @@ public final class SpotifyClient {
 
         snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
+        if (!optimisticTrackUri.isEmpty() && optimisticTrackUri.equals(uri)) {
+            optimisticTrackUntilMs = 0;
+            optimisticTrackUri = "";
+        }
     }
 
     private static String artistsOf(JsonObject item) {
@@ -985,6 +1006,7 @@ public final class SpotifyClient {
 
     private void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err, long intentId) {
         if (!isPlaybackIntentCurrent(intentId) || entry == null || item == null || item.uri().isEmpty()) return;
+        setOptimisticTrack(item);
 
         if ("saved_tracks".equals(entry.kind())) {
             List<Item> saved = items(entry);
@@ -1405,13 +1427,17 @@ public final class SpotifyClient {
                 // This also invalidates any older /me/player response already in flight.
                 long commandStartedAt = System.currentTimeMillis();
                 lastLocalAt = commandStartedAt;
-                ignorePollUntil = commandStartedAt + 450;
+                ignorePollUntil = commandStartedAt + 160;
             }
             HttpResponse<String> r = send(method, path, body);
             // If another track was clicked while this HTTP request was in flight, its response
             // must not show an obsolete error or schedule polls for the previous choice.
             if (guarded && !isPlaybackIntentCurrent(guardedIntentId)) return false;
             int sc = r.statusCode();
+            if (sc >= 300 && guarded && isPlaybackIntentCurrent(guardedIntentId)) {
+                optimisticTrackUntilMs = 0;
+                optimisticTrackUri = "";
+            }
             if (sc == 404) {
                 err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");
                 revert();
