@@ -170,8 +170,19 @@ public final class SpotifyClient {
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<List<Item>>> itemLoads = new ConcurrentHashMap<>();
-    private record LikedPlayback(List<Item> items, int index) {}
+    private record LikedPlayback(List<Item> items, int index, long sessionId) {}
     private volatile LikedPlayback likedPlayback;
+    private final AtomicLong likedSessionSequence = new AtomicLong();
+    // Favorites are played one track at a time via their album context. Spotify would
+    // otherwise continue that album, so schedule the next saved track before the
+    // current one ends and verify every observed track transition against this queue.
+    private final Object likedAdvanceLock = new Object();
+    private ScheduledFuture<?> likedAdvanceTask;
+    private LikedPlayback scheduledLikedQueue;
+    private String scheduledLikedUri = "";
+    private long scheduledLikedAtMs;
+    private static final long LIKED_ADVANCE_LEAD_MS = 450;
+    private static final long LIKED_ADVANCE_RECHECK_MS = 1_200;
     // Optimistic UI target: highlight the last user-selected row immediately,
     // while waiting for Spotify to confirm the actual player state.
     private volatile String optimisticTrackUri = "";
@@ -188,6 +199,193 @@ public final class SpotifyClient {
             // Warm the shared cover cache before the now-playing card needs the image.
             // The API snapshot supplies the canonical cover URL; this just primes known cached URLs.
         }
+    }
+
+    private void cancelLikedAdvanceTask() {
+        synchronized (likedAdvanceLock) {
+            cancelLikedAdvanceTaskLocked();
+        }
+    }
+
+    private void cancelLikedAdvanceTaskLocked() {
+        if (likedAdvanceTask != null) likedAdvanceTask.cancel(false);
+        likedAdvanceTask = null;
+        scheduledLikedQueue = null;
+        scheduledLikedUri = "";
+        scheduledLikedAtMs = 0;
+    }
+
+    private long endLikedSession() {
+        long sessionId = likedSessionSequence.incrementAndGet();
+        synchronized (likedAdvanceLock) {
+            likedPlayback = null;
+            cancelLikedAdvanceTaskLocked();
+        }
+        return sessionId;
+    }
+
+    private boolean setLikedPlayback(LikedPlayback queue, long sessionId, long intentId) {
+        synchronized (likedAdvanceLock) {
+            if (sessionId != likedSessionSequence.get() || !isPlaybackIntentCurrent(intentId)) return false;
+            likedPlayback = queue;
+            cancelLikedAdvanceTaskLocked();
+            return true;
+        }
+    }
+
+    private boolean endLikedSession(long intentId) {
+        synchronized (likedAdvanceLock) {
+            if (!isPlaybackIntentCurrent(intentId)) return false;
+            likedSessionSequence.incrementAndGet();
+            likedPlayback = null;
+            cancelLikedAdvanceTaskLocked();
+            return true;
+        }
+    }
+
+    private boolean replaceLikedPlayback(LikedPlayback expected, LikedPlayback replacement) {
+        synchronized (likedAdvanceLock) {
+            if (likedPlayback != expected || expected.sessionId() != likedSessionSequence.get()) return false;
+            likedPlayback = replacement;
+            cancelLikedAdvanceTaskLocked();
+            return true;
+        }
+    }
+
+    /**
+     * Schedule the next favorite slightly before the current album-context track ends.
+     * The callback validates the live player state before issuing a new album-context
+     * play command, so paused tracks and seeks do not advance the queue incorrectly.
+     */
+    private void scheduleLikedAdvance(Snapshot state) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.sessionId() != likedSessionSequence.get()
+                || queue.items() == null || queue.items().isEmpty()
+                || queue.index() < 0 || queue.index() >= queue.items().size()
+                || state == null || state.status() != Status.ACTIVE || !state.playing()
+                || state.track() == null || state.track().durationMs() <= 0
+                || "track".equals(state.repeat())) {
+            cancelLikedAdvanceTask();
+            return;
+        }
+
+        String expectedUri = queue.items().get(queue.index()).uri();
+        if (expectedUri == null || expectedUri.isEmpty() || !expectedUri.equals(state.track().uri())) {
+            cancelLikedAdvanceTask();
+            return;
+        }
+
+        long remainingMs = Math.max(0L, state.track().durationMs() - state.currentProgress());
+        long delayMs = Math.max(75L, remainingMs - LIKED_ADVANCE_LEAD_MS);
+        long fireAtMs = System.currentTimeMillis() + delayMs;
+
+        synchronized (likedAdvanceLock) {
+            if (likedPlayback != queue) return;
+            if (scheduledLikedQueue == queue && expectedUri.equals(scheduledLikedUri)
+                    && likedAdvanceTask != null && !likedAdvanceTask.isDone()
+                    && Math.abs(fireAtMs - scheduledLikedAtMs) < 2_500L) {
+                return;
+            }
+            cancelLikedAdvanceTaskLocked();
+            scheduledLikedQueue = queue;
+            scheduledLikedUri = expectedUri;
+            scheduledLikedAtMs = fireAtMs;
+            likedAdvanceTask = exec.schedule(() -> runLikedAdvance(queue, expectedUri),
+                    delayMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void runLikedAdvance(LikedPlayback queue, String expectedUri) {
+        synchronized (likedAdvanceLock) {
+            if (scheduledLikedQueue != queue || !expectedUri.equals(scheduledLikedUri)) return;
+            cancelLikedAdvanceTaskLocked();
+        }
+        if (likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()) return;
+
+        Snapshot state = snapshot;
+        if (state.status() != Status.ACTIVE || !state.playing() || state.track() == null
+                || !expectedUri.equals(state.track().uri())) {
+            return; // a pause or a manual track change took over
+        }
+
+        long remainingMs = Math.max(0L, state.track().durationMs() - state.currentProgress());
+        if (remainingMs > LIKED_ADVANCE_RECHECK_MS) {
+            scheduleLikedAdvance(state); // for example, the user sought back before this timer fired
+            return;
+        }
+        advanceLikedQueue(queue, state.repeat());
+    }
+
+    private void pauseLikedQueue(LikedPlayback queue, Consumer<String> err) {
+        long intentId;
+        synchronized (likedAdvanceLock) {
+            if (queue == null || likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()) return;
+            intentId = beginPlaybackIntent();
+            cancelLikedAdvanceTaskLocked();
+        }
+        schedulePlaybackControl(intentId, "PUT", "/me/player/pause", null, err);
+    }
+
+    private void advanceLikedQueue(LikedPlayback queue, String repeat) {
+        if (queue == null || likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()
+                || queue.items().isEmpty()) return;
+        if ("track".equals(repeat)) return;
+        int nextIndex = queue.index() + 1;
+        if (nextIndex < queue.items().size()) {
+            playLikedItem(queue, nextIndex, ignored -> {});
+        } else if ("context".equals(repeat)) {
+            playLikedItem(queue, 0, ignored -> {});
+        } else {
+            // Do not let Spotify continue into the remainder of the current album
+            // after the final saved track. Guard the pause like a track selection so
+            // a newer user choice cannot be paused by a stale end-of-queue callback.
+            pauseLikedQueue(queue, ignored -> {});
+        }
+    }
+
+    /**
+     * Spotify naturally advances within the album used to start a favorite. If that
+     * happens before our timer can take effect, immediately restore the exact next
+     * item from the saved-tracks order.
+     */
+    private void handleLikedTrackTransition(Snapshot previous, Snapshot current) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.sessionId() != likedSessionSequence.get()
+                || previous == null || current == null || !previous.playing()
+                || previous.track() == null || current.track() == null
+                || previous.track().uri().equals(current.track().uri())) return;
+        if (queue.index() < 0 || queue.index() >= queue.items().size()) return;
+
+        Item activeLikedItem = queue.items().get(queue.index());
+        if (activeLikedItem == null || !previous.track().uri().equals(activeLikedItem.uri())) return;
+        if ("track".equals(current.repeat())) return;
+
+        int nextIndex = queue.index() + 1;
+        if (nextIndex < queue.items().size()) {
+            Item expectedNext = queue.items().get(nextIndex);
+            if (expectedNext.uri().equals(current.track().uri())) {
+                replaceLikedPlayback(queue, new LikedPlayback(queue.items(), nextIndex, queue.sessionId()));
+            } else {
+                playLikedItem(queue, nextIndex, ignored -> {});
+            }
+        } else if ("context".equals(current.repeat())) {
+            playLikedItem(queue, 0, ignored -> {});
+        } else {
+            pauseLikedQueue(queue, ignored -> {});
+        }
+    }
+
+    /** Handles the rare case where Spotify reports no active item at the track boundary. */
+    private void handleLikedPlaybackIdle(Snapshot previous) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.sessionId() != likedSessionSequence.get()
+                || previous == null || !previous.playing() || previous.track() == null
+                || queue.index() < 0 || queue.index() >= queue.items().size()) return;
+        Item expected = queue.items().get(queue.index());
+        if (expected == null || !previous.track().uri().equals(expected.uri())) return;
+        if (previous.track().durationMs() > 0
+                && previous.currentProgress() < previous.track().durationMs() - LIKED_ADVANCE_RECHECK_MS) return;
+        advanceLikedQueue(queue, previous.repeat());
     }
 
     // обложки
@@ -349,7 +547,9 @@ public final class SpotifyClient {
                 return; // ответ относится к переходу между треками или к старому состоянию
             }
             if (sc == 204) {
+                Snapshot previous = snapshot;
                 snapshot = Snapshot.of(Status.IDLE);
+                handleLikedPlaybackIdle(previous);
             } else if (sc == 401) {
                 auth.invalidate();
             } else if (sc == 429) {
@@ -379,7 +579,10 @@ public final class SpotifyClient {
         JsonObject o = JsonParser.parseString(body).getAsJsonObject();
         JsonElement itemEl = o.get("item");
         if (itemEl == null || itemEl.isJsonNull()) {
+            Snapshot previous = snapshot;
             snapshot = Snapshot.of(Status.IDLE);
+            handleLikedPlaybackIdle(previous);
+            cancelLikedAdvanceTask();
             return;
         }
         JsonObject item = itemEl.getAsJsonObject();
@@ -417,8 +620,11 @@ public final class SpotifyClient {
             if (Math.abs(diff) < 2500) prog = predicted + diff / 3;
         }
 
-        snapshot = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
+        Snapshot current = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
+        snapshot = current;
+        handleLikedTrackTransition(prev, current);
+        scheduleLikedAdvance(snapshot);
         if (!optimisticTrackUri.isEmpty() && optimisticTrackUri.equals(uri)) {
             optimisticTrackUntilMs = 0;
             optimisticTrackUri = "";
@@ -998,10 +1204,12 @@ public final class SpotifyClient {
      */
     public void playLibraryEntry(LibraryEntry entry, Consumer<String> err) {
         if (entry == null) return;
+        // End the old queue before allocating a new playback intent, so an auto-advance
+        // callback cannot win a race and invalidate this user's library selection.
+        endLikedSession();
         long intentId = beginPlaybackIntent();
 
         if ("artist".equals(entry.kind())) {
-            likedPlayback = null;
             requestItems(entry, false); // список альбомов нужен для отображения раздела
             if (entry.uri() != null && !entry.uri().isEmpty()) {
                 schedulePlaybackControl(intentId, "PUT", "/me/player/play",
@@ -1039,7 +1247,6 @@ public final class SpotifyClient {
                         }
                     });
             default -> {
-                likedPlayback = null;
                 if (entry.uri() != null && !entry.uri().isEmpty()) {
                     schedulePlaybackControl(intentId, "PUT", "/me/player/play",
                             contextBody(entry.uri(), ""), err);
@@ -1052,14 +1259,15 @@ public final class SpotifyClient {
 
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
+        endLikedSession();
         playLibraryItem(entry, item, err, beginPlaybackIntent());
     }
 
     /** Запускает трек, найденный поиском, через контекст его альбома, когда URI альбома доступен. */
     public void playSearchResult(Item item, Consumer<String> err) {
         if (item == null || item.uri() == null || item.uri().isEmpty()) return;
+        endLikedSession();
         long intentId = beginPlaybackIntent();
-        likedPlayback = null;
         setOptimisticTrack(item);
         playTrackFromAlbum(item, err, intentId);
     }
@@ -1079,13 +1287,14 @@ public final class SpotifyClient {
                     }
                 }
             }
-            likedPlayback = saved != null && selectedIndex >= 0
-                    ? new LikedPlayback(List.copyOf(saved), selectedIndex) : null;
+            long sessionId = likedSessionSequence.get();
+            if (!setLikedPlayback(saved != null && selectedIndex >= 0
+                    ? new LikedPlayback(List.copyOf(saved), selectedIndex, sessionId) : null, sessionId, intentId)) return;
             playTrackFromAlbum(item, err, intentId);
             return;
         }
 
-        likedPlayback = null;
+        if (!endLikedSession(intentId)) return;
         switch (entry.kind()) {
             case "playlist", "album" -> playContextInternal(entry.uri(), item.uri(), err, intentId);
             case "artist" -> schedulePlaybackControl(intentId, "PUT", "/me/player/play",
@@ -1096,9 +1305,17 @@ public final class SpotifyClient {
 
     private void playLikedItem(LikedPlayback queue, int index, Consumer<String> err) {
         if (queue == null || queue.items() == null || index < 0 || index >= queue.items().size()) return;
-        long intentId = beginPlaybackIntent();
         Item item = queue.items().get(index);
-        likedPlayback = new LikedPlayback(queue.items(), index);
+        long intentId;
+        synchronized (likedAdvanceLock) {
+            // Claim this transition only while the same Liked Songs session is still active.
+            // A newer library/search selection ends the session first, so a stale timer cannot
+            // allocate a newer playback intent and override that user's selection.
+            if (likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()) return;
+            intentId = beginPlaybackIntent();
+            likedPlayback = new LikedPlayback(queue.items(), index, queue.sessionId());
+            cancelLikedAdvanceTaskLocked();
+        }
         playTrackFromAlbum(item, err, intentId);
     }
 
@@ -1287,7 +1504,7 @@ public final class SpotifyClient {
         } else {
             // Keep the Liked Songs session active, so repeated presses cannot fall
             // through to the current album and unexpectedly leave the collection.
-            pause(err);
+            pauseLikedQueue(queue, err);
             err.accept("Это последний трек в «Любимых треках».");
         }
     }
@@ -1358,7 +1575,7 @@ public final class SpotifyClient {
 
     /** Играть плейлист/альбом/исполнителя; внешний запуск завершает навигацию по избранному. */
     public void playContext(String contextUri, String trackUri, Consumer<String> err) {
-        likedPlayback = null;
+        endLikedSession();
         long intentId = beginPlaybackIntent();
         playContextInternal(contextUri, trackUri, err, intentId);
     }

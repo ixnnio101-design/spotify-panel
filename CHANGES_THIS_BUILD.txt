@@ -109,3 +109,10 @@ Library typography matched to search styling (7 Nov 2026)
 - Matched title/artist column starts to the search table and kept a fixed centered duration column with its gutter.
 - Preserved the original library table position, row spacing, five-row viewport, scrolling and playback behavior.
 - Gradle was not run.
+
+Liked Songs sequential auto-advance fix (7 Nov 2026)
+- Fixed the playback source mismatch in Liked Songs: starting a saved track still uses its album context for Spotify Desktop compatibility, but the mod now schedules the next saved track from the cached Liked Songs order near the end of the current track.
+- Added a track-transition guard: if Spotify advances within the current album before the scheduled command takes effect, the mod immediately starts the next saved track instead of remaining in that album.
+- The Liked Songs queue index is kept in sync when Spotify naturally reaches the expected next saved track. Manual next/previous continue to use the same saved-track order.
+- Pausing cancels the pending auto-advance; resuming schedules it again. Seeking is rechecked before advancing, and Repeat One remains handled by Spotify. Repeat Context loops to the first saved track; with Repeat Off, playback pauses after the last saved track rather than continuing through the album.
+- Gradle was not run.
