@@ -123,6 +123,11 @@ public final class WorldPanel {
     private static List<SpotifyClient.Item> searchResults = List.of();
     private static long searchGeneration;
     private static long searchDebounceAtMs;
+    // The search results now start immediately below the search housing, covering
+    // the otherwise unused playlist-info surface. The taller area fits eight rows.
+    private static final double SEARCH_RESULTS_TOP = 12.5;
+    private static final int SEARCH_RESULT_ROW_HEIGHT = 35;
+    private static final int SEARCH_VISIBLE_ROWS = 8;
 
     private WorldPanel() {}
 
@@ -246,7 +251,8 @@ public final class WorldPanel {
         updateScrollArea(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz);
         boolean searchMode = searchMode();
         applyWheel(libraryEntries.size(), searchMode ? searchResults.size()
-                : (selected == null ? 0 : safeItemCount(selected.key())));
+                : (selected == null ? 0 : safeItemCount(selected.key())),
+                searchMode ? SEARCH_VISIBLE_ROWS : 5);
         List<SpotifyClient.Item> items = null;
         if (selected != null) {
             if (!selected.key().equals(lastRequestedLibraryKey) || now - lastItemsRequestNs > 60_000_000_000L) {
@@ -257,7 +263,7 @@ public final class WorldPanel {
             items = SpotifyPanelMod.spotify.items(selected.key());
         }
         sideScroll = Math.min(sideScroll, Math.max(0, libraryEntries.size() - 7));
-        if (searchMode) trackScroll = Math.min(trackScroll, Math.max(0, searchResults.size() - 5));
+        if (searchMode) trackScroll = Math.min(trackScroll, Math.max(0, searchResults.size() - SEARCH_VISIBLE_ROWS));
         else if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 5));
         SpotifyClient.Snapshot snapshot = SpotifyPanelMod.spotify.snapshot();
         updateScrollAnimation(now, snapshot, items);
@@ -428,15 +434,16 @@ public final class WorldPanel {
         // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
         scrollArea = 3;
         if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) && ty <= py(2.4)) scrollArea = 1;
-        else if (tx >= px(-9.4) && tx <= px(5.2) && ty >= py(9.2) && ty <= py(2.4)) scrollArea = 2;
+        else if (tx >= px(-9.4) && tx <= px(5.2)
+                && ty >= py(searchMode() ? SEARCH_RESULTS_TOP : 9.2) && ty <= py(2.4)) scrollArea = 2;
     }
 
-    private static void applyWheel(int playlistCount, int itemCount) {
+    private static void applyWheel(int playlistCount, int itemCount, int visibleTrackRows) {
         // Unmodified wheel only scrolls the library and selected content list.
         while (Math.abs(wheelDelta) >= 1.0) {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
-            else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - 5), trackScroll + direction));
+            else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - visibleTrackRows), trackScroll + direction));
             wheelDelta -= Math.signum(wheelDelta);
         }
     }
@@ -646,7 +653,7 @@ public final class WorldPanel {
     }
 
     private static void paintSearchResults(Graphics2D g, SpotifyClient.Snapshot snapshot) {
-        int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(SEARCH_RESULTS_TOP), y1 = py(2.4);
         g.setColor(new Color(7, 12, 9, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
@@ -689,14 +696,18 @@ public final class WorldPanel {
         drawUiText(g, "#", x0 + 15, y0 + 49, g.getColor());
         drawUiText(g, "НАЗВАНИЕ", x0 + 43, y0 + 49, g.getColor());
         drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 290, y0 + 49, g.getColor());
-        drawUiText(g, "ВРЕМЯ", x1 - 51, y0 + 49, g.getColor());
+        int searchDurationLeft = x1 - 62, searchDurationRight = x1 - 10;
+        String searchTimeHeader = "ВРЕМЯ";
+        drawUiText(g, searchTimeHeader, searchDurationLeft
+                + (searchDurationRight - searchDurationLeft - g.getFontMetrics().stringWidth(searchTimeHeader)) / 2,
+                y0 + 49, g.getColor());
         g.setColor(new Color(255, 255, 255, 38));
         g.drawLine(x0 + 10, y0 + 56, x1 - 10, y0 + 56);
 
         int first = Math.max(0, Math.min(searchResults.size(), (int) Math.floor(trackScrollVisual)));
         double fraction = trackScrollVisual - first;
-        int rows = Math.min(5, Math.max(0, searchResults.size() - first));
-        int rowH = 35;
+        int rows = Math.min(SEARCH_VISIBLE_ROWS, Math.max(0, searchResults.size() - first));
+        int rowH = SEARCH_RESULT_ROW_HEIGHT;
         int startY = y0 + 59;
         java.awt.Shape oldClip = g.getClip();
         g.clipRect(x0 + 4, startY - 3, x1 - x0 - 8, y1 - startY + 1);
@@ -715,14 +726,16 @@ public final class WorldPanel {
 
             int baseline = y + 25;
             int titleLeft = x0 + 43, titleRight = x0 + 278;
-            int artistLeft = x0 + 290, artistRight = x1 - 60;
-            int durationLeft = x1 - 54, durationRight = x1 - 10;
+            int artistLeft = x0 + 290;
+            int durationLeft = searchDurationLeft, durationRight = searchDurationRight;
+            // Keep a real gutter between artist names and the time column.
+            int artistRight = durationLeft - 14;
             g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 17));
             g.setColor(playing ? new Color(30, 235, 105) : new Color(220, 232, 223));
             String number = Integer.toString(itemIndex + 1);
             drawUiText(g, number, x0 + 14, baseline, g.getColor());
 
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
             g.setColor(playing ? new Color(220, 255, 232) : Color.WHITE);
             String title = fit(g, safe(item.title(), "Без названия"), titleRight - titleLeft);
             drawReadableText(g, title, titleLeft, baseline, g.getColor());
@@ -739,7 +752,7 @@ public final class WorldPanel {
                     (durationRight - durationLeft - g.getFontMetrics().stringWidth(duration)) / 2), baseline, g.getColor());
         }
         g.setClip(oldClip);
-        if (searchResults.size() > 5) {
+        if (searchResults.size() > SEARCH_VISIBLE_ROWS) {
             g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
             g.setColor(new Color(160, 181, 167));
             drawUiText(g, "Колёсико — прокрутка результатов", x1 - 220, y1 - 7, g.getColor());
@@ -886,8 +899,12 @@ public final class WorldPanel {
         g.setColor(new Color(248, 250, 248));
         drawUiText(g, "#", x0 + 14, y0 + 22, g.getColor());
         drawUiText(g, "НАЗВАНИЕ", x0 + 42, y0 + 22, g.getColor());
-        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 265, y0 + 22, g.getColor());
-        drawUiText(g, "ВРЕМЯ", x1 - 48, y0 + 22, g.getColor());
+        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 256, y0 + 22, g.getColor());
+        int durationColumnLeft = x1 - 62, durationColumnRight = x1 - 10;
+        String timeHeader = "ВРЕМЯ";
+        drawUiText(g, timeHeader, durationColumnLeft
+                + (durationColumnRight - durationColumnLeft - g.getFontMetrics().stringWidth(timeHeader)) / 2,
+                y0 + 22, g.getColor());
         g.setColor(new Color(255, 255, 255, 42));
         g.drawLine(x0 + 10, y0 + 30, x1 - 10, y0 + 30);
 
@@ -945,9 +962,11 @@ public final class WorldPanel {
             // No horizontal row separators: they made the panel look visually split.
             int textBaseline = y + 8;
             int numberCenter = x0 + 25;
-            int titleLeft = x0 + 42, titleRight = x0 + 250;
-            int artistLeft = x0 + 258, artistRight = x1 - 55;
-            int durationLeft = x1 - 52, durationRight = x1 - 10;
+            int titleLeft = x0 + 42, titleRight = x0 + 248;
+            int artistLeft = x0 + 256;
+            int durationLeft = durationColumnLeft, durationRight = durationColumnRight;
+            // Reserve a separate time column and a visible gutter so artist text cannot touch it.
+            int artistRight = durationLeft - 14;
 
             g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 18));
             g.setColor(blend(numberBase, numberActive, highlight));
@@ -955,19 +974,19 @@ public final class WorldPanel {
             drawReadableText(g, number, numberCenter - g.getFontMetrics().stringWidth(number) / 2,
                     textBaseline, blend(new Color(235, 240, 236), numberActive, highlight));
 
-            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 22));
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
             g.setColor(blend(titleBase, titleActive, highlight));
             String title = fit(g, safe(item.title(), "Без названия"), titleRight - titleLeft);
             drawReadableText(g, title, titleLeft + (titleRight - titleLeft - g.getFontMetrics().stringWidth(title)) / 2,
                     textBaseline, blend(Color.WHITE, titleActive, highlight));
 
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 19));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 17));
             g.setColor(new Color(235, 240, 236));
             String artists = fit(g, safe(item.artists(), ""), artistRight - artistLeft);
             drawReadableText(g, artists, artistLeft + (artistRight - artistLeft - g.getFontMetrics().stringWidth(artists)) / 2,
                     textBaseline, new Color(242, 246, 243));
 
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 20));
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 18));
             g.setColor(new Color(245, 247, 245));
             String duration = formatTime(item.durationMs());
             drawReadableText(g, duration, durationLeft + (durationRight - durationLeft - g.getFontMetrics().stringWidth(duration)) / 2,
@@ -1307,8 +1326,9 @@ public final class WorldPanel {
 
         // Search results occupy the central track area while a query is present.
         if (searchMode() && tx >= px(-9.4) && tx <= px(5.2)
-                && ty >= py(9.2) + 59 && ty <= py(2.4)) {
-            int itemIndex = (int) Math.floor((ty - (py(9.2) + 59)) / 35.0 + trackScrollVisual);
+                && ty >= py(SEARCH_RESULTS_TOP) + 59 && ty <= py(2.4)) {
+            int itemIndex = (int) Math.floor((ty - (py(SEARCH_RESULTS_TOP) + 59))
+                    / (double) SEARCH_RESULT_ROW_HEIGHT + trackScrollVisual);
             if (itemIndex >= 0 && itemIndex < searchResults.size()) {
                 client.playSearchResult(searchResults.get(itemIndex), SpotifyPanelMod::say);
             }

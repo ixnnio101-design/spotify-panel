@@ -81,3 +81,23 @@ Search field and updated Blockbench model (6 Nov 2026)
 - Search results replace the center track list while a query is present. Clicking a result starts it through its album context when Spotify supplies the album URI. Wheel scrolling works over the result list.
 - Search uses the existing authorized Spotify Web API session; no additional OAuth scope was added.
 - Gradle was intentionally not run; the project archive contains source files for the user to build locally.
+
+
+Search results layout correction (7 Nov 2026)
+- Moved the search-results surface directly below the search housing so the former empty purple playlist-info region is used for results.
+- Expanded the visible search list from five to eight rows in the newly available vertical space.
+- Updated wheel scrolling, result hit-testing and scroll clamping to use the new top edge and eight-row viewport.
+- Normal library browsing layout is unchanged.
+
+
+Track-table typography and column spacing (7 Nov 2026)
+- Reduced normal library track-title text from 22 px to 20 px while retaining the bold readable style.
+- Slightly reduced artist and duration text sizes so longer names fit more comfortably in each row.
+- Reserved a fixed right-hand time column, centered its heading and values, and added a 14 px gutter before it so artist names cannot run into durations.
+- Applied the same separated time-column layout to search results for consistent table behavior.
+
+
+Track title size adjustment (7 Nov 2026)
+- Reduced normal library track-title font size from 20 px to 18 px to better fit the title column.
+- Search-result titles were already 18 px and remain unchanged; artist, duration, column spacing and playback behavior are unchanged.
+- Gradle was not run.
