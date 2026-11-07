@@ -60,7 +60,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 14.4;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.2;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -895,11 +895,11 @@ public final class WorldPanel {
         int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
         g.setColor(new Color(8, 12, 9, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
         g.setColor(new Color(248, 250, 248));
         drawUiText(g, "#", x0 + 14, y0 + 22, g.getColor());
         drawUiText(g, "НАЗВАНИЕ", x0 + 42, y0 + 22, g.getColor());
-        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 256, y0 + 22, g.getColor());
+        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 290, y0 + 22, g.getColor());
         int durationColumnLeft = x1 - 62, durationColumnRight = x1 - 10;
         String timeHeader = "ВРЕМЯ";
         drawUiText(g, timeHeader, durationColumnLeft
@@ -958,17 +958,17 @@ public final class WorldPanel {
             Color numberActive = new Color(30, 235, 105);
             Color titleBase = Color.WHITE;
             Color titleActive = new Color(220, 255, 232);
-            // Larger typography, centered in each column and vertically within the row.
+            // Match search-result typography while keeping the original library-row layout.
             // No horizontal row separators: they made the panel look visually split.
             int textBaseline = y + 8;
             int numberCenter = x0 + 25;
-            int titleLeft = x0 + 42, titleRight = x0 + 248;
-            int artistLeft = x0 + 256;
+            int titleLeft = x0 + 43, titleRight = x0 + 278;
+            int artistLeft = x0 + 290;
             int durationLeft = durationColumnLeft, durationRight = durationColumnRight;
             // Reserve a separate time column and a visible gutter so artist text cannot touch it.
             int artistRight = durationLeft - 14;
 
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 18));
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 17));
             g.setColor(blend(numberBase, numberActive, highlight));
             String number = Integer.toString(itemIndex + 1);
             drawReadableText(g, number, numberCenter - g.getFontMetrics().stringWidth(number) / 2,
@@ -977,16 +977,15 @@ public final class WorldPanel {
             g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
             g.setColor(blend(titleBase, titleActive, highlight));
             String title = fit(g, safe(item.title(), "Без названия"), titleRight - titleLeft);
-            drawReadableText(g, title, titleLeft + (titleRight - titleLeft - g.getFontMetrics().stringWidth(title)) / 2,
-                    textBaseline, blend(Color.WHITE, titleActive, highlight));
+            drawReadableText(g, title, titleLeft, textBaseline,
+                    blend(Color.WHITE, titleActive, highlight));
 
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 17));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
             g.setColor(new Color(235, 240, 236));
             String artists = fit(g, safe(item.artists(), ""), artistRight - artistLeft);
-            drawReadableText(g, artists, artistLeft + (artistRight - artistLeft - g.getFontMetrics().stringWidth(artists)) / 2,
-                    textBaseline, new Color(242, 246, 243));
+            drawReadableText(g, artists, artistLeft, textBaseline, new Color(242, 246, 243));
 
-            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 18));
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 16));
             g.setColor(new Color(245, 247, 245));
             String duration = formatTime(item.durationMs());
             drawReadableText(g, duration, durationLeft + (durationRight - durationLeft - g.getFontMetrics().stringWidth(duration)) / 2,

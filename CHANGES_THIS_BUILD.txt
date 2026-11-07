@@ -101,3 +101,11 @@ Track title size adjustment (7 Nov 2026)
 - Reduced normal library track-title font size from 20 px to 18 px to better fit the title column.
 - Search-result titles were already 18 px and remain unchanged; artist, duration, column spacing and playback behavior are unchanged.
 - Gradle was not run.
+
+
+Library typography matched to search styling (7 Nov 2026)
+- Kept the original album/playlist artwork banner, gradient, title and metadata layout unchanged.
+- Matched the library table font sizes and left alignment to search: 18 px track titles, 16 px artist names and durations, 17 px row numbers, and 13 px column headings.
+- Matched title/artist column starts to the search table and kept a fixed centered duration column with its gutter.
+- Preserved the original library table position, row spacing, five-row viewport, scrolling and playback behavior.
+- Gradle was not run.
