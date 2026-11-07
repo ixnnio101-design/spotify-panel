@@ -71,3 +71,13 @@ Playback click and highlight synchronization (5 Nov 2026)
 - Removed the extra 300 ms confirmation delay for a new non-empty Spotify track URI. Stale API responses are already rejected by playback-intent guards, so the playing-row highlight can switch on the same render update as the now-playing cover/title.
 - Kept the longer empty-state grace period to prevent brief 204 responses from making the playing highlight flicker.
 - The green row accent now becomes faintly visible immediately and completes its fade more quickly, keeping the transition smooth without a noticeable late flash.
+
+
+Search field and updated Blockbench model (6 Nov 2026)
+- Replaced the bundled `panel.bbmodel` with the newly supplied 14-element model, including the `search_corpus` housing.
+- Updated the world-space model bounds and UI coordinate mapping for the new 22 x 14.4 model dimensions while preserving the previous scale per Blockbench unit. Existing library, playback, seek and volume zones were moved to match the edited geometry.
+- Added an editable world-space search field. Clicking the housing focuses it; Unicode keyboard input and Backspace are routed to the field without inserting the same text into Minecraft chat. Enter/Escape unfocus the field; the cross clears it.
+- Search requests are debounced and run asynchronously through the existing Spotify HTTP executor. Only the newest query is allowed to update the result list.
+- Search results replace the center track list while a query is present. Clicking a result starts it through its album context when Spotify supplies the album URI. Wheel scrolling works over the result list.
+- Search uses the existing authorized Spotify Web API session; no additional OAuth scope was added.
+- Gradle was intentionally not run; the project archive contains source files for the user to build locally.

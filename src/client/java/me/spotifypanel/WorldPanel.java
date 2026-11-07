@@ -21,6 +21,8 @@ import net.minecraft.util.math.Vec3d;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWScrollCallback;
+import org.lwjgl.glfw.GLFWCharCallback;
+import org.lwjgl.glfw.GLFWKeyCallback;
 
 import java.awt.BasicStroke;
 import java.awt.Color;
@@ -49,15 +51,17 @@ public final class WorldPanel {
 
     private static final int TEX_W = 768;
     private static final int TEX_H = 500;
-    private static final double MODEL_WIDTH = 1.82;
-    private static final double MODEL_HEIGHT = 1.20;
+    // The new Blockbench model spans 22 x 14.4 units. Preserve the previous world
+    // scale per model unit so the existing typography stays the same physical size.
+    private static final double MODEL_WIDTH = 1.82 * 22.0 / 20.0;
+    private static final double MODEL_HEIGHT = 1.20 * 14.4 / 13.0;
     // Preserve the Blockbench model's proportions: its X coordinate is depth in the world.
     // The model is intentionally a thin, layered plane, not a set of extruded boxes.
-    private static final double MODEL_Z_SCALE = MODEL_WIDTH / 20.0;
-    private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 20.0;
-    private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 13.0;
+    private static final double MODEL_Z_SCALE = MODEL_WIDTH / 22.0;
+    private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
+    private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 14.4;
     private static final double MODEL_OVERLAY_X = -0.82;
-    private static final double MODEL_CENTER_Y = 6.5;
+    private static final double MODEL_CENTER_Y = 7.2;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
     // It is not camera-relative and is not rendered as a child/attachment of the player.
@@ -107,6 +111,18 @@ public final class WorldPanel {
     private static volatile double wheelDelta;
     private static boolean scrollHooked;
     private static GLFWScrollCallback previousScroll;
+    private static long inputHookWindow;
+    private static GLFWCharCallback previousChar;
+    private static GLFWKeyCallback previousKey;
+
+    // Search is owned by the world-space panel; only its API call runs asynchronously.
+    private static String searchText = "";
+    private static boolean searchFocused;
+    private static boolean searchLoading;
+    private static String searchError = "";
+    private static List<SpotifyClient.Item> searchResults = List.of();
+    private static long searchGeneration;
+    private static long searchDebounceAtMs;
 
     private WorldPanel() {}
 
@@ -162,6 +178,7 @@ public final class WorldPanel {
             case "icon_song_title" -> new int[]{0xFF172019, 0xFF3D5144};
             case "time_of_the_played_song" -> new int[]{0xFF17231B, 0xFF3D6047};
             case "reduction_of_sound_amplification" -> new int[]{0xFF17231B, 0xFF3D6047};
+            case "search_corpus" -> new int[]{0xFF101A13, 0xFF42604A};
             default -> new int[]{0xFF172019, 0xFF344238};
         };
     }
@@ -171,6 +188,7 @@ public final class WorldPanel {
         if (!SpotifyPanelMod.config.visible || mc.player == null || mc.world == null) {
             wasLeftDown = false;
             dragMode = DRAG_NONE;
+            searchFocused = false;
             // Do not keep consuming the game's mouse wheel while the panel is hidden or unavailable.
             scrollArea = 0;
             wheelDelta = 0;
@@ -187,6 +205,9 @@ public final class WorldPanel {
         Vec3d cameraPos = context.worldState().cameraRenderState.pos;
         float tickDelta = mc.getRenderTickCounter().getTickProgress(false);
         hookScroll(mc.getWindow().getHandle());
+        hookSearchInput(mc.getWindow().getHandle());
+        if (!(mc.currentScreen instanceof ChatScreen)) searchFocused = false;
+        runPendingSearch(mc);
         // Position is recalculated from the player's interpolated WORLD coordinates every frame.
         // Only the body direction is used to find the point one block ahead; camera/head yaw is ignored.
         Vec3d body = player.getLerpedPos(tickDelta);
@@ -223,7 +244,9 @@ public final class WorldPanel {
             viewTransition = 0.0;
         }
         updateScrollArea(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz);
-        applyWheel(libraryEntries.size(), selected == null ? 0 : safeItemCount(selected.key()));
+        boolean searchMode = searchMode();
+        applyWheel(libraryEntries.size(), searchMode ? searchResults.size()
+                : (selected == null ? 0 : safeItemCount(selected.key())));
         List<SpotifyClient.Item> items = null;
         if (selected != null) {
             if (!selected.key().equals(lastRequestedLibraryKey) || now - lastItemsRequestNs > 60_000_000_000L) {
@@ -234,7 +257,8 @@ public final class WorldPanel {
             items = SpotifyPanelMod.spotify.items(selected.key());
         }
         sideScroll = Math.min(sideScroll, Math.max(0, libraryEntries.size() - 7));
-        if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 5));
+        if (searchMode) trackScroll = Math.min(trackScroll, Math.max(0, searchResults.size() - 5));
+        else if (items != null) trackScroll = Math.min(trackScroll, Math.max(0, items.size() - 5));
         SpotifyClient.Snapshot snapshot = SpotifyPanelMod.spotify.snapshot();
         updateScrollAnimation(now, snapshot, items);
 
@@ -245,7 +269,7 @@ public final class WorldPanel {
         // Playback time is animated even when idle; mouse dragging gets a 60 Hz texture
         // refresh so the slider follows the pointer instead of stepping every ~65-250 ms.
         long overlayIntervalNs;
-        if (dragMode != DRAG_NONE || scrolling || animatingView) overlayIntervalNs = 16_666_667L;
+        if (dragMode != DRAG_NONE || scrolling || animatingView || searchFocused || searchLoading) overlayIntervalNs = 16_666_667L;
         else if (snapshot.playing()) overlayIntervalNs = 33_333_333L;
         else overlayIntervalNs = 180_000_000L;
         if (now - lastOverlayUpdateNs >= overlayIntervalNs) {
@@ -257,7 +281,7 @@ public final class WorldPanel {
         matrices.translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
         Matrix4f matrix = matrices.peek().getPositionMatrix();
 
-        // Render the 13 Blockbench elements as thin, world-space planes. Their small X offsets
+        // Render the 14 Blockbench elements as thin, world-space planes. Their small X offsets
         // are preserved as subtle layer separation, but no thickness or side faces are invented.
         VertexConsumer material = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(MATERIAL_TEXTURE_ID));
         for (ModelPart part : MODEL_PARTS) {
@@ -272,8 +296,8 @@ public final class WorldPanel {
         for (int i = 0; i < visibleLibraryIcons; i++) {
             double top = 11.5 - (i - iconFraction) * 1.2;
             ModelPart iconPart = new ModelPart("playlist_icon_" + i,
-                    -0.2, top - 0.9, -9.7,
-                    -0.2, top, -8.7,
+                    -0.2, top - 0.9, -10.7,
+                    -0.2, top, -9.7,
                     iconColors[0], iconColors[1]);
             drawModelPart(material, matrix, cx, centerY, cz, wx, wz, nx, nz, iconPart);
         }
@@ -299,6 +323,90 @@ public final class WorldPanel {
         });
     }
 
+    /**
+     * The panel is a world-space surface, not a Screen widget. While its search housing
+     * is focused, route GLFW character/edit keys here and leave Minecraft's chat input
+     * untouched. When it is not focused, the original Minecraft callbacks are invoked.
+     */
+    private static void hookSearchInput(long handle) {
+        if (inputHookWindow == handle) return;
+        inputHookWindow = handle;
+        previousChar = GLFW.glfwSetCharCallback(handle, (window, codepoint) -> {
+            if (searchFocused) {
+                if (Character.isValidCodePoint(codepoint) && !Character.isISOControl(codepoint)) {
+                    String value = searchText + new String(Character.toChars(codepoint));
+                    if (value.codePointCount(0, value.length()) <= 96) setSearchText(value);
+                }
+                return;
+            }
+            if (previousChar != null) previousChar.invoke(window, codepoint);
+        });
+        previousKey = GLFW.glfwSetKeyCallback(handle, (window, key, scanCode, action, mods) -> {
+            if (searchFocused) {
+                if (action == GLFW.GLFW_PRESS || action == GLFW.GLFW_REPEAT) {
+                    boolean control = (mods & (GLFW.GLFW_MOD_CONTROL | GLFW.GLFW_MOD_SUPER)) != 0;
+                    if (key == GLFW.GLFW_KEY_BACKSPACE) {
+                        if (!searchText.isEmpty()) {
+                            int end = searchText.offsetByCodePoints(searchText.length(), -1);
+                            setSearchText(searchText.substring(0, end));
+                        }
+                    } else if (key == GLFW.GLFW_KEY_DELETE || (control && key == GLFW.GLFW_KEY_A)) {
+                        setSearchText("");
+                    } else if (key == GLFW.GLFW_KEY_ENTER || key == GLFW.GLFW_KEY_KP_ENTER
+                            || key == GLFW.GLFW_KEY_ESCAPE) {
+                        searchFocused = false;
+                    }
+                }
+                // Keep keyboard shortcuts and navigation out of the Minecraft chat while
+                // the search field owns focus; text itself arrives through the char callback.
+                return;
+            }
+            if (previousKey != null) previousKey.invoke(window, key, scanCode, action, mods);
+        });
+    }
+
+    private static void setSearchText(String value) {
+        searchText = value == null ? "" : value;
+        searchGeneration++;
+        searchResults = List.of();
+        searchError = "";
+        searchLoading = false;
+        trackScroll = 0;
+        trackScrollVisual = 0.0;
+        searchDebounceAtMs = searchText.isBlank() ? 0 : System.currentTimeMillis() + 320;
+    }
+
+    private static boolean searchMode() {
+        return !searchText.isBlank();
+    }
+
+    private static void runPendingSearch(MinecraftClient mc) {
+        if (searchDebounceAtMs == 0 || System.currentTimeMillis() < searchDebounceAtMs) return;
+        String query = searchText.trim();
+        long generation = searchGeneration;
+        searchDebounceAtMs = 0;
+        if (query.isEmpty()) return;
+        searchLoading = true;
+        searchError = "";
+        SpotifyPanelMod.spotify.searchTracks(query).whenComplete((result, failure) -> mc.execute(() -> {
+            if (generation != searchGeneration || !query.equals(searchText.trim())) return;
+            searchLoading = false;
+            if (failure != null) {
+                searchResults = List.of();
+                searchError = "Поиск Spotify: " + (failure.getMessage() == null
+                        ? failure.getClass().getSimpleName() : failure.getMessage());
+            } else if (result == null) {
+                searchResults = List.of();
+                searchError = "Spotify не вернул результат поиска.";
+            } else {
+                searchResults = result.items() == null ? List.of() : result.items();
+                searchError = result.error() == null ? "" : result.error();
+            }
+            trackScroll = 0;
+            trackScrollVisual = 0.0;
+        }));
+    }
+
     private static void updateScrollArea(MinecraftClient mc, Vec3d cameraPos,
                                          double cx, double cy, double cz, double wx, double wz, double nx, double nz) {
         scrollArea = 0;
@@ -319,8 +427,8 @@ public final class WorldPanel {
         int ty = (int) (uv[1] * TEX_H);
         // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
         scrollArea = 3;
-        if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) && ty <= py(2.5)) scrollArea = 1;
-        else if (tx >= px(-8.4) && tx <= px(4.2) && ty >= py(9.1) && ty <= py(2.5)) scrollArea = 2;
+        if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) && ty <= py(2.4)) scrollArea = 1;
+        else if (tx >= px(-9.4) && tx <= px(5.2) && ty >= py(9.2) && ty <= py(2.4)) scrollArea = 2;
     }
 
     private static void applyWheel(int playlistCount, int itemCount) {
@@ -481,15 +589,20 @@ public final class WorldPanel {
         prepare(g);
 
         paintSidebar(g, libraryEntries, selected);
-        java.awt.Composite previousComposite = g.getComposite();
-        java.awt.geom.AffineTransform previousTransform = g.getTransform();
-        float transitionAlpha = (float) Math.max(0.0, Math.min(1.0, viewTransition));
-        g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, transitionAlpha));
-        g.translate(0, Math.round((1.0 - viewTransition) * 10.0));
-        paintPlaylistHeader(g, selected, items);
-        paintTrackTable(g, s, items, selected);
-        g.setTransform(previousTransform);
-        g.setComposite(previousComposite);
+        paintSearchBar(g);
+        if (searchMode()) {
+            paintSearchResults(g, s);
+        } else {
+            java.awt.Composite previousComposite = g.getComposite();
+            java.awt.geom.AffineTransform previousTransform = g.getTransform();
+            float transitionAlpha = (float) Math.max(0.0, Math.min(1.0, viewTransition));
+            g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, transitionAlpha));
+            g.translate(0, Math.round((1.0 - viewTransition) * 10.0));
+            paintPlaylistHeader(g, selected, items);
+            paintTrackTable(g, s, items, selected);
+            g.setTransform(previousTransform);
+            g.setComposite(previousComposite);
+        }
         paintNowPlaying(g, s);
         paintBottomPlayer(g, s);
 
@@ -497,8 +610,144 @@ public final class WorldPanel {
         return image;
     }
 
+    private static void paintSearchBar(Graphics2D g) {
+        int x0 = px(-4.35), x1 = px(4.35);
+        int y0 = py(14.22), y1 = py(12.88);
+        g.setColor(new Color(5, 10, 7, 248));
+        g.fillRect(x0, y0, x1 - x0, y1 - y0);
+        paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0,
+                searchFocused ? new Color(30, 215, 96, 245) : new Color(115, 145, 123, 190), 2, 7);
+
+        // Magnifying glass mark at the left of the editable field.
+        int iconX = x0 + 17, iconY = y0 + (y1 - y0) / 2 - 4;
+        g.setColor(new Color(190, 211, 196));
+        g.setStroke(new BasicStroke(2.2f));
+        g.drawOval(iconX, iconY - 5, 13, 13);
+        g.drawLine(iconX + 11, iconY + 7, iconX + 19, iconY + 15);
+
+        String shown = searchText.isEmpty() ? "Поиск треков Spotify…" : searchText;
+        int textX = x0 + 47;
+        int baseline = y0 + (y1 - y0) / 2 + 8;
+        g.setFont(new Font(Font.SANS_SERIF, searchText.isEmpty() ? Font.PLAIN : Font.BOLD, 22));
+        Color textColor = searchText.isEmpty() ? new Color(162, 180, 168) : new Color(248, 252, 249);
+        String fitted = fit(g, shown, x1 - textX - 42);
+        drawReadableText(g, fitted, textX, baseline, textColor);
+        if (searchFocused && (System.currentTimeMillis() / 500L) % 2L == 0L) {
+            int caretX = textX + g.getFontMetrics().stringWidth(fitted) + 2;
+            caretX = Math.min(caretX, x1 - 40);
+            g.setColor(new Color(30, 215, 96));
+            g.fillRect(caretX, baseline - 19, 2, 23);
+        }
+
+        int clearX = x1 - 27;
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 23));
+        g.setColor(searchText.isEmpty() ? new Color(90, 110, 96) : new Color(230, 240, 233));
+        drawUiText(g, "×", clearX, baseline, g.getColor());
+    }
+
+    private static void paintSearchResults(Graphics2D g, SpotifyClient.Snapshot snapshot) {
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
+        g.setColor(new Color(7, 12, 9, 250));
+        g.fillRect(x0, y0, x1 - x0, y1 - y0);
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 16));
+        g.setColor(new Color(30, 225, 100));
+        drawUiText(g, "РЕЗУЛЬТАТЫ ПОИСКА", x0 + 13, y0 + 22, g.getColor());
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+        g.setColor(new Color(184, 201, 189));
+        String queryLabel = fit(g, searchText, Math.max(40, x1 - x0 - 230));
+        drawUiText(g, queryLabel, x0 + 210, y0 + 22, g.getColor());
+        g.setColor(new Color(255, 255, 255, 48));
+        g.drawLine(x0 + 10, y0 + 31, x1 - 10, y0 + 31);
+
+        if (searchDebounceAtMs > 0) {
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 19));
+            g.setColor(new Color(215, 225, 218));
+            drawUiText(g, "Подготовка поиска…", x0 + 20, y0 + 78, g.getColor());
+            return;
+        }
+        if (searchLoading) {
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 19));
+            g.setColor(new Color(215, 225, 218));
+            drawUiText(g, "Ищу треки в Spotify…", x0 + 20, y0 + 78, g.getColor());
+            return;
+        }
+        if (!searchError.isEmpty()) {
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
+            g.setColor(new Color(255, 178, 130));
+            drawUiText(g, fit(g, searchError, x1 - x0 - 36), x0 + 18, y0 + 75, g.getColor());
+            return;
+        }
+        if (searchResults.isEmpty()) {
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 17));
+            g.setColor(new Color(202, 215, 206));
+            drawUiText(g, "Ничего не найдено. Попробуй другое название.", x0 + 18, y0 + 78, g.getColor());
+            return;
+        }
+
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
+        g.setColor(new Color(213, 224, 216));
+        drawUiText(g, "#", x0 + 15, y0 + 49, g.getColor());
+        drawUiText(g, "НАЗВАНИЕ", x0 + 43, y0 + 49, g.getColor());
+        drawUiText(g, "ИСПОЛНИТЕЛЬ", x0 + 290, y0 + 49, g.getColor());
+        drawUiText(g, "ВРЕМЯ", x1 - 51, y0 + 49, g.getColor());
+        g.setColor(new Color(255, 255, 255, 38));
+        g.drawLine(x0 + 10, y0 + 56, x1 - 10, y0 + 56);
+
+        int first = Math.max(0, Math.min(searchResults.size(), (int) Math.floor(trackScrollVisual)));
+        double fraction = trackScrollVisual - first;
+        int rows = Math.min(5, Math.max(0, searchResults.size() - first));
+        int rowH = 35;
+        int startY = y0 + 59;
+        java.awt.Shape oldClip = g.getClip();
+        g.clipRect(x0 + 4, startY - 3, x1 - x0 - 8, y1 - startY + 1);
+        String playingUri = snapshot.track() == null ? "" : snapshot.track().uri();
+        for (int i = 0; i < rows; i++) {
+            int itemIndex = first + i;
+            SpotifyClient.Item item = searchResults.get(itemIndex);
+            int y = startY + (int) Math.round((i - fraction) * rowH);
+            boolean playing = !playingUri.isEmpty() && playingUri.equals(item.uri());
+            if (playing) {
+                g.setColor(new Color(30, 215, 96, 42));
+                g.fillRect(x0 + 7, y, x1 - x0 - 14, rowH - 1);
+                g.setColor(new Color(30, 215, 96, 210));
+                g.fillRect(x0 + 7, y, 4, rowH - 1);
+            }
+
+            int baseline = y + 25;
+            int titleLeft = x0 + 43, titleRight = x0 + 278;
+            int artistLeft = x0 + 290, artistRight = x1 - 60;
+            int durationLeft = x1 - 54, durationRight = x1 - 10;
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 17));
+            g.setColor(playing ? new Color(30, 235, 105) : new Color(220, 232, 223));
+            String number = Integer.toString(itemIndex + 1);
+            drawUiText(g, number, x0 + 14, baseline, g.getColor());
+
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+            g.setColor(playing ? new Color(220, 255, 232) : Color.WHITE);
+            String title = fit(g, safe(item.title(), "Без названия"), titleRight - titleLeft);
+            drawReadableText(g, title, titleLeft, baseline, g.getColor());
+
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+            g.setColor(new Color(223, 234, 226));
+            String artists = fit(g, safe(item.artists(), ""), artistRight - artistLeft);
+            drawReadableText(g, artists, artistLeft, baseline, g.getColor());
+
+            g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 16));
+            g.setColor(new Color(235, 241, 236));
+            String duration = formatTime(item.durationMs());
+            drawUiText(g, duration, durationLeft + Math.max(0,
+                    (durationRight - durationLeft - g.getFontMetrics().stringWidth(duration)) / 2), baseline, g.getColor());
+        }
+        g.setClip(oldClip);
+        if (searchResults.size() > 5) {
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+            g.setColor(new Color(160, 181, 167));
+            drawUiText(g, "Колёсико — прокрутка результатов", x1 - 220, y1 - 7, g.getColor());
+        }
+    }
+
     private static void paintSidebar(Graphics2D g, List<SpotifyClient.LibraryEntry> libraryEntries, SpotifyClient.LibraryEntry selected) {
-        int left = px(-9.8), right = px(-8.6), top = py(12.8), bottom = py(2.5);
+        int left = px(-10.8), right = px(-9.6), top = py(12.7), bottom = py(2.4);
         g.setColor(new Color(5, 9, 7, 250));
         g.fillRect(left, top, right - left, bottom - top);
         paintPixelFrame(g, left, top, right - left, bottom - top, new Color(30, 215, 96, 175), 2, 7);
@@ -553,7 +802,7 @@ public final class WorldPanel {
     }
 
     private static void paintPlaylistHeader(Graphics2D g, SpotifyClient.LibraryEntry selected, List<SpotifyClient.Item> items) {
-        int x0 = px(-8.2), x1 = px(4.0), y0 = py(12.6), y1 = py(9.3);
+        int x0 = px(-9.2), x1 = px(5.0), y0 = py(12.5), y1 = py(9.2);
         int accentRgb = selected == null ? 0xFF52635B
                 : SpotifyPanelMod.spotify.coverAccentColor(selected.coverUrl());
         Color[] headerColors = headerGradient(accentRgb);
@@ -630,7 +879,7 @@ public final class WorldPanel {
 
     private static void paintTrackTable(Graphics2D g, SpotifyClient.Snapshot snapshot,
                                         List<SpotifyClient.Item> items, SpotifyClient.LibraryEntry selected) {
-        int x0 = px(-8.4), x1 = px(4.2), y0 = py(9.1), y1 = py(2.5);
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
         g.setColor(new Color(8, 12, 9, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
@@ -737,14 +986,14 @@ public final class WorldPanel {
     }
 
     private static void paintNowPlaying(Graphics2D g, SpotifyClient.Snapshot s) {
-        int x0 = px(4.4), x1 = px(9.8), y0 = py(12.8), y1 = py(2.5);
+        int x0 = px(5.4), x1 = px(10.8), y0 = py(12.7), y1 = py(2.4);
         g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(255, 255, 255, 25), 1, 8);
         g.setColor(new Color(30, 215, 96, 175));
         g.fillRect(x0 + 8, y0 + 8, 18, 3);
 
-        int coverX = px(4.6), coverY = py(12.6), coverSize = Math.min(px(9.6) - coverX, py(7.6) - coverY);
+        int coverX = px(5.6), coverY = py(12.5), coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
         drawCover(g, cover, 128, coverX + 5, coverY + 5, coverSize - 10);
         g.setColor(new Color(30, 215, 96, 210));
@@ -769,14 +1018,14 @@ public final class WorldPanel {
     }
 
     private static void paintBottomPlayer(Graphics2D g, SpotifyClient.Snapshot s) {
-        int x0 = px(-9.8), x1 = px(9.8), y0 = py(2.3), y1 = py(0.2);
+        int x0 = px(-10.8), x1 = px(10.8), y0 = py(2.3), y1 = py(0.2);
         g.setColor(new Color(4, 7, 5, 250));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(30, 215, 96, 125), 1, 10);
         g.setColor(new Color(30, 215, 96, 170));
         g.fillRect(x0 + 10, y0 + 1, x1 - x0 - 20, 2);
 
-        int leftCover = px(-9.4), leftY = y0 + 12;
+        int leftCover = px(-10.4), leftY = y0 + 12;
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
         drawCover(g, cover, 48, leftCover, leftY, 50);
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
@@ -788,7 +1037,7 @@ public final class WorldPanel {
         String bottomArtist = s.track() == null ? "Подключи аккаунт" : s.track().artists();
         drawReadableText(g, fit(g, bottomArtist, 190), leftCover + 58, leftY + 43, new Color(238, 242, 239));
 
-        int center = (px(-4.4) + px(3.1)) / 2;
+        int center = (px(-3.7) + px(3.7)) / 2;
         g.setColor(new Color(177, 194, 182));
         drawPrevious(g, center - 43, y0 + 27);
         g.setColor(new Color(30, 215, 96));
@@ -809,7 +1058,7 @@ public final class WorldPanel {
                 ? Math.round(displayedProgressMs) : s.currentProgress();
         long progress = duration == 0 ? 0 : Math.max(0, Math.min(duration, visualProgress));
         double fraction = duration == 0 ? 0 : progress / (double) duration;
-        int barX = px(-4.0), barRight = px(2.7), barY = y1 - 12;
+        int barX = px(-3.7), barRight = px(3.7), barY = y1 - 12;
         g.setColor(new Color(103, 122, 109, 170));
         g.fillRect(barX, barY, barRight - barX, 4);
         g.setColor(new Color(30, 215, 96));
@@ -820,7 +1069,7 @@ public final class WorldPanel {
         String total = formatTime(duration);
         drawUiText(g, total, barRight - g.getFontMetrics().stringWidth(total), barY - 5, g.getColor());
 
-        int volX = px(3.5), volR = px(9.6);
+        int volX = px(4.0), volR = px(10.6);
         g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
         g.setColor(new Color(248, 250, 248));
         drawReadableText(g, "ГРОМКОСТЬ", volX + 8, y0 + 21, new Color(250, 252, 250));
@@ -894,10 +1143,10 @@ public final class WorldPanel {
         if (overlayTexture == null) return;
         VertexConsumer vc = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(OVERLAY_TEXTURE_ID));
         MatrixStack.Entry entry = matrices.peek();
-        Vec3d p0 = modelPoint(MODEL_OVERLAY_X, 0, -10, cx, cy, cz, wx, wz, nx, nz);
-        Vec3d p1 = modelPoint(MODEL_OVERLAY_X, 0, 10, cx, cy, cz, wx, wz, nx, nz);
-        Vec3d p2 = modelPoint(MODEL_OVERLAY_X, 13, 10, cx, cy, cz, wx, wz, nx, nz);
-        Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 13, -10, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p0 = modelPoint(MODEL_OVERLAY_X, 0, -11, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p1 = modelPoint(MODEL_OVERLAY_X, 0, 11, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p2 = modelPoint(MODEL_OVERLAY_X, 14.4, 11, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 14.4, -11, cx, cy, cz, wx, wz, nx, nz);
         // The overlay is offset forward from the model surfaces and emitted once,
         // avoiding coplanar alpha blending and the resulting sparkle/flicker.
         overlayVertex(vc, entry, p0, 0, 1, nx, nz);
@@ -931,6 +1180,7 @@ public final class WorldPanel {
 
         // If the chat closes while dragging, stop cleanly instead of keeping a stale drag state.
         if (!chatOpen) {
+            searchFocused = false;
             finishSeekDrag(SpotifyPanelMod.spotify);
             dragMode = DRAG_NONE;
             lastDragSeekMs = -1;
@@ -974,8 +1224,8 @@ public final class WorldPanel {
         SpotifyClient client = SpotifyPanelMod.spotify;
 
         int bottomTop = py(2.3), bottomBottom = py(0.2);
-        int progressX0 = px(-4.0), progressX1 = px(2.7), progressY = bottomBottom - 12;
-        int volumeX0 = px(3.5) + 8, volumeX1 = px(9.6) - 8, volumeY = bottomTop + 34;
+        int progressX0 = px(-3.7), progressX1 = px(3.7), progressY = bottomBottom - 12;
+        int volumeX0 = px(4.0) + 8, volumeX1 = px(10.6) - 8, volumeY = bottomTop + 34;
 
         // Update the visual thumb on each frame. Seeking is committed only on release;
         // volume is smoothed/coalesced by SpotifyClient while the pointer moves.
@@ -1027,8 +1277,17 @@ public final class WorldPanel {
             return;
         }
 
-        if (tx >= px(-9.8) && tx <= px(-8.6) && ty >= py(12.8) + 45 && ty <= py(2.5)) {
-            double relativeSlot = (ty - (py(12.8) + 53)) / 46.0;
+        // The new Blockbench search_corpus occupies the centered top strip.
+        if (tx >= px(-4.5) && tx <= px(4.5) && ty >= py(14.3) && ty <= py(12.8)) {
+            searchFocused = true;
+            if (tx >= px(3.65)) setSearchText("");
+            wasLeftDown = down;
+            return;
+        }
+        searchFocused = false;
+
+        if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) + 45 && ty <= py(2.4)) {
+            double relativeSlot = (ty - (py(12.7) + 53)) / 46.0;
             int visibleSlot = Math.max(0, (int) Math.floor(relativeSlot));
             int entryIndex = Math.max(0, (int) Math.floor(Math.max(0.0, relativeSlot) + sideScrollVisual));
             if (visibleSlot < 7 && entryIndex < libraryEntries.size()) {
@@ -1046,10 +1305,21 @@ public final class WorldPanel {
             return;
         }
 
+        // Search results occupy the central track area while a query is present.
+        if (searchMode() && tx >= px(-9.4) && tx <= px(5.2)
+                && ty >= py(9.2) + 59 && ty <= py(2.4)) {
+            int itemIndex = (int) Math.floor((ty - (py(9.2) + 59)) / 35.0 + trackScrollVisual);
+            if (itemIndex >= 0 && itemIndex < searchResults.size()) {
+                client.playSearchResult(searchResults.get(itemIndex), SpotifyPanelMod::say);
+            }
+            wasLeftDown = down;
+            return;
+        }
+
         // Content rows inside the selected library section.
-        if (selected != null && items != null && tx >= px(-8.4) && tx <= px(4.2)
-                && ty >= py(9.1) + 43 && ty <= py(2.5)) {
-            int itemIndex = (int) Math.floor((ty - (py(9.1) + 43)) / 42.0 + trackScrollVisual);
+        if (!searchMode() && selected != null && items != null && tx >= px(-9.4) && tx <= px(5.2)
+                && ty >= py(9.2) + 43 && ty <= py(2.4)) {
+            int itemIndex = (int) Math.floor((ty - (py(9.2) + 43)) / 42.0 + trackScrollVisual);
             if (itemIndex >= 0 && itemIndex < items.size()) {
                 client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
                 wasLeftDown = down;
@@ -1059,7 +1329,7 @@ public final class WorldPanel {
 
         // Bottom transport controls (progress and volume are handled by drag above).
         if (ty >= bottomTop && ty <= bottomBottom) {
-            int center = (px(-4.4) + px(3.1)) / 2;
+            int center = (px(-3.7) + px(3.7)) / 2;
             if (ty <= bottomTop + 46 && tx >= center - 70 && tx <= center + 70) {
                 if (tx < center - 22) client.previous(SpotifyPanelMod::say);
                 else if (tx > center + 25) client.next(SpotifyPanelMod::say);
@@ -1068,7 +1338,7 @@ public final class WorldPanel {
                 return;
             }
         }
-        if (tx >= px(4.4) && ty >= py(7.4) && ty <= py(2.7)) {
+        if (tx >= px(5.4) && ty >= py(7.3) && ty <= py(2.6)) {
             client.togglePlay(SpotifyPanelMod::say);
         }
         wasLeftDown = down;
@@ -1085,7 +1355,7 @@ public final class WorldPanel {
             SpotifyClient.Snapshot snapshot = client.snapshot();
             SpotifyClient.Track track = snapshot.track();
             if (track == null || track.durationMs() <= 0) return;
-            int x0 = px(-4.0), x1 = px(2.7);
+            int x0 = px(-3.7), x1 = px(3.7);
             double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
             long target = Math.max(0, Math.min(track.durationMs(), Math.round(track.durationMs() * fraction)));
             if (target != lastDragSeekMs) {
@@ -1094,7 +1364,7 @@ public final class WorldPanel {
                 lastDragSeekMs = target;
             }
         } else {
-            int x0 = px(3.5) + 8, x1 = px(9.6) - 8;
+            int x0 = px(4.0) + 8, x1 = px(10.6) - 8;
             double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
             int target = (int) Math.round(fraction * 100.0);
             if (target != lastDragVolume) {
@@ -1241,11 +1511,11 @@ public final class WorldPanel {
     }
 
     private static int px(double modelZ) {
-        return (int) Math.round((modelZ + 10.0) / 20.0 * TEX_W);
+        return (int) Math.round((modelZ + 11.0) / 22.0 * TEX_W);
     }
 
     private static int py(double modelY) {
-        return (int) Math.round((13.0 - modelY) / 13.0 * TEX_H);
+        return (int) Math.round((14.4 - modelY) / 14.4 * TEX_H);
     }
 
     private static String safe(String value, String fallback) {

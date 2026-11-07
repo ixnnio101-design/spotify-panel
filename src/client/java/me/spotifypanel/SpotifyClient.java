@@ -13,6 +13,7 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
@@ -79,6 +80,9 @@ public final class SpotifyClient {
             this(title, artists, durationMs, uri, "");
         }
     }
+
+    /** Результаты поиска Spotify: список найденных треков и сообщение об ошибке, если запрос не прошёл. */
+    public record SearchResults(List<Item> items, String error) {}
 
     public record Snapshot(Status status, boolean playing, Track track, long progressMs, long fetchedAtMs,
                            String device, int volume, boolean shuffle, String repeat, String error) {
@@ -218,6 +222,53 @@ public final class SpotifyClient {
     public String itemError(String key) { return itemErrors.getOrDefault(key, ""); }
 
     public String itemError(LibraryEntry entry) { return entry == null ? "" : itemErrors.getOrDefault(entry.key(), ""); }
+
+    /**
+     * Асинхронно ищет треки в каталоге Spotify. Запрос выполняется в общем пуле API,
+     * поэтому поток отрисовки Minecraft не ждёт ответа сети.
+     */
+    public CompletableFuture<SearchResults> searchTracks(String query) {
+        String normalized = query == null ? "" : query.trim();
+        if (normalized.isEmpty()) return CompletableFuture.completedFuture(new SearchResults(List.of(), ""));
+        if (auth.clientId().isBlank()) {
+            return CompletableFuture.completedFuture(new SearchResults(List.of(), "Сначала настрой Spotify: /spotify setup <client_id>."));
+        }
+        if (!auth.isLoggedIn()) {
+            return CompletableFuture.completedFuture(new SearchResults(List.of(), "Сначала подключи Spotify: /spotify login."));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                String encoded = URLEncoder.encode(normalized, java.nio.charset.StandardCharsets.UTF_8);
+                HttpResponse<String> response = send("GET", "/search?q=" + encoded + "&type=track&limit=10", null);
+                if (response.statusCode() != 200) {
+                    String detail = apiMessage(response.body());
+                    String message;
+                    if (response.statusCode() == 403) {
+                        message = "Spotify отклонил поиск (HTTP 403). Проверь доступность Web API для приложения и аккаунта.";
+                    } else {
+                        message = "Поиск Spotify: HTTP " + response.statusCode()
+                                + (detail.isEmpty() ? "" : " — " + detail);
+                    }
+                    return new SearchResults(List.of(), message);
+                }
+
+                JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+                JsonObject tracks = root.has("tracks") && root.get("tracks").isJsonObject()
+                        ? root.getAsJsonObject("tracks") : new JsonObject();
+                JsonArray results = tracks.has("items") && tracks.get("items").isJsonArray()
+                        ? tracks.getAsJsonArray("items") : new JsonArray();
+                List<Item> found = new ArrayList<>();
+                for (JsonElement element : results) {
+                    if (!element.isJsonObject()) continue;
+                    Item item = parseTrackItem(element.getAsJsonObject());
+                    if (item != null) found.add(item);
+                }
+                return new SearchResults(List.copyOf(found), "");
+            } catch (Exception e) {
+                return new SearchResults(List.of(), "Поиск Spotify: " + errText(e));
+            }
+        }, exec);
+    }
 
     // ------------------------------------------------------------- HTTP
 
@@ -1002,6 +1053,15 @@ public final class SpotifyClient {
     public void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err) {
         if (entry == null || item == null || item.uri().isEmpty()) return;
         playLibraryItem(entry, item, err, beginPlaybackIntent());
+    }
+
+    /** Запускает трек, найденный поиском, через контекст его альбома, когда URI альбома доступен. */
+    public void playSearchResult(Item item, Consumer<String> err) {
+        if (item == null || item.uri() == null || item.uri().isEmpty()) return;
+        long intentId = beginPlaybackIntent();
+        likedPlayback = null;
+        setOptimisticTrack(item);
+        playTrackFromAlbum(item, err, intentId);
     }
 
     private void playLibraryItem(LibraryEntry entry, Item item, Consumer<String> err, long intentId) {
