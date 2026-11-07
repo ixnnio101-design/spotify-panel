@@ -60,7 +60,7 @@ public final class WorldPanel {
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 14.4;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.2;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -79,6 +79,7 @@ public final class WorldPanel {
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
     private static boolean wasLeftDown;
+    private static boolean panelWasVisible;
     private static boolean bodyYawInitialized;
     private static double smoothedBodyYaw;
     private static long lastBodyYawUpdateNs;
@@ -191,6 +192,8 @@ public final class WorldPanel {
     private static void draw(WorldRenderContext context) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!SpotifyPanelMod.config.visible || mc.player == null || mc.world == null) {
+            panelWasVisible = false;
+            if (SpotifyPanelMod.spotify != null) SpotifyPanelMod.spotify.setVisibleSelection(null);
             wasLeftDown = false;
             dragMode = DRAG_NONE;
             searchFocused = false;
@@ -242,6 +245,15 @@ public final class WorldPanel {
 
         List<SpotifyClient.LibraryEntry> libraryEntries = SpotifyPanelMod.spotify.library();
         SpotifyClient.LibraryEntry selected = selectedLibraryEntry(libraryEntries);
+        SpotifyPanelMod.spotify.setVisibleSelection(selected);
+        boolean panelJustOpened = !panelWasVisible;
+        if (panelJustOpened) {
+            panelWasVisible = true;
+            // On reopening, revalidate the library and the currently selected rows immediately.
+            lastRequestedLibraryKey = "";
+            lastItemsRequestNs = 0;
+            SpotifyPanelMod.spotify.onPanelOpened();
+        }
         if (selected != null && !selected.key().equals(lastAnimatedLibraryKey)) {
             lastAnimatedLibraryKey = selected.key();
             trackScroll = 0;
@@ -255,10 +267,16 @@ public final class WorldPanel {
                 searchMode ? SEARCH_VISIBLE_ROWS : 5);
         List<SpotifyClient.Item> items = null;
         if (selected != null) {
-            if (!selected.key().equals(lastRequestedLibraryKey) || now - lastItemsRequestNs > 60_000_000_000L) {
+            boolean selectionChanged = !selected.key().equals(lastRequestedLibraryKey);
+            if (selectionChanged || now - lastItemsRequestNs > 120_000_000_000L) {
                 lastRequestedLibraryKey = selected.key();
                 lastItemsRequestNs = now;
-                SpotifyPanelMod.spotify.requestItems(selected, false);
+                // Switching sections triggers a lightweight metadata revalidation.
+                // Playlist snapshot/ETag checks avoid re-downloading unchanged contents.
+                if (selectionChanged && !panelJustOpened) {
+                    SpotifyPanelMod.spotify.onLibrarySectionOpened(selected);
+                }
+                SpotifyPanelMod.spotify.requestItems(selected, selectionChanged);
             }
             items = SpotifyPanelMod.spotify.items(selected.key());
         }

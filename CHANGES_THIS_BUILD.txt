@@ -116,3 +116,21 @@ Liked Songs sequential auto-advance fix (7 Nov 2026)
 - The Liked Songs queue index is kept in sync when Spotify naturally reaches the expected next saved track. Manual next/previous continue to use the same saved-track order.
 - Pausing cancels the pending auto-advance; resuming schedules it again. Seeking is rechecked before advancing, and Repeat One remains handled by Spotify. Repeat Context loops to the first saved track; with Repeat Off, playback pauses after the last saved track rather than continuing through the album.
 - Gradle was not run.
+
+
+External Spotify control and live library synchronization (7 Nov 2026)
+- Removed the old track-transition interceptor that forced playback back to the Liked Songs queue whenever Spotify reported a different song. Choosing a song directly in Spotify now relinquishes the temporary favorites queue instead of being overridden.
+- Automatic favorites advance now performs a fresh GET /me/player check immediately before sending the next-track command. If Spotify is already playing another song, the old queue is dropped without issuing a playback command.
+- Kept the normal Liked Songs order for panel-driven next/previous and end-of-track auto-advance.
+- While the panel is visible, playlists and saved albums are refreshed automatically about every 20 seconds; the newest 50 liked tracks are refreshed on the same cadence, preserving cached older pages until the normal full library refresh.
+- The currently selected playlist/album item list now refreshes about every 20 seconds (cache TTL 15 seconds), so content changes appear without reopening the section.
+- Full library refresh remains in place for the deeper saved-track pages and other categories. Gradle was not run.
+
+Adaptive library synchronization (7 Nov 2026)
+- Replaced the 20-second library refresh cadence with a two-minute revalidation cadence while the in-world panel is actually visible; no library-sync network work is scheduled while the panel is hidden or unavailable in-world.
+- Opening the panel and switching library sections trigger an immediate lightweight check. A five-second minimum guard prevents rapid section clicks from queuing duplicate library requests.
+- Added conditional GET support for Spotify library endpoints: cached responses are reused while Cache-Control allows it, and expired responses are revalidated with If-None-Match when Spotify supplies an ETag. HTTP 304 reuses the existing body instead of downloading it again.
+- Read playlist snapshot_id values from the user's playlist listing. If a snapshot changes, the cached track rows and their ETag pages are invalidated; the currently selected playlist is reloaded. A version-change race during page loading is detected and retried rather than marking mixed-version rows as current.
+- Unchanged playlist tracklists remain cached by snapshot ID; album tracklists remain cached because album track order/content is immutable. The selected playlist content is checked at most every two minutes when no usable snapshot ID is supplied.
+- The latest 50 liked tracks, saved playlists and saved albums are checked on the two-minute cadence. Deeper saved-track pages are reconciled by the full library sync every 30 minutes, and that full sync is deferred while the panel is hidden.
+- Kept the normal two-second playback-state polling separate from library synchronization. Gradle was not run.

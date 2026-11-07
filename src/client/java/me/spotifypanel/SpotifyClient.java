@@ -16,6 +16,7 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpHeaders;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -166,16 +167,28 @@ public final class SpotifyClient {
         apiCooldownUntilMs = Math.max(apiCooldownUntilMs, untilMs);
     }
     private final java.util.concurrent.atomic.AtomicBoolean playlistsLoading = new java.util.concurrent.atomic.AtomicBoolean();
+    private final AtomicBoolean coreLibraryLoading = new AtomicBoolean();
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<List<Item>>> itemLoads = new ConcurrentHashMap<>();
+    // Spotify does not push library-change events to third-party Web API clients.
+    // Revalidate library GETs with ETags/Cache-Control instead of downloading unchanged pages.
+    private record CachedGet(HttpResponse<String> response, String etag, long expiresAtMs) {}
+    private final Map<String, CachedGet> libraryHttpCache = new ConcurrentHashMap<>();
+    private final Map<String, String> playlistSnapshotIds = new ConcurrentHashMap<>();
+    private final Map<String, String> loadedPlaylistSnapshotIds = new ConcurrentHashMap<>();
+    private volatile long lastCoreLibraryRefreshAtMs;
+    private volatile LibraryEntry visibleSelection;
+    private static final long CORE_LIBRARY_REFRESH_INTERVAL_MS = 120_000L;
+    private static final long PLAYLIST_ITEMS_REFRESH_INTERVAL_MS = 120_000L;
+    private static final long FULL_LIBRARY_REFRESH_INTERVAL_MS = 30 * 60_000L;
     private record LikedPlayback(List<Item> items, int index, long sessionId) {}
     private volatile LikedPlayback likedPlayback;
     private final AtomicLong likedSessionSequence = new AtomicLong();
-    // Favorites are played one track at a time via their album context. Spotify would
-    // otherwise continue that album, so schedule the next saved track before the
-    // current one ends and verify every observed track transition against this queue.
+    // Liked Songs uses Spotify album-context playback for compatibility. Advance the
+    // favorites queue before the album can continue, but never override a manual track
+    // selection made directly in Spotify: verify the live player immediately first.
     private final Object likedAdvanceLock = new Object();
     private ScheduledFuture<?> likedAdvanceTask;
     private LikedPlayback scheduledLikedQueue;
@@ -224,6 +237,15 @@ public final class SpotifyClient {
         return sessionId;
     }
 
+    private void endLikedSession(LikedPlayback expected) {
+        synchronized (likedAdvanceLock) {
+            if (expected == null || likedPlayback != expected) return;
+            likedSessionSequence.incrementAndGet();
+            likedPlayback = null;
+            cancelLikedAdvanceTaskLocked();
+        }
+    }
+
     private boolean setLikedPlayback(LikedPlayback queue, long sessionId, long intentId) {
         synchronized (likedAdvanceLock) {
             if (sessionId != likedSessionSequence.get() || !isPlaybackIntentCurrent(intentId)) return false;
@@ -238,15 +260,6 @@ public final class SpotifyClient {
             if (!isPlaybackIntentCurrent(intentId)) return false;
             likedSessionSequence.incrementAndGet();
             likedPlayback = null;
-            cancelLikedAdvanceTaskLocked();
-            return true;
-        }
-    }
-
-    private boolean replaceLikedPlayback(LikedPlayback expected, LikedPlayback replacement) {
-        synchronized (likedAdvanceLock) {
-            if (likedPlayback != expected || expected.sessionId() != likedSessionSequence.get()) return false;
-            likedPlayback = replacement;
             cancelLikedAdvanceTaskLocked();
             return true;
         }
@@ -302,18 +315,78 @@ public final class SpotifyClient {
         }
         if (likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()) return;
 
-        Snapshot state = snapshot;
-        if (state.status() != Status.ACTIVE || !state.playing() || state.track() == null
-                || !expectedUri.equals(state.track().uri())) {
-            return; // a pause or a manual track change took over
-        }
+        // The cached snapshot can be up to two seconds old. Query Spotify directly
+        // before issuing an automatic command so a song manually started in Spotify
+        // Desktop is never replaced by the old Liked Songs queue.
+        try {
+            HttpResponse<String> response = send("GET", "/me/player", null);
+            if (response.statusCode() == 204) {
+                endLikedSession(queue);
+                return;
+            }
+            if (response.statusCode() != 200) {
+                // A rate limit or transient API failure must not trigger a blind play.
+                endLikedSession(queue);
+                return;
+            }
 
-        long remainingMs = Math.max(0L, state.track().durationMs() - state.currentProgress());
-        if (remainingMs > LIKED_ADVANCE_RECHECK_MS) {
-            scheduleLikedAdvance(state); // for example, the user sought back before this timer fired
-            return;
+            JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+            JsonElement liveItem = root.get("item");
+            if (liveItem == null || !liveItem.isJsonObject()) {
+                endLikedSession(queue);
+                return;
+            }
+            JsonObject track = liveItem.getAsJsonObject();
+            String liveUri = str(track, "uri");
+            if (!expectedUri.equals(liveUri)) {
+                // The user changed the track in Spotify itself. Drop our queue quietly;
+                // do not try to pull playback back into the favorites list.
+                endLikedSession(queue);
+                return;
+            }
+            if (!bool(root, "is_playing")) return;
+
+            long duration = lng(track, "duration_ms");
+            long progress = lng(root, "progress_ms");
+            long remainingMs = Math.max(0L, duration - progress);
+            String repeat = str(root, "repeat_state");
+            if (repeat.isEmpty()) repeat = "off";
+            if ("track".equals(repeat)) return;
+
+            if (remainingMs > LIKED_ADVANCE_RECHECK_MS) {
+                // For example, the user sought backwards after the timer was scheduled.
+                String device = root.has("device") && root.get("device").isJsonObject()
+                        ? str(root.getAsJsonObject("device"), "name") : "";
+                int volume = root.has("device") && root.get("device").isJsonObject()
+                        ? (int) lng(root.getAsJsonObject("device"), "volume_percent") : 0;
+                Snapshot verified = new Snapshot(Status.ACTIVE, true,
+                        new Track(str(track, "name"), artistsOf(track), "", duration, liveUri),
+                        progress, System.currentTimeMillis(), device, volume,
+                        bool(root, "shuffle_state"), repeat, "");
+                scheduleLikedAdvance(verified);
+                return;
+            }
+            advanceLikedQueue(queue, repeat);
+        } catch (Exception e) {
+            // On network failure prefer ending this queue over risking an override of
+            // a manual Spotify selection that the client could not verify.
+            LOG.debug("Liked Songs auto-advance verification failed", e);
+            endLikedSession(queue);
         }
-        advanceLikedQueue(queue, state.repeat());
+    }
+
+    /** A track change not requested by this panel ends the temporary Liked Songs queue. */
+    private void releaseLikedQueueOnExternalTrackChange(Snapshot previous, Snapshot current) {
+        LikedPlayback queue = likedPlayback;
+        if (queue == null || queue.sessionId() != likedSessionSequence.get()
+                || previous == null || current == null || previous.track() == null || current.track() == null
+                || queue.index() < 0 || queue.index() >= queue.items().size()) return;
+
+        String expectedUri = queue.items().get(queue.index()).uri();
+        if (expectedUri.equals(current.track().uri())) return; // the panel's requested next favorite started
+        if (System.currentTimeMillis() < optimisticTrackUntilMs
+                && expectedUri.equals(optimisticTrackUri)) return; // our play command is still pending
+        endLikedSession(queue); // external Spotify selection: relinquish control, do not intercept
     }
 
     private void pauseLikedQueue(LikedPlayback queue, Consumer<String> err) {
@@ -343,51 +416,6 @@ public final class SpotifyClient {
         }
     }
 
-    /**
-     * Spotify naturally advances within the album used to start a favorite. If that
-     * happens before our timer can take effect, immediately restore the exact next
-     * item from the saved-tracks order.
-     */
-    private void handleLikedTrackTransition(Snapshot previous, Snapshot current) {
-        LikedPlayback queue = likedPlayback;
-        if (queue == null || queue.sessionId() != likedSessionSequence.get()
-                || previous == null || current == null || !previous.playing()
-                || previous.track() == null || current.track() == null
-                || previous.track().uri().equals(current.track().uri())) return;
-        if (queue.index() < 0 || queue.index() >= queue.items().size()) return;
-
-        Item activeLikedItem = queue.items().get(queue.index());
-        if (activeLikedItem == null || !previous.track().uri().equals(activeLikedItem.uri())) return;
-        if ("track".equals(current.repeat())) return;
-
-        int nextIndex = queue.index() + 1;
-        if (nextIndex < queue.items().size()) {
-            Item expectedNext = queue.items().get(nextIndex);
-            if (expectedNext.uri().equals(current.track().uri())) {
-                replaceLikedPlayback(queue, new LikedPlayback(queue.items(), nextIndex, queue.sessionId()));
-            } else {
-                playLikedItem(queue, nextIndex, ignored -> {});
-            }
-        } else if ("context".equals(current.repeat())) {
-            playLikedItem(queue, 0, ignored -> {});
-        } else {
-            pauseLikedQueue(queue, ignored -> {});
-        }
-    }
-
-    /** Handles the rare case where Spotify reports no active item at the track boundary. */
-    private void handleLikedPlaybackIdle(Snapshot previous) {
-        LikedPlayback queue = likedPlayback;
-        if (queue == null || queue.sessionId() != likedSessionSequence.get()
-                || previous == null || !previous.playing() || previous.track() == null
-                || queue.index() < 0 || queue.index() >= queue.items().size()) return;
-        Item expected = queue.items().get(queue.index());
-        if (expected == null || !previous.track().uri().equals(expected.uri())) return;
-        if (previous.track().durationMs() > 0
-                && previous.currentProgress() < previous.track().durationMs() - LIKED_ADVANCE_RECHECK_MS) return;
-        advanceLikedQueue(queue, previous.repeat());
-    }
-
     // обложки
     private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
     private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
@@ -401,6 +429,40 @@ public final class SpotifyClient {
 
     public void start() {
         exec.scheduleWithFixedDelay(this::poll, 1, 2, TimeUnit.SECONDS);
+        // Spotify does not expose library-change push events to third-party apps.
+        // While the panel is visible, revalidate the small core library snapshot every
+        // two minutes. Cache-Control and ETag avoid downloading unchanged responses.
+        exec.scheduleWithFixedDelay(this::refreshVisibleCoreLibrary, 120, 120, TimeUnit.SECONDS);
+    }
+
+    /** Called once when the in-world panel becomes visible again. */
+    public void onPanelOpened() {
+        if (!auth.isLoggedIn()) return;
+        exec.execute(() -> {
+            long now = System.currentTimeMillis();
+            if (library.isEmpty()) {
+                if (!playlistsLoading.get()) {
+                    nextPlaylistTry = 0;
+                    tryLoadPlaylists();
+                }
+            } else if (now >= nextPlaylistTry && !playlistsLoading.get()) {
+                tryLoadPlaylists();
+            } else {
+                refreshVisibleCoreLibrary(true);
+            }
+        });
+    }
+
+    /** Revalidate metadata when the user switches to another library section. */
+    public void onLibrarySectionOpened(LibraryEntry entry) {
+        visibleSelection = entry;
+        if (!auth.isLoggedIn()) return;
+        exec.execute(() -> refreshVisibleCoreLibrary(true));
+    }
+
+    /** Current selection is used to refresh its contents after a playlist snapshot changes. */
+    public void setVisibleSelection(LibraryEntry entry) {
+        visibleSelection = entry;
     }
 
     public Snapshot snapshot() { return snapshot; }
@@ -477,9 +539,20 @@ public final class SpotifyClient {
                     + Math.max(1, (remainingCooldown + 999) / 1000) + " сек.");
         }
 
+        String cacheKey = method.toUpperCase(java.util.Locale.ROOT) + " " + path;
+        boolean cacheableGet = "GET".equalsIgnoreCase(method) && isLibraryCacheablePath(path);
+        long now = System.currentTimeMillis();
+        CachedGet cached = cacheableGet ? libraryHttpCache.get(cacheKey) : null;
+        if (cached != null && now < cached.expiresAtMs()) {
+            return cached.response();
+        }
+
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create("https://api.spotify.com/v1" + path))
                 .header("Authorization", "Bearer " + auth.accessToken())
                 .timeout(Duration.ofSeconds(10));
+        if (cacheableGet && cached != null && !cached.etag().isEmpty()) {
+            b.header("If-None-Match", cached.etag());
+        }
         if (jsonBody == null) {
             b.method(method, HttpRequest.BodyPublishers.noBody());
         } else {
@@ -496,7 +569,54 @@ public final class SpotifyClient {
             }
             extendApiCooldown(System.currentTimeMillis() + delayMs);
         }
+
+        if (cacheableGet && response.statusCode() == 304 && cached != null) {
+            long expiresAt = cacheExpiry(response.headers(), System.currentTimeMillis());
+            if (isNoStore(response.headers())) {
+                libraryHttpCache.remove(cacheKey);
+            } else {
+                libraryHttpCache.put(cacheKey, new CachedGet(cached.response(), cached.etag(), expiresAt));
+            }
+            // Callers receive the original successful response/body transparently.
+            return cached.response();
+        }
+        if (cacheableGet && response.statusCode() == 200) {
+            String etag = response.headers().firstValue("ETag").orElse("");
+            long expiresAt = cacheExpiry(response.headers(), System.currentTimeMillis());
+            if (!isNoStore(response.headers()) && (!etag.isEmpty() || expiresAt > System.currentTimeMillis())) {
+                libraryHttpCache.put(cacheKey, new CachedGet(response, etag, expiresAt));
+            } else {
+                libraryHttpCache.remove(cacheKey);
+            }
+        }
         return response;
+    }
+
+    private static boolean isLibraryCacheablePath(String path) {
+        return path.startsWith("/me/playlists") || path.startsWith("/me/albums")
+                || path.startsWith("/me/tracks") || path.startsWith("/playlists/")
+                || path.startsWith("/albums/");
+    }
+
+    private static boolean isNoStore(HttpHeaders headers) {
+        return headers.firstValue("Cache-Control").orElse("")
+                .toLowerCase(java.util.Locale.ROOT).contains("no-store");
+    }
+
+    /** Uses Spotify's Cache-Control max-age/Age headers when supplied. */
+    private static long cacheExpiry(HttpHeaders headers, long nowMs) {
+        String cacheControl = headers.firstValue("Cache-Control").orElse("");
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?:s-maxage|max-age)\\s*=\\s*(\\d+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(cacheControl);
+        if (!matcher.find()) return nowMs;
+        try {
+            long maxAgeSeconds = Long.parseLong(matcher.group(1));
+            long ageSeconds = Long.parseLong(headers.firstValue("Age").orElse("0"));
+            return nowMs + Math.max(0L, maxAgeSeconds - ageSeconds) * 1_000L;
+        } catch (NumberFormatException ignored) {
+            return nowMs;
+        }
     }
 
     private static String errText(Throwable e) {
@@ -533,7 +653,10 @@ public final class SpotifyClient {
                 }
                 return;
             }
-            if (now >= nextPlaylistTry) tryLoadPlaylists();
+            if (now >= nextPlaylistTry && (library.isEmpty()
+                    || (SpotifyPanelMod.config != null && SpotifyPanelMod.config.visible))) {
+                tryLoadPlaylists();
+            }
 
             long started = System.currentTimeMillis();
             HttpResponse<String> r = send("GET", "/me/player", null);
@@ -547,9 +670,8 @@ public final class SpotifyClient {
                 return; // ответ относится к переходу между треками или к старому состоянию
             }
             if (sc == 204) {
-                Snapshot previous = snapshot;
                 snapshot = Snapshot.of(Status.IDLE);
-                handleLikedPlaybackIdle(previous);
+                endLikedSession();
             } else if (sc == 401) {
                 auth.invalidate();
             } else if (sc == 429) {
@@ -579,10 +701,8 @@ public final class SpotifyClient {
         JsonObject o = JsonParser.parseString(body).getAsJsonObject();
         JsonElement itemEl = o.get("item");
         if (itemEl == null || itemEl.isJsonNull()) {
-            Snapshot previous = snapshot;
             snapshot = Snapshot.of(Status.IDLE);
-            handleLikedPlaybackIdle(previous);
-            cancelLikedAdvanceTask();
+            endLikedSession();
             return;
         }
         JsonObject item = itemEl.getAsJsonObject();
@@ -623,7 +743,7 @@ public final class SpotifyClient {
         Snapshot current = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
         snapshot = current;
-        handleLikedTrackTransition(prev, current);
+        releaseLikedQueueOnExternalTrackChange(prev, current);
         scheduleLikedAdvance(snapshot);
         if (!optimisticTrackUri.isEmpty() && optimisticTrackUri.equals(uri)) {
             optimisticTrackUntilMs = 0;
@@ -681,6 +801,11 @@ public final class SpotifyClient {
 
     /** Перезагрузить все разделы медиатеки после авторизации или изменения списка. */
     public void reloadPlaylists() {
+        // Re-authentication or explicit library commands should observe the latest server state.
+        libraryHttpCache.clear();
+        playlistSnapshotIds.clear();
+        loadedPlaylistSnapshotIds.clear();
+        itemsTime.keySet().removeIf(key -> key.startsWith("playlist:"));
         nextPlaylistTry = 0;
         tryLoadPlaylists();
     }
@@ -698,7 +823,7 @@ public final class SpotifyClient {
                 long now = System.currentTimeMillis();
                 if (playlistsError.isEmpty()) {
                     playlistFails = 0;
-                    nextPlaylistTry = now + 120_000;
+                    nextPlaylistTry = now + FULL_LIBRARY_REFRESH_INTERVAL_MS;
                 } else {
                     playlistFails++;
                     nextPlaylistTry = now + Math.max(60_000, retryAfterMs);
@@ -750,6 +875,171 @@ public final class SpotifyClient {
             offset += got;
         }
         return new PageData(out, total);
+    }
+
+    /** Fetch only the newest 50 saved tracks for lightweight near-live synchronization. */
+    private PageData fetchFirstPage(String endpoint) throws Exception {
+        String separator = endpoint.contains("?") ? "&" : "?";
+        HttpResponse<String> response = send("GET", endpoint + separator + "limit=50&offset=0", null);
+        if (response.statusCode() != 200) {
+            if (response.statusCode() == 401) auth.invalidate();
+            throw new IOException("HTTP " + response.statusCode()
+                    + (apiMessage(response.body()).isEmpty() ? "" : ": " + apiMessage(response.body())));
+        }
+        JsonObject page = JsonParser.parseString(response.body()).getAsJsonObject();
+        List<JsonObject> objects = new ArrayList<>();
+        JsonArray array = page.has("items") && page.get("items").isJsonArray()
+                ? page.getAsJsonArray("items") : new JsonArray();
+        for (JsonElement element : array) if (element.isJsonObject()) objects.add(element.getAsJsonObject());
+        return new PageData(objects, (int) lng(page, "total"));
+    }
+
+    private void refreshVisibleCoreLibrary() {
+        refreshVisibleCoreLibrary(false);
+    }
+
+    private void refreshVisibleCoreLibrary(boolean immediate) {
+        long refreshStartedAt = System.currentTimeMillis();
+        if (!auth.isLoggedIn() || SpotifyPanelMod.config == null || !SpotifyPanelMod.config.visible
+                || visibleSelection == null || playlistsLoading.get() || refreshStartedAt < apiCooldownUntilMs
+                || (immediate && refreshStartedAt - lastCoreLibraryRefreshAtMs < 5_000L)
+                || (!immediate && refreshStartedAt - lastCoreLibraryRefreshAtMs < CORE_LIBRARY_REFRESH_INTERVAL_MS)
+                || !coreLibraryLoading.compareAndSet(false, true)) return;
+        try {
+            // A full first-time load is already in progress; let it populate all categories.
+            if (library.isEmpty()) return;
+
+            PageData playlistPage = fetchOffsetPages("/me/playlists");
+            PageData albumPage = fetchOffsetPages("/me/albums");
+            PageData likedPage = fetchFirstPage("/me/tracks");
+
+            List<LibraryEntry> freshPlaylists = new ArrayList<>();
+            List<Playlist> freshPlaylistOnly = new ArrayList<>();
+            Set<String> playlistIds = new HashSet<>();
+            for (JsonObject object : playlistPage.objects()) {
+                Playlist playlist = parsePlaylist(object);
+                if (playlist != null && playlistIds.add(playlist.id())) {
+                    updatePlaylistSnapshot(playlist.id(), str(object, "snapshot_id"));
+                    freshPlaylistOnly.add(playlist);
+                    freshPlaylists.add(asEntry(playlist));
+                }
+            }
+            // Keep manually configured playlist URLs that are not returned by /me/playlists.
+            Set<String> configuredExtras = new HashSet<>(SpotifyPanelMod.config.extraPlaylists);
+            for (LibraryEntry previous : library) {
+                if ("playlist".equals(previous.kind()) && configuredExtras.contains(previous.id())
+                        && playlistIds.add(previous.id())) {
+                    freshPlaylists.add(previous);
+                    freshPlaylistOnly.add(new Playlist(previous.id(), previous.name(), previous.owner(),
+                            previous.total(), previous.coverUrl(), previous.uri()));
+                }
+            }
+            playlistSnapshotIds.keySet().retainAll(playlistIds);
+            loadedPlaylistSnapshotIds.keySet().retainAll(playlistIds.stream()
+                    .map(id -> "playlist:" + id).collect(java.util.stream.Collectors.toSet()));
+
+            List<LibraryEntry> freshAlbums = new ArrayList<>();
+            Set<String> albumIds = new HashSet<>();
+            for (JsonObject wrapper : albumPage.objects()) {
+                LibraryEntry album = albumEntry(nested(wrapper, "album"));
+                if (album != null && albumIds.add(album.id())) freshAlbums.add(album);
+            }
+
+            List<Item> freshLikedHead = new ArrayList<>();
+            String likedCover = "";
+            for (JsonObject wrapper : likedPage.objects()) {
+                JsonObject track = nested(wrapper, "track");
+                Item parsed = parseTrackItem(track);
+                if (parsed != null) freshLikedHead.add(parsed);
+                if (likedCover.isEmpty() && track.has("album") && track.get("album").isJsonObject()) {
+                    likedCover = bestImage(track.getAsJsonObject("album"));
+                }
+            }
+
+            // Replace the cached first page while preserving deeper cached pages. This
+            // immediately reflects recent likes/unlikes without re-downloading hundreds
+            // of older tracks on every lightweight two-minute check; the full sync refreshes all pages.
+            String likedKey = "saved_tracks:liked";
+            List<Item> oldLiked = items.getOrDefault(likedKey, List.of());
+            int oldHeadSize = Math.min(50, oldLiked.size());
+            Set<String> newLikedUris = new HashSet<>();
+            List<Item> mergedLiked = new ArrayList<>(freshLikedHead);
+            for (Item item : freshLikedHead) newLikedUris.add(item.uri());
+            if (likedPage.total() > freshLikedHead.size()) {
+                for (int i = oldHeadSize; i < oldLiked.size(); i++) {
+                    Item old = oldLiked.get(i);
+                    if (old != null && old.uri() != null && newLikedUris.add(old.uri())) mergedLiked.add(old);
+                }
+            }
+            List<Item> immutableLiked = List.copyOf(mergedLiked);
+            items.put(likedKey, immutableLiked);
+            itemsTime.put(likedKey, System.currentTimeMillis());
+            refreshActiveLikedQueue(immutableLiked);
+
+            List<LibraryEntry> updatedLibrary = new ArrayList<>();
+            updatedLibrary.add(new LibraryEntry("liked", "Любимые треки", "Твоя медиатека",
+                    likedPage.total(), likedCover, "", "saved_tracks"));
+            updatedLibrary.addAll(freshPlaylists);
+            updatedLibrary.addAll(freshAlbums);
+            for (LibraryEntry old : library) {
+                if (!"playlist".equals(old.kind()) && !"album".equals(old.kind())
+                        && !"saved_tracks".equals(old.kind())) updatedLibrary.add(old);
+            }
+            updatedLibrary.sort((a, b) -> Integer.compare(libraryOrder(a.kind()), libraryOrder(b.kind())));
+            library = List.copyOf(updatedLibrary);
+            playlists = List.copyOf(freshPlaylistOnly);
+            lastCoreLibraryRefreshAtMs = System.currentTimeMillis();
+
+            // If the currently open playlist changed, refresh its visible rows immediately.
+            LibraryEntry selected = visibleSelection;
+            if (selected != null && "playlist".equals(selected.kind())) {
+                LibraryEntry currentEntry = updatedLibrary.stream()
+                        .filter(entry -> entry.key().equals(selected.key())).findFirst().orElse(null);
+                if (currentEntry != null) requestItemsAsync(currentEntry, false);
+            }
+        } catch (Exception e) {
+            // Keep the last good snapshot. The normal full refresh and API cooldown handle recovery.
+            LOG.debug("Core Spotify library refresh failed", e);
+        } finally {
+            coreLibraryLoading.set(false);
+        }
+    }
+
+    private void updatePlaylistSnapshot(String playlistId, String snapshotId) {
+        if (playlistId == null || playlistId.isEmpty() || snapshotId == null || snapshotId.isEmpty()) return;
+        String previous = playlistSnapshotIds.put(playlistId, snapshotId);
+        if (previous == null || !previous.equals(snapshotId)) {
+            itemsTime.remove("playlist:" + playlistId);
+            String itemPathPrefix = "GET /playlists/" + playlistId + "/items";
+            libraryHttpCache.keySet().removeIf(cacheKey -> cacheKey.startsWith(itemPathPrefix));
+        }
+    }
+
+    private void refreshActiveLikedQueue(List<Item> refreshedItems) {
+        LikedPlayback previous = likedPlayback;
+        if (previous == null || previous.sessionId() != likedSessionSequence.get()
+                || previous.index() < 0 || previous.index() >= previous.items().size()) return;
+        Item active = previous.items().get(previous.index());
+        String activeUri = active == null ? "" : active.uri();
+        if (activeUri.isEmpty()) return;
+
+        int newIndex = -1;
+        for (int i = 0; i < refreshedItems.size(); i++) {
+            if (activeUri.equals(refreshedItems.get(i).uri())) { newIndex = i; break; }
+        }
+        List<Item> queueItems = new ArrayList<>(refreshedItems);
+        if (newIndex < 0) {
+            // Keep a song that is already playing until it ends even if it was just unliked.
+            newIndex = Math.max(0, Math.min(previous.index(), queueItems.size()));
+            queueItems.add(newIndex, active);
+        }
+        LikedPlayback replacement = new LikedPlayback(List.copyOf(queueItems), newIndex, previous.sessionId());
+        synchronized (likedAdvanceLock) {
+            if (likedPlayback == previous && previous.sessionId() == likedSessionSequence.get()) {
+                likedPlayback = replacement;
+                cancelLikedAdvanceTaskLocked(); // the next poll reschedules against the new list
+            }
+        }
     }
 
     private PageData fetchFollowedArtists() throws Exception {
@@ -874,6 +1164,7 @@ public final class SpotifyClient {
             for (JsonObject obj : page.objects()) {
                 Playlist p = parsePlaylist(obj);
                 if (p != null && seen.add("playlist:" + p.id())) {
+                    updatePlaylistSnapshot(p.id(), str(obj, "snapshot_id"));
                     playlistOnly.add(p);
                     all.add(asEntry(p));
                 }
@@ -1023,7 +1314,11 @@ public final class SpotifyClient {
             Playlist p = null;
             try {
                 HttpResponse<String> r = send("GET", "/playlists/" + id, null);
-                if (r.statusCode() == 200) p = parsePlaylist(JsonParser.parseString(r.body()).getAsJsonObject());
+                if (r.statusCode() == 200) {
+                    JsonObject detail = JsonParser.parseString(r.body()).getAsJsonObject();
+                    p = parsePlaylist(detail);
+                    updatePlaylistSnapshot(id, str(detail, "snapshot_id"));
+                }
             } catch (Exception ignored) {}
             if (p == null) p = new Playlist(id, "Плейлист " + id.substring(0, Math.min(6, id.length())), "", 0, "", "spotify:playlist:" + id);
             playlistOnly.add(p);
@@ -1031,6 +1326,13 @@ public final class SpotifyClient {
         }
 
         playlists = List.copyOf(playlistOnly);
+        if (errors.stream().noneMatch(error -> error.startsWith("плейлисты:"))) {
+            Set<String> livePlaylistIds = new HashSet<>();
+            for (Playlist playlist : playlistOnly) livePlaylistIds.add(playlist.id());
+            playlistSnapshotIds.keySet().retainAll(livePlaylistIds);
+            loadedPlaylistSnapshotIds.keySet().retainAll(livePlaylistIds.stream()
+                    .map(id -> "playlist:" + id).collect(java.util.stream.Collectors.toSet()));
+        }
         String newError = errors.isEmpty() ? "" : "Часть медиатеки недоступна: " + String.join("; ", errors);
         if (!newError.equals(playlistsError)) {
             if (!newError.isEmpty()) LOG.warn("Spotify library partially unavailable: {}", newError);
@@ -1041,6 +1343,13 @@ public final class SpotifyClient {
         // playlists, albums, followed artists, podcasts, saved episodes and audiobooks.
         all.sort((a, b) -> Integer.compare(libraryOrder(a.kind()), libraryOrder(b.kind())));
         library = List.copyOf(all);
+        lastCoreLibraryRefreshAtMs = System.currentTimeMillis();
+        LibraryEntry activeSelection = visibleSelection;
+        if (activeSelection != null && "playlist".equals(activeSelection.kind())) {
+            LibraryEntry currentEntry = all.stream()
+                    .filter(entry -> entry.key().equals(activeSelection.key())).findFirst().orElse(null);
+            if (currentEntry != null) requestItemsAsync(currentEntry, false);
+        }
         if (!all.isEmpty() || errors.isEmpty()) {
             if (previousLibrary.isEmpty() || previousLibrary.size() != all.size()
                     || !previousLibrary.stream().map(LibraryEntry::key).toList().equals(all.stream().map(LibraryEntry::key).toList())) {
@@ -1100,8 +1409,21 @@ public final class SpotifyClient {
         long now = System.currentTimeMillis();
         Long cachedAt = itemsTime.get(key);
         List<Item> cached = items.get(key);
-        if (!force && cached != null && cachedAt != null && now - cachedAt < 60_000) {
-            return CompletableFuture.completedFuture(cached);
+        if (cached != null) {
+            if ("album".equals(entry.kind())) {
+                // Album tracklists are immutable; keep them cached for the entire session.
+                return CompletableFuture.completedFuture(cached);
+            }
+            if ("playlist".equals(entry.kind())) {
+                String currentSnapshot = playlistSnapshotIds.getOrDefault(entry.id(), "");
+                String loadedSnapshot = loadedPlaylistSnapshotIds.getOrDefault(key, "");
+                if (!currentSnapshot.isEmpty() && currentSnapshot.equals(loadedSnapshot)) {
+                    return CompletableFuture.completedFuture(cached);
+                }
+            }
+            if (!force && cachedAt != null && now - cachedAt < PLAYLIST_ITEMS_REFRESH_INTERVAL_MS) {
+                return CompletableFuture.completedFuture(cached);
+            }
         }
 
         AtomicBoolean shouldStart = new AtomicBoolean(false);
@@ -1128,6 +1450,8 @@ public final class SpotifyClient {
 
     private void loadItems(LibraryEntry entry, String key) throws Exception {
         List<Item> out = new ArrayList<>();
+        String playlistSnapshotAtStart = "playlist".equals(entry.kind())
+                ? playlistSnapshotIds.getOrDefault(entry.id(), "") : "";
         int offset = 0;
         boolean failed = false;
         while (offset < 1000) {
@@ -1191,6 +1515,19 @@ public final class SpotifyClient {
             items.put(key, List.copyOf(out));
             itemErrors.remove(key);
             itemsTime.put(key, System.currentTimeMillis());
+            if ("playlist".equals(entry.kind())) {
+                String snapshotNow = playlistSnapshotIds.getOrDefault(entry.id(), "");
+                if (playlistSnapshotAtStart.equals(snapshotNow) && !playlistSnapshotAtStart.isEmpty()) {
+                    loadedPlaylistSnapshotIds.put(key, playlistSnapshotAtStart);
+                } else if (!playlistSnapshotAtStart.equals(snapshotNow)) {
+                    // The playlist changed while its pages were loading. Do not bless
+                    // this potentially mixed-version result as current; retry once the
+                    // in-flight load has been removed from itemLoads.
+                    loadedPlaylistSnapshotIds.remove(key);
+                    itemsTime.remove(key);
+                    exec.schedule(() -> requestItemsAsync(entry, true), 250, TimeUnit.MILLISECONDS);
+                }
+            }
         } else if (!out.isEmpty()) {
             // Keep successfully fetched pages visible, but retain the API error and do not
             // mark the incomplete result as a fresh cache entry.
@@ -1316,6 +1653,7 @@ public final class SpotifyClient {
             likedPlayback = new LikedPlayback(queue.items(), index, queue.sessionId());
             cancelLikedAdvanceTaskLocked();
         }
+        setOptimisticTrack(item);
         playTrackFromAlbum(item, err, intentId);
     }
 
