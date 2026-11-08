@@ -61,7 +61,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -185,7 +185,7 @@ public final class WorldPanel {
             case "icon_song_title" -> new int[]{0xFF172019, 0xFF3D5144};
             case "time_of_the_played_song" -> new int[]{0xFF17231B, 0xFF3D6047};
             case "reduction_of_sound_amplification" -> new int[]{0xFF17231B, 0xFF3D6047};
-            case "search_corpus" -> new int[]{0xFF101A13, 0xFF42604A};
+            case "search_corpus" -> new int[]{0xFF080C09, 0xFF26332B};
             case "search" -> new int[]{0xFF1B2B21, 0xFF54765E};
             default -> new int[]{0xFF172019, 0xFF344238};
         };
@@ -654,7 +654,7 @@ public final class WorldPanel {
         g.drawOval(iconX, iconY - 5, 13, 13);
         g.drawLine(iconX + 11, iconY + 7, iconX + 19, iconY + 15);
 
-        String shown = searchText.isEmpty() ? "Поиск треков Spotify…" : searchText;
+        String shown = searchText.isEmpty() ? "Поиск треков" : searchText;
         int textX = x0 + 47;
         int baseline = y0 + (y1 - y0) / 2 + 8;
         g.setFont(new Font(Font.SANS_SERIF, searchText.isEmpty() ? Font.PLAIN : Font.BOLD, 22));
@@ -1068,37 +1068,39 @@ public final class WorldPanel {
         int leftCover = px(-10.4), leftY = y0 + 12;
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
         drawCover(g, cover, 48, leftCover, leftY, 50);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
+        int center = (px(-3.0) + px(3.0)) / 2;
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 17));
         g.setColor(Color.WHITE);
         String bottomTitle = s.track() == null ? "Spotify" : s.track().title();
-        drawReadableText(g, fit(g, bottomTitle, 190), leftCover + 58, leftY + 22, Color.WHITE);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+        int trackTextX = leftCover + 58;
+        int trackTextMax = Math.max(120, Math.min(190, center - 60 - trackTextX));
+        drawReadableText(g, fit(g, bottomTitle, trackTextMax), trackTextX, leftY + 22, Color.WHITE);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
         g.setColor(new Color(242, 245, 242));
         String bottomArtist = s.track() == null ? "Подключи аккаунт" : s.track().artists();
-        drawReadableText(g, fit(g, bottomArtist, 190), leftCover + 58, leftY + 43, new Color(238, 242, 239));
+        drawReadableText(g, fit(g, bottomArtist, trackTextMax), trackTextX, leftY + 43, new Color(238, 242, 239));
 
-        int center = (px(-3.7) + px(3.7)) / 2;
         g.setColor(new Color(177, 194, 182));
-        drawPrevious(g, center - 43, y0 + 27);
+        drawPrevious(g, center - 31, y0 + 25);
         g.setColor(new Color(30, 215, 96));
-        fillPixelButton(g, center - 13, y0 + 8, 34, 34);
+        fillPixelButton(g, center - 11, y0 + 14, 22, 22);
         g.setColor(new Color(4, 16, 8));
         if (s.playing()) {
-            g.fillRect(center - 4, y0 + 17, 5, 17);
-            g.fillRect(center + 5, y0 + 17, 5, 17);
+            g.fillRect(center - 4, y0 + 19, 3, 12);
+            g.fillRect(center + 2, y0 + 19, 3, 12);
         } else {
-            g.fillPolygon(new Polygon(new int[]{center - 3, center - 3, center + 11},
-                    new int[]{y0 + 16, y0 + 33, y0 + 24}, 3));
+            g.fillPolygon(new Polygon(new int[]{center - 4, center - 4, center + 7},
+                    new int[]{y0 + 18, y0 + 32, y0 + 25}, 3));
         }
         g.setColor(new Color(177, 194, 182));
-        drawNext(g, center + 45, y0 + 27);
+        drawNext(g, center + 31, y0 + 25);
 
         long duration = s.track() == null ? 0 : Math.max(0, s.track().durationMs());
         long visualProgress = progressVisualInitialized
                 ? Math.round(displayedProgressMs) : s.currentProgress();
         long progress = duration == 0 ? 0 : Math.max(0, Math.min(duration, visualProgress));
         double fraction = duration == 0 ? 0 : progress / (double) duration;
-        int barX = px(-3.7), barRight = px(3.7), barY = y1 - 12;
+        int barX = px(-3.0), barRight = px(3.0), barY = y1 - 12;
         g.setColor(new Color(103, 122, 109, 170));
         g.fillRect(barX, barY, barRight - barX, 4);
         g.setColor(new Color(30, 215, 96));
@@ -1110,21 +1112,19 @@ public final class WorldPanel {
         drawUiText(g, total, barRight - g.getFontMetrics().stringWidth(total), barY - 5, g.getColor());
 
         int volX = px(4.0), volR = px(10.6);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
-        g.setColor(new Color(248, 250, 248));
-        drawReadableText(g, "ГРОМКОСТЬ", volX + 8, y0 + 21, new Color(250, 252, 250));
-        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         int visualVolume = (int) Math.round(Math.max(0.0, Math.min(100.0,
                 volumeVisualInitialized ? displayedVolume : s.volume())));
-        drawReadableText(g, visualVolume + "%", volR - 33, y0 + 21, Color.WHITE);
+        drawVolumeIcon(g, volX + 8, y0 + 11, visualVolume);
+        g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 15));
+        g.setColor(Color.WHITE);
+        String volumeLabel = visualVolume + "%";
+        drawReadableText(g, volumeLabel, volR - 8 - g.getFontMetrics().stringWidth(volumeLabel),
+                y0 + 22, Color.WHITE);
         int vBarX = volX + 8, vBarR = volR - 8, vBarY = y0 + 34;
         g.setColor(new Color(75, 94, 81));
-        g.fillRect(vBarX, vBarY, vBarR - vBarX, 5);
+        g.fillRect(vBarX, vBarY, vBarR - vBarX, 6);
         g.setColor(new Color(30, 215, 96));
-        g.fillRect(vBarX, vBarY, (int) ((vBarR - vBarX) * visualVolume / 100.0), 5);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-        g.setColor(new Color(165, 184, 171));
-        drawReadableText(g, "Зажми ЛКМ и тяни ползунок", vBarX, y0 + 57, new Color(235, 242, 237));
+        g.fillRect(vBarX, vBarY, (int) ((vBarR - vBarX) * visualVolume / 100.0), 6);
     }
 
     // -------------------------------------------------------------------- model geometry
@@ -1264,7 +1264,7 @@ public final class WorldPanel {
         SpotifyClient client = SpotifyPanelMod.spotify;
 
         int bottomTop = py(2.3), bottomBottom = py(0.2);
-        int progressX0 = px(-3.7), progressX1 = px(3.7), progressY = bottomBottom - 12;
+        int progressX0 = px(-3.0), progressX1 = px(3.0), progressY = bottomBottom - 12;
         int volumeX0 = px(4.0) + 8, volumeX1 = px(10.6) - 8, volumeY = bottomTop + 34;
 
         // Update the visual thumb on each frame. Seeking is committed only on release;
@@ -1370,10 +1370,10 @@ public final class WorldPanel {
 
         // Bottom transport controls (progress and volume are handled by drag above).
         if (ty >= bottomTop && ty <= bottomBottom) {
-            int center = (px(-3.7) + px(3.7)) / 2;
-            if (ty <= bottomTop + 46 && tx >= center - 70 && tx <= center + 70) {
-                if (tx < center - 22) client.previous(SpotifyPanelMod::say);
-                else if (tx > center + 25) client.next(SpotifyPanelMod::say);
+            int center = (px(-3.0) + px(3.0)) / 2;
+            if (ty <= bottomTop + 46 && tx >= center - 48 && tx <= center + 48) {
+                if (tx < center - 13) client.previous(SpotifyPanelMod::say);
+                else if (tx > center + 13) client.next(SpotifyPanelMod::say);
                 else client.togglePlay(SpotifyPanelMod::say);
                 wasLeftDown = down;
                 return;
@@ -1396,7 +1396,7 @@ public final class WorldPanel {
             SpotifyClient.Snapshot snapshot = client.snapshot();
             SpotifyClient.Track track = snapshot.track();
             if (track == null || track.durationMs() <= 0) return;
-            int x0 = px(-3.7), x1 = px(3.7);
+            int x0 = px(-3.0), x1 = px(3.0);
             double fraction = Math.max(0.0, Math.min(1.0, (textureX - x0) / (double) (x1 - x0)));
             long target = Math.max(0, Math.min(track.durationMs(), Math.round(track.durationMs() * fraction)));
             if (target != lastDragSeekMs) {
@@ -1574,13 +1574,27 @@ public final class WorldPanel {
     }
 
     private static void drawPrevious(Graphics2D g, int x, int y) {
-        g.fillRect(x - 8, y - 10, 3, 20);
-        g.fillPolygon(new Polygon(new int[]{x + 8, x + 8, x - 6}, new int[]{y - 10, y + 10, y}, 3));
+        g.fillRect(x - 6, y - 7, 2, 14);
+        g.fillPolygon(new Polygon(new int[]{x + 6, x + 6, x - 4}, new int[]{y - 7, y + 7, y}, 3));
     }
 
     private static void drawNext(Graphics2D g, int x, int y) {
-        g.fillRect(x + 5, y - 10, 3, 20);
-        g.fillPolygon(new Polygon(new int[]{x - 8, x - 8, x + 6}, new int[]{y - 10, y + 10, y}, 3));
+        g.fillRect(x + 4, y - 7, 2, 14);
+        g.fillPolygon(new Polygon(new int[]{x - 6, x - 6, x + 4}, new int[]{y - 7, y + 7, y}, 3));
+    }
+
+    private static void drawVolumeIcon(Graphics2D g, int x, int y, int volume) {
+        g.setColor(new Color(242, 247, 243));
+        g.fillPolygon(new Polygon(
+                new int[]{x, x + 5, x + 12, x + 12, x + 5, x},
+                new int[]{y + 5, y + 5, y, y + 16, y + 11, y + 11}, 6));
+        if (volume > 0) {
+            java.awt.Stroke oldStroke = g.getStroke();
+            g.setStroke(new BasicStroke(1.6f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g.drawArc(x + 7, y + 2, 12, 12, -55, 110);
+            if (volume >= 35) g.drawArc(x + 7, y - 2, 20, 20, -55, 110);
+            g.setStroke(oldStroke);
+        }
     }
 
     private static String formatTime(long ms) {

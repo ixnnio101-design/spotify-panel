@@ -151,3 +151,21 @@ Liked Songs natural-transition recovery (8 Nov 2026)
 - The mod now distinguishes a natural end (the previous favorite was at the end of its duration) from an external track selection. Natural transitions are corrected to the next saved favorite; manual Spotify selections still relinquish the temporary favorites queue without being overridden.
 - If Spotify naturally advances to exactly the next saved favorite, the queue index is adopted without sending a redundant play command. Repeat Context and end-of-list pause behavior are preserved.
 - Gradle was not run.
+
+
+Search housing appearance and placeholder (8 Nov 2026)
+- Changed the wide `search_corpus` backing to the same near-black front and dark-edge palette as `corpus_of_songs`.
+- Kept the separate `search` input housing and its existing green-toned styling unchanged.
+- Simplified the empty search-field placeholder from “Поиск треков Spotify…” to “Поиск треков”.
+- No search behavior, geometry, Spotify API, playback, or library synchronization was changed.
+- Gradle was not run.
+
+
+Compact bottom playback panel (8 Nov 2026)
+- Reduced the center transport controls: previous/next glyphs and play/pause button are smaller and more restrained.
+- Narrowed the playback timeline and moved its seek hitbox to the new visible bar bounds.
+- Reduced bottom-panel track title and artist font sizes slightly, keeping a strict width limit so long names cannot overlap the transport buttons.
+- Replaced the “ГРОМКОСТЬ” heading with a hand-drawn speaker icon and made the numeric volume percentage larger, bold and bright.
+- Removed the “Зажми ЛКМ и тяни ползунок” hint; kept the volume bar and drag interaction.
+- Updated transport click zones to match the smaller buttons. No Spotify playback/API logic was changed.
+- Gradle was not run.
