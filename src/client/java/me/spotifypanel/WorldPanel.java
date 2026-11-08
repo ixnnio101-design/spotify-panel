@@ -33,6 +33,7 @@ import java.awt.RenderingHints;
 import java.awt.geom.Path2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import javax.imageio.ImageIO;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
@@ -62,7 +63,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -78,6 +79,13 @@ public final class WorldPanel {
     // Rendering happens on the client render thread, so these buffers are not shared concurrently.
     private static final BufferedImage OVERLAY_IMAGE = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
     private static final Map<Integer, BufferedImage> COVER_IMAGE_BUFFERS = new HashMap<>();
+    // Tiny 32x32 pixel-art volume sprites are scaled with nearest-neighbour filtering.
+    private static final BufferedImage VOLUME_ICON_MUTED = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_muted.png");
+    private static final BufferedImage VOLUME_ICON_LOW = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_low.png");
+    private static final BufferedImage VOLUME_ICON_HIGH = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_high.png");
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
     private static boolean wasLeftDown;
@@ -1120,7 +1128,7 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        drawVolumeIcon(g, volumeBarX - 26, volumeCenterY - 9, visualVolume);
+        drawVolumeIcon(g, volumeBarX - 36, volumeCenterY - 12, visualVolume);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1593,8 +1601,8 @@ public final class WorldPanel {
     }
 
     private static int volumeSliderX0() {
-        // Leave a clear gap after the smaller speaker icon.
-        return volumeGroupLeft() + 26;
+        // Keep the pixel-art speaker visibly separated from the slider track.
+        return volumeGroupLeft() + 36;
     }
 
     private static int volumeSliderX1() {
@@ -1605,31 +1613,31 @@ public final class WorldPanel {
         return (py(2.3) + py(0.2)) / 2;
     }
 
-    private static void drawVolumeIcon(Graphics2D g, int x, int y, int volume) {
-        Color oldColor = g.getColor();
-        java.awt.Stroke oldStroke = g.getStroke();
-        g.setColor(new Color(224, 232, 226));
-
-        // Low-poly take on the previous speaker icon: a faceted body and angular sound waves.
-        g.fillPolygon(new Polygon(
-                new int[]{x, x + 5, x + 13, x + 13, x + 5, x},
-                new int[]{y + 6, y + 6, y, y + 18, y + 12, y + 12}, 6));
-
-        if (volume > 0) {
-            g.setStroke(new BasicStroke(1.9f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER));
-            // Small angular wave, then a wider one for stronger volume.
-            g.drawPolyline(
-                    new int[]{x + 16, x + 19, x + 16},
-                    new int[]{y + 4, y + 9, y + 14}, 3);
-            if (volume >= 45) {
-                g.drawPolyline(
-                        new int[]{x + 18, x + 23, x + 18},
-                        new int[]{y, y + 9, y + 18}, 3);
+    private static BufferedImage loadVolumeIcon(String resource) {
+        try (InputStream in = WorldPanel.class.getResourceAsStream(resource)) {
+            if (in == null) throw new IllegalStateException("Missing volume icon: " + resource);
+            BufferedImage image = ImageIO.read(in);
+            if (image == null || image.getWidth() != 32 || image.getHeight() != 32) {
+                throw new IllegalStateException("Volume icon must be a 32x32 PNG: " + resource);
             }
+            return image;
+        } catch (Exception e) {
+            System.err.println("[SpotifyPanel] Could not load volume icon " + resource + ": " + e.getMessage());
+            return null;
         }
+    }
 
-        g.setStroke(oldStroke);
-        g.setColor(oldColor);
+    private static void drawVolumeIcon(Graphics2D g, int x, int y, int volume) {
+        BufferedImage icon = volume <= 0 ? VOLUME_ICON_MUTED
+                : volume < 45 ? VOLUME_ICON_LOW : VOLUME_ICON_HIGH;
+        if (icon == null) return;
+
+        Object previousInterpolation = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+        g.drawImage(icon, x, y, 24, 24, null);
+        if (previousInterpolation != null) {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, previousInterpolation);
+        }
     }
 
     private static String formatTime(long ms) {
