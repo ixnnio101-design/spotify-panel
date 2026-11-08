@@ -169,3 +169,11 @@ Compact bottom playback panel (8 Nov 2026)
 - Removed the “Зажми ЛКМ и тяни ползунок” hint; kept the volume bar and drag interaction.
 - Updated transport click zones to match the smaller buttons. No Spotify playback/API logic was changed.
 - Gradle was not run.
+
+Bottom player volume and transport refinement (8 Nov 2026)
+- Slightly enlarged the previous/next glyphs and the central play/pause button, with matching click hitboxes.
+- Removed the numeric volume percentage from the bottom player.
+- Reworked the volume area into a compact, centered speaker-and-slider row; the speaker is vertically centered and the slider is shorter and thinner.
+- Preserved click-and-drag volume adjustment and remapped its hitbox/value mapping to the new slider coordinates.
+- No Spotify playback, API, search, library, or queue behavior was changed.
+- Gradle was not run.
