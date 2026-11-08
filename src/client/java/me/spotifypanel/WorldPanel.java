@@ -62,7 +62,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -1120,7 +1120,7 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        drawVolumeIcon(g, volumeBarX - 26, volumeCenterY - 7, visualVolume);
+        drawVolumeIcon(g, volumeBarX - 26, volumeCenterY - 9, visualVolume);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1610,26 +1610,22 @@ public final class WorldPanel {
         java.awt.Stroke oldStroke = g.getStroke();
         g.setColor(new Color(224, 232, 226));
 
-        // A compact, smooth speaker symbol, vertically centered with the slider.
-        Path2D.Float speaker = new Path2D.Float();
-        speaker.moveTo(x, y + 5);
-        speaker.lineTo(x + 4, y + 5);
-        speaker.lineTo(x + 10, y + 1);
-        speaker.lineTo(x + 10, y + 13);
-        speaker.lineTo(x + 4, y + 9);
-        speaker.lineTo(x, y + 9);
-        speaker.closePath();
-        g.fill(speaker);
+        // Low-poly take on the previous speaker icon: a faceted body and angular sound waves.
+        g.fillPolygon(new Polygon(
+                new int[]{x, x + 5, x + 13, x + 13, x + 5, x},
+                new int[]{y + 6, y + 6, y, y + 18, y + 12, y + 12}, 6));
 
-        g.setStroke(new BasicStroke(1.6f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
         if (volume > 0) {
-            Path2D.Float wave = new Path2D.Float();
-            wave.moveTo(x + 12, y + 3);
-            wave.quadTo(x + 17, y + 7, x + 12, y + 11);
-            g.draw(wave);
-        } else {
-            g.drawLine(x + 12, y + 3, x + 17, y + 11);
-            g.drawLine(x + 17, y + 3, x + 12, y + 11);
+            g.setStroke(new BasicStroke(1.9f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER));
+            // Small angular wave, then a wider one for stronger volume.
+            g.drawPolyline(
+                    new int[]{x + 16, x + 19, x + 16},
+                    new int[]{y + 4, y + 9, y + 14}, 3);
+            if (volume >= 45) {
+                g.drawPolyline(
+                        new int[]{x + 18, x + 23, x + 18},
+                        new int[]{y, y + 9, y + 18}, 3);
+            }
         }
 
         g.setStroke(oldStroke);
