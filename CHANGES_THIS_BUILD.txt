@@ -134,3 +134,13 @@ Adaptive library synchronization (7 Nov 2026)
 - Unchanged playlist tracklists remain cached by snapshot ID; album tracklists remain cached because album track order/content is immutable. The selected playlist content is checked at most every two minutes when no usable snapshot ID is supplied.
 - The latest 50 liked tracks, saved playlists and saved albums are checked on the two-minute cadence. Deeper saved-track pages are reconciled by the full library sync every 30 minutes, and that full sync is deferred while the panel is hidden.
 - Kept the normal two-second playback-state polling separate from library synchronization. Gradle was not run.
+
+
+Blockbench model update — 8 November 2026
+
+- Replaced the active panel model with the supplied `model (3).bbmodel` (15 elements).
+- Preserved the wide `search_corpus` backing and the new centered `search` housing.
+- Matched the live search text field and click target to the new, narrower `search` element.
+- Updated the vertical model/overlay bounds from 14.4 to 14 units and kept the same physical scale per Blockbench unit.
+- Added a dedicated material palette entry for the new `search` element.
+- No Spotify API, playback, adaptive-sync, or library behavior was changed.

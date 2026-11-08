@@ -51,17 +51,18 @@ public final class WorldPanel {
 
     private static final int TEX_W = 768;
     private static final int TEX_H = 500;
-    // The new Blockbench model spans 22 x 14.4 units. Preserve the previous world
-    // scale per model unit so the existing typography stays the same physical size.
+    // The updated Blockbench model spans 22 x 14 units. Keep the same world scale
+    // per model unit as the previous model so the interface does not change physical size.
     private static final double MODEL_WIDTH = 1.82 * 22.0 / 20.0;
-    private static final double MODEL_HEIGHT = 1.20 * 14.4 / 13.0;
-    // Preserve the Blockbench model's proportions: its X coordinate is depth in the world.
+    // Previous Y scale was 1.20 / 13.0 world units per Blockbench unit.
+    // The new 14-unit body is therefore slightly shorter, matching the supplied geometry.
     // The model is intentionally a thin, layered plane, not a set of extruded boxes.
     private static final double MODEL_Z_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
-    private static final double MODEL_Y_SCALE = MODEL_HEIGHT / 14.4;
-    private static final double MODEL_OVERLAY_X = -0.28;
-    private static final double MODEL_CENTER_Y = 7.2;
+    private static final double MODEL_Y_SCALE = 1.20 / 13.0;
+    private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
+    private static final double MODEL_OVERLAY_X = -0.82;
+    private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
     // It is not camera-relative and is not rendered as a child/attachment of the player.
@@ -185,6 +186,7 @@ public final class WorldPanel {
             case "time_of_the_played_song" -> new int[]{0xFF17231B, 0xFF3D6047};
             case "reduction_of_sound_amplification" -> new int[]{0xFF17231B, 0xFF3D6047};
             case "search_corpus" -> new int[]{0xFF101A13, 0xFF42604A};
+            case "search" -> new int[]{0xFF1B2B21, 0xFF54765E};
             default -> new int[]{0xFF172019, 0xFF344238};
         };
     }
@@ -305,7 +307,7 @@ public final class WorldPanel {
         matrices.translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
         Matrix4f matrix = matrices.peek().getPositionMatrix();
 
-        // Render the 14 Blockbench elements as thin, world-space planes. Their small X offsets
+        // Render the 15 Blockbench elements as thin, world-space planes. Their small X offsets
         // are preserved as subtle layer separation, but no thickness or side faces are invented.
         VertexConsumer material = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(MATERIAL_TEXTURE_ID));
         for (ModelPart part : MODEL_PARTS) {
@@ -636,8 +638,10 @@ public final class WorldPanel {
     }
 
     private static void paintSearchBar(Graphics2D g) {
-        int x0 = px(-4.35), x1 = px(4.35);
-        int y0 = py(14.22), y1 = py(12.88);
+        // The new model adds a dedicated centered "search" element inside
+        // the full-width search_corpus. Keep the editable overlay inside that housing.
+        int x0 = px(-3.85), x1 = px(3.85);
+        int y0 = py(13.78), y1 = py(12.92);
         g.setColor(new Color(5, 10, 7, 248));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0,
@@ -1181,8 +1185,8 @@ public final class WorldPanel {
         MatrixStack.Entry entry = matrices.peek();
         Vec3d p0 = modelPoint(MODEL_OVERLAY_X, 0, -11, cx, cy, cz, wx, wz, nx, nz);
         Vec3d p1 = modelPoint(MODEL_OVERLAY_X, 0, 11, cx, cy, cz, wx, wz, nx, nz);
-        Vec3d p2 = modelPoint(MODEL_OVERLAY_X, 14.4, 11, cx, cy, cz, wx, wz, nx, nz);
-        Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 14.4, -11, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p2 = modelPoint(MODEL_OVERLAY_X, 14.0, 11, cx, cy, cz, wx, wz, nx, nz);
+        Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 14.0, -11, cx, cy, cz, wx, wz, nx, nz);
         // The overlay is offset forward from the model surfaces and emitted once,
         // avoiding coplanar alpha blending and the resulting sparkle/flicker.
         overlayVertex(vc, entry, p0, 0, 1, nx, nz);
@@ -1313,10 +1317,10 @@ public final class WorldPanel {
             return;
         }
 
-        // The new Blockbench search_corpus occupies the centered top strip.
-        if (tx >= px(-4.5) && tx <= px(4.5) && ty >= py(14.3) && ty <= py(12.8)) {
+        // The new dedicated Blockbench search element defines the centered input housing.
+        if (tx >= px(-4.0) && tx <= px(4.0) && ty >= py(13.9) && ty <= py(12.85)) {
             searchFocused = true;
-            if (tx >= px(3.65)) setSearchText("");
+            if (tx >= px(3.35)) setSearchText("");
             wasLeftDown = down;
             return;
         }
@@ -1552,7 +1556,7 @@ public final class WorldPanel {
     }
 
     private static int py(double modelY) {
-        return (int) Math.round((14.4 - modelY) / 14.4 * TEX_H);
+        return (int) Math.round((14.0 - modelY) / 14.0 * TEX_H);
     }
 
     private static String safe(String value, String fallback) {
