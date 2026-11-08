@@ -338,10 +338,19 @@ public final class SpotifyClient {
             }
             JsonObject track = liveItem.getAsJsonObject();
             String liveUri = str(track, "uri");
+            String repeat = str(root, "repeat_state");
+            if (repeat.isEmpty()) repeat = "off";
             if (!expectedUri.equals(liveUri)) {
-                // The user changed the track in Spotify itself. Drop our queue quietly;
-                // do not try to pull playback back into the favorites list.
-                endLikedSession(queue);
+                // A natural album-context transition can win the race against our
+                // pre-end timer. Only recover when the previous snapshot proves that
+                // the expected favorite had reached its end; otherwise this is an
+                // external Spotify selection and the favorites queue must stand down.
+                Snapshot previous = snapshot;
+                if (wasAtNaturalTrackEnd(previous, expectedUri)) {
+                    handleNaturalLikedTrackChange(queue, liveUri, repeat);
+                } else {
+                    endLikedSession(queue);
+                }
                 return;
             }
             if (!bool(root, "is_playing")) return;
@@ -349,8 +358,6 @@ public final class SpotifyClient {
             long duration = lng(track, "duration_ms");
             long progress = lng(root, "progress_ms");
             long remainingMs = Math.max(0L, duration - progress);
-            String repeat = str(root, "repeat_state");
-            if (repeat.isEmpty()) repeat = "off";
             if ("track".equals(repeat)) return;
 
             if (remainingMs > LIKED_ADVANCE_RECHECK_MS) {
@@ -375,7 +382,45 @@ public final class SpotifyClient {
         }
     }
 
-    /** A track change not requested by this panel ends the temporary Liked Songs queue. */
+    /** True only when the previous favorite was effectively at its natural end. */
+    private boolean wasAtNaturalTrackEnd(Snapshot previous, String expectedUri) {
+        if (previous == null || !previous.playing() || previous.track() == null
+                || previous.track().durationMs() <= 0 || expectedUri == null
+                || !expectedUri.equals(previous.track().uri())) return false;
+        // Polling runs every two seconds. A 2.5s window covers the last poll before
+        // Spotify's own album-context transition without treating normal track picks
+        // as end-of-track events in the usual case.
+        return previous.currentProgress() >= Math.max(0L, previous.track().durationMs() - 2_500L);
+    }
+
+    /** Keep the favorites queue when Spotify naturally advances its album context. */
+    private void handleNaturalLikedTrackChange(LikedPlayback queue, String liveUri, String repeat) {
+        if (queue == null || likedPlayback != queue || queue.sessionId() != likedSessionSequence.get()) return;
+        int nextIndex = queue.index() + 1;
+        if (nextIndex < queue.items().size()) {
+            String nextUri = queue.items().get(nextIndex).uri();
+            if (nextUri != null && nextUri.equals(liveUri)) {
+                // Spotify happened to choose exactly the next favorite. Adopt that
+                // position instead of sending a redundant play command.
+                synchronized (likedAdvanceLock) {
+                    if (likedPlayback == queue && queue.sessionId() == likedSessionSequence.get()) {
+                        likedPlayback = new LikedPlayback(queue.items(), nextIndex, queue.sessionId());
+                        cancelLikedAdvanceTaskLocked();
+                    }
+                }
+            } else {
+                // Spotify continued to another album track; correct it to the next
+                // favorite, but only because the previous favorite naturally ended.
+                playLikedItem(queue, nextIndex, ignored -> {});
+            }
+        } else if ("context".equals(repeat)) {
+            playLikedItem(queue, 0, ignored -> {});
+        } else {
+            pauseLikedQueue(queue, ignored -> {});
+        }
+    }
+
+    /** Manual Spotify track changes end the temporary queue; natural endings do not. */
     private void releaseLikedQueueOnExternalTrackChange(Snapshot previous, Snapshot current) {
         LikedPlayback queue = likedPlayback;
         if (queue == null || queue.sessionId() != likedSessionSequence.get()
@@ -386,7 +431,11 @@ public final class SpotifyClient {
         if (expectedUri.equals(current.track().uri())) return; // the panel's requested next favorite started
         if (System.currentTimeMillis() < optimisticTrackUntilMs
                 && expectedUri.equals(optimisticTrackUri)) return; // our play command is still pending
-        endLikedSession(queue); // external Spotify selection: relinquish control, do not intercept
+        if (wasAtNaturalTrackEnd(previous, expectedUri)) {
+            handleNaturalLikedTrackChange(queue, current.track().uri(), current.repeat());
+            return;
+        }
+        endLikedSession(queue); // manual/external Spotify selection: relinquish control
     }
 
     private void pauseLikedQueue(LikedPlayback queue, Consumer<String> err) {

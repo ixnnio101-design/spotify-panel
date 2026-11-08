@@ -144,3 +144,10 @@ Blockbench model update — 8 November 2026
 - Updated the vertical model/overlay bounds from 14.4 to 14 units and kept the same physical scale per Blockbench unit.
 - Added a dedicated material palette entry for the new `search` element.
 - No Spotify API, playback, adaptive-sync, or library behavior was changed.
+
+
+Liked Songs natural-transition recovery (8 Nov 2026)
+- Fixed a race where Spotify's album-context player could advance to another album track just before the scheduled favorites command, causing the mod to mistake a natural track ending for a manual Spotify selection and abandon the Liked Songs queue.
+- The mod now distinguishes a natural end (the previous favorite was at the end of its duration) from an external track selection. Natural transitions are corrected to the next saved favorite; manual Spotify selections still relinquish the temporary favorites queue without being overridden.
+- If Spotify naturally advances to exactly the next saved favorite, the queue index is adopted without sending a redundant play command. Repeat Context and end-of-list pause behavior are preserved.
+- Gradle was not run.
