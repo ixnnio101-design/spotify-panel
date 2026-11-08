@@ -30,6 +30,7 @@ import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.RenderingHints;
+import java.awt.geom.Path2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.io.InputStream;
@@ -61,7 +62,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -1119,7 +1120,7 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        drawVolumeIcon(g, volumeBarX - 27, volumeCenterY - 9, visualVolume);
+        drawVolumeIcon(g, volumeBarX - 26, volumeCenterY - 7, visualVolume);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1584,16 +1585,20 @@ public final class WorldPanel {
         g.fillPolygon(new Polygon(new int[]{x - 7, x - 7, x + 5}, new int[]{y - 8, y + 8, y}, 3));
     }
 
+    private static int volumeGroupLeft() {
+        // Center the whole control directly below the right-hand "Now Playing" panel.
+        int panelLeft = px(5.4), panelRight = px(10.8);
+        int groupWidth = 146;
+        return (panelLeft + panelRight - groupWidth) / 2;
+    }
+
     private static int volumeSliderX0() {
-        int sectionLeft = px(4.0), sectionRight = px(10.6);
-        int groupLeft = (sectionLeft + sectionRight - 150) / 2;
-        return groupLeft + 28;
+        // Leave a clear gap after the smaller speaker icon.
+        return volumeGroupLeft() + 26;
     }
 
     private static int volumeSliderX1() {
-        int sectionLeft = px(4.0), sectionRight = px(10.6);
-        int groupLeft = (sectionLeft + sectionRight - 150) / 2;
-        return groupLeft + 150;
+        return volumeGroupLeft() + 146;
     }
 
     private static int volumeSliderY() {
@@ -1604,15 +1609,29 @@ public final class WorldPanel {
         Color oldColor = g.getColor();
         java.awt.Stroke oldStroke = g.getStroke();
         g.setColor(new Color(224, 232, 226));
-        // A small, clean speaker glyph with rounded sound waves, centered on the slider.
-        g.fillPolygon(new Polygon(
-                new int[]{x, x + 5, x + 12, x + 12, x + 5, x},
-                new int[]{y + 5, y + 5, y, y + 18, y + 13, y + 13}, 6));
+
+        // A compact, smooth speaker symbol, vertically centered with the slider.
+        Path2D.Float speaker = new Path2D.Float();
+        speaker.moveTo(x, y + 5);
+        speaker.lineTo(x + 4, y + 5);
+        speaker.lineTo(x + 10, y + 1);
+        speaker.lineTo(x + 10, y + 13);
+        speaker.lineTo(x + 4, y + 9);
+        speaker.lineTo(x, y + 9);
+        speaker.closePath();
+        g.fill(speaker);
+
+        g.setStroke(new BasicStroke(1.6f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
         if (volume > 0) {
-            g.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-            g.drawArc(x + 7, y + 2, 12, 14, -55, 110);
-            if (volume >= 45) g.drawArc(x + 7, y - 1, 19, 20, -55, 110);
+            Path2D.Float wave = new Path2D.Float();
+            wave.moveTo(x + 12, y + 3);
+            wave.quadTo(x + 17, y + 7, x + 12, y + 11);
+            g.draw(wave);
+        } else {
+            g.drawLine(x + 12, y + 3, x + 17, y + 11);
+            g.drawLine(x + 17, y + 3, x + 12, y + 11);
         }
+
         g.setStroke(oldStroke);
         g.setColor(oldColor);
     }
