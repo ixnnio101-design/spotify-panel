@@ -179,8 +179,13 @@ Bottom player volume and transport refinement (8 Nov 2026)
 - Gradle was not run.
 
 Pixel-art volume icon and slider spacing (8 Nov 2026)
-- Replaced the vector-drawn speaker with dedicated transparent 32x32 PNG textures in a crisp pixel-art style.
+- Replaced the vector-drawn speaker with dedicated transparent 16x16 PNG textures in a crisp pixel-art style.
 - Added muted, low-volume and high-volume icon states; the icon is rendered with nearest-neighbour filtering so its pixel edges stay sharp.
 - Increased the horizontal gap between the speaker and volume slider, while keeping the compact right-side control placement and the existing drag hitbox mapped to the visible slider.
 - No Blockbench geometry, Spotify API, playback, search, library, or queue behavior was changed.
 - Gradle was not run.
+
+
+## Дополнительная правка громкости
+- Текстуры динамика уменьшены до нативного размера 16×16 пикселей; отрисовка также идёт в 16×16 без растягивания.
+- Значок смещён левее, чтобы между ним и полосой громкости оставался более заметный зазор.
