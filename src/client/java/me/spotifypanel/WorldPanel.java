@@ -63,7 +63,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -1124,8 +1124,8 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        // Use a larger 24px icon while keeping a 10px visual gap before the slider.
-        drawVolumeIcon(g, volumeBarX - 34, volumeCenterY - 12);
+        // Display the 32px pixel-art source at 48px, centered vertically, with a clear gap.
+        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 24);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1591,19 +1591,19 @@ public final class WorldPanel {
     }
 
     private static int volumeGroupLeft() {
-        // Center the whole control directly below the right-hand "Now Playing" panel.
+        // Center the larger speaker + slider group directly below the right-hand panel.
         int panelLeft = px(5.4), panelRight = px(10.8);
-        int groupWidth = 146;
+        int groupWidth = 170;
         return (panelLeft + panelRight - groupWidth) / 2;
     }
 
     private static int volumeSliderX0() {
-        // Keep the pixel-art speaker visibly separated from the slider track.
-        return volumeGroupLeft() + 36;
+        // Leave a clear 12px gap after the 48px speaker icon.
+        return volumeGroupLeft() + 60;
     }
 
     private static int volumeSliderX1() {
-        return volumeGroupLeft() + 146;
+        return volumeGroupLeft() + 170;
     }
 
     private static int volumeSliderY() {
@@ -1630,7 +1630,7 @@ public final class WorldPanel {
 
         Object previousInterpolation = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-        g.drawImage(icon, x, y, 24, 24, null);
+        g.drawImage(icon, x, y, 48, 48, null);
         if (previousInterpolation != null) {
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, previousInterpolation);
         }

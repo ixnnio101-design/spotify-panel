@@ -196,3 +196,9 @@ Volume icon display-size adjustment (9 Nov 2026)
 - Kept the PNG asset at 32x32 and preserved nearest-neighbour filtering for crisp pixels.
 - No slider geometry, drag hitbox, Spotify behavior, model geometry, or other UI elements were changed.
 - Gradle was not run.
+
+
+Volume icon display size (9 Nov 2026)
+- Increased the single 32x32 pixel-art speaker texture's on-panel display size from 24x24 to 48x48.
+- Re-centered the speaker-and-slider group beneath the Now Playing column and preserved a 12px gap before the slider.
+- Kept the slider width and volume drag interaction unchanged.
