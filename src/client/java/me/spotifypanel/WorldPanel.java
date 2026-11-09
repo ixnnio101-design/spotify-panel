@@ -63,7 +63,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -1124,8 +1124,8 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        // Display the 32px pixel-art source at 48px, centered vertically, with a clear gap.
-        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 24);
+        // Draw the 32x32 white pixel-art speaker at native size, centered vertically.
+        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 16);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1598,7 +1598,7 @@ public final class WorldPanel {
     }
 
     private static int volumeSliderX0() {
-        // Leave a clear 12px gap after the 48px speaker icon.
+        // Keep a comfortable 28px gap after the 32px speaker icon.
         return volumeGroupLeft() + 60;
     }
 
@@ -1630,7 +1630,7 @@ public final class WorldPanel {
 
         Object previousInterpolation = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-        g.drawImage(icon, x, y, 48, 48, null);
+        g.drawImage(icon, x, y, 32, 32, null);
         if (previousInterpolation != null) {
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, previousInterpolation);
         }
