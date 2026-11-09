@@ -1,3 +1,4 @@
-- Volume speaker texture is a single 32x32 PNG with all visible pixels pure white and a transparent background.
-- Volume speaker is rendered at native 32x32 size and vertically centered next to the volume slider.
-- Volume slider behavior and its interaction coordinates are unchanged.
+- Replaced the volume glyph with a smooth, flat Spotify-style white outline speaker matching the user's reference (no low-poly facets or pixelated edges).
+- The project uses exactly one transparent 32x32 PNG texture (volume_speaker.png), rendered at 32x32 in the panel with bilinear filtering for smooth edges.
+- Volume slider dimensions, position, and drag interaction are unchanged.
+- Gradle was not run, as requested.
