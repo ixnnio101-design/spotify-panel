@@ -63,7 +63,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -1124,8 +1124,8 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        // Leave a clear 18px visual gap before the slider so the icon does not touch the track.
-        drawVolumeIcon(g, volumeBarX - 34, volumeCenterY - 8);
+        // Use a larger 24px icon while keeping a 10px visual gap before the slider.
+        drawVolumeIcon(g, volumeBarX - 34, volumeCenterY - 12);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1630,7 +1630,7 @@ public final class WorldPanel {
 
         Object previousInterpolation = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-        g.drawImage(icon, x, y, 16, 16, null);
+        g.drawImage(icon, x, y, 24, 24, null);
         if (previousInterpolation != null) {
             g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, previousInterpolation);
         }

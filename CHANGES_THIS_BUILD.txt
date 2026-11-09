@@ -189,3 +189,10 @@ Pixel-art volume icon and slider spacing (8 Nov 2026)
 ## Дополнительная правка громкости
 - Текстуры динамика уменьшены до нативного размера 16×16 пикселей; отрисовка также идёт в 16×16 без растягивания.
 - Значок смещён левее, чтобы между ним и полосой громкости оставался более заметный зазор.
+
+Volume icon display-size adjustment (9 Nov 2026)
+- Increased the 32x32 pixel-art speaker texture's on-panel display size from 16x16 to 24x24.
+- Vertically recentered the larger icon beside the slider and retained a 10 px visual gap before the slider track.
+- Kept the PNG asset at 32x32 and preserved nearest-neighbour filtering for crisp pixels.
+- No slider geometry, drag hitbox, Spotify behavior, model geometry, or other UI elements were changed.
+- Gradle was not run.
