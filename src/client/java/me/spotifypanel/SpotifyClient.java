@@ -34,6 +34,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.function.Consumer;
 import java.util.function.IntBinaryOperator;
 import java.util.function.UnaryOperator;
@@ -45,7 +47,27 @@ public final class SpotifyClient {
 
     public enum Status { NO_CLIENT_ID, LOGGED_OUT, IDLE, ACTIVE, ERROR }
 
-    public record Track(String title, String artists, String coverUrl, long durationMs, String uri) {}
+    public record Track(String title, String artists, String coverUrl, long durationMs, String uri, String albumName) {
+        public Track(String title, String artists, String coverUrl, long durationMs, String uri) {
+            this(title, artists, coverUrl, durationMs, uri, "");
+        }
+    }
+
+    public enum LyricsStatus { IDLE, LOADING, FOUND, NOT_FOUND, INSTRUMENTAL, ERROR }
+
+    /** One active track's lyrics only. No per-track map or disk cache is kept. */
+    public record LyricLine(long timeMs, String text) {}
+    public record Lyrics(String trackUri, LyricsStatus status, boolean instrumental,
+                         List<String> plainLines, List<LyricLine> syncedLines, String message) {
+        public Lyrics {
+            plainLines = plainLines == null ? List.of() : List.copyOf(plainLines);
+            syncedLines = syncedLines == null ? List.of() : List.copyOf(syncedLines);
+            message = message == null ? "" : message;
+        }
+        public static Lyrics empty() {
+            return new Lyrics("", LyricsStatus.IDLE, false, List.of(), List.of(), "");
+        }
+    }
 
     public record Playlist(String id, String name, String owner, int total, String coverUrl, String uri) {}
 
@@ -131,6 +153,18 @@ public final class SpotifyClient {
     });
 
     /** Команды управления идут строго по очереди, чтобы громкость/перемотка не приходили в перепутанном порядке. */
+    private final ExecutorService lyricsExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "spotifypanel-lyrics");
+        t.setDaemon(true);
+        return t;
+    });
+    private final AtomicLong lyricsRequestSequence = new AtomicLong();
+    private volatile String lyricsRequestedUri = "";
+    private volatile Lyrics lyrics = Lyrics.empty();
+    // LRCLIB requests are serialized and spaced out; Retry-After applies to the next track too.
+    private volatile long nextLyricsRequestAtMs;
+    private volatile long lrclibCooldownUntilMs;
+
     private final ExecutorService ctl = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "spotifypanel-ctl");
         t.setDaemon(true);
@@ -368,7 +402,9 @@ public final class SpotifyClient {
                 int volume = root.has("device") && root.get("device").isJsonObject()
                         ? (int) lng(root.getAsJsonObject("device"), "volume_percent") : 0;
                 Snapshot verified = new Snapshot(Status.ACTIVE, true,
-                        new Track(str(track, "name"), artistsOf(track), "", duration, liveUri),
+                        new Track(str(track, "name"), artistsOf(track), "", duration, liveUri,
+                                track.has("album") && track.get("album").isJsonObject()
+                                        ? str(track.getAsJsonObject("album"), "name") : ""),
                         progress, System.currentTimeMillis(), device, volume,
                         bool(root, "shuffle_state"), repeat, "");
                 scheduleLikedAdvance(verified);
@@ -521,6 +557,9 @@ public final class SpotifyClient {
     }
 
     public Snapshot snapshot() { return snapshot; }
+
+    /** Lyrics for the currently playing track only. Previous tracks are never cached. */
+    public Lyrics lyrics() { return lyrics; }
 
     public List<Playlist> playlists() { return playlists; }
 
@@ -692,10 +731,12 @@ public final class SpotifyClient {
         try {
             if (auth.clientId().isEmpty()) {
                 snapshot = Snapshot.of(Status.NO_CLIENT_ID);
+                clearCurrentLyrics();
                 return;
             }
             if (!auth.isLoggedIn()) {
                 snapshot = Snapshot.of(Status.LOGGED_OUT);
+                clearCurrentLyrics();
                 return;
             }
 
@@ -726,9 +767,12 @@ public final class SpotifyClient {
             }
             if (sc == 204) {
                 snapshot = Snapshot.of(Status.IDLE);
+                clearCurrentLyrics();
                 endLikedSession();
             } else if (sc == 401) {
                 auth.invalidate();
+                snapshot = Snapshot.of(Status.LOGGED_OUT);
+                clearCurrentLyrics();
             } else if (sc == 429) {
                 Snapshot current = snapshot;
                 if (current.status() == Status.ACTIVE) {
@@ -746,6 +790,7 @@ public final class SpotifyClient {
         } catch (Exception e) {
             if (!auth.isLoggedIn()) {
                 snapshot = Snapshot.of(Status.LOGGED_OUT);
+                clearCurrentLyrics();
             } else {
                 snapshot = Snapshot.error(errText(e));
             }
@@ -757,6 +802,7 @@ public final class SpotifyClient {
         JsonElement itemEl = o.get("item");
         if (itemEl == null || itemEl.isJsonNull()) {
             snapshot = Snapshot.of(Status.IDLE);
+            clearCurrentLyrics();
             endLikedSession();
             return;
         }
@@ -766,6 +812,8 @@ public final class SpotifyClient {
         long duration = lng(item, "duration_ms");
         String uri = str(item, "uri");
         String artists = artistsOf(item);
+        String albumName = item.has("album") && item.get("album").isJsonObject()
+                ? str(item.getAsJsonObject("album"), "name") : "";
 
         String cover = "";
         JsonObject imgHolder = item.has("album") && item.get("album").isJsonObject() ? item.getAsJsonObject("album")
@@ -795,15 +843,243 @@ public final class SpotifyClient {
             if (Math.abs(diff) < 2500) prog = predicted + diff / 3;
         }
 
-        Snapshot current = new Snapshot(Status.ACTIVE, playing, new Track(title, artists, cover, duration, uri),
+        Track currentTrack = new Track(title, artists, cover, duration, uri, albumName);
+        Snapshot current = new Snapshot(Status.ACTIVE, playing, currentTrack,
                 prog, System.currentTimeMillis(), device, volume, shuffle, repeat, "");
         snapshot = current;
+        String previousUri = prev.track() == null ? "" : prev.track().uri();
+        if (!uri.equals(previousUri)) requestLyricsForTrack(currentTrack);
         releaseLikedQueueOnExternalTrackChange(prev, current);
         scheduleLikedAdvance(snapshot);
         if (!optimisticTrackUri.isEmpty() && optimisticTrackUri.equals(uri)) {
             optimisticTrackUntilMs = 0;
             optimisticTrackUri = "";
         }
+    }
+
+    // --------------------------------------------------------------- lyrics (LRCLIB)
+
+    private static final Pattern LRC_TIMESTAMP = Pattern.compile("\\[(\\d{1,2}):(\\d{2})(?:\\.(\\d{1,3}))?\\]");
+    // Before public release, add the real Modrinth/GitHub project URL or maintainer contact here.
+    private static final String LRCLIB_USER_AGENT = "SpotifyPanelMod/1.0 (Minecraft Fabric client mod)";
+    private static final long LRCLIB_REQUEST_GAP_MS = 350L;
+
+    private void clearCurrentLyrics() {
+        lyricsRequestSequence.incrementAndGet();
+        lyricsRequestedUri = "";
+        if (lyrics.status() != LyricsStatus.IDLE || !lyrics.trackUri().isEmpty()) {
+            lyrics = Lyrics.empty();
+        }
+    }
+
+    /** Start one on-demand lookup when Spotify reports a new track. There is no lyrics cache. */
+    private void requestLyricsForTrack(Track track) {
+        if (track == null || track.uri() == null || track.uri().isBlank()) {
+            clearCurrentLyrics();
+            return;
+        }
+        String uri = track.uri();
+        if (uri.equals(lyricsRequestedUri)) return;
+        lyricsRequestedUri = uri;
+        long requestId = lyricsRequestSequence.incrementAndGet();
+        lyrics = new Lyrics(uri, LyricsStatus.LOADING, false, List.of(), List.of(), "Ищем текст...");
+        try {
+            lyricsExecutor.execute(() -> {
+                if (requestId != lyricsRequestSequence.get()) return;
+                Lyrics result = fetchLyrics(track);
+                if (requestId == lyricsRequestSequence.get()
+                        && snapshot.track() != null && uri.equals(snapshot.track().uri())) {
+                    lyrics = result;
+                }
+            });
+        } catch (RuntimeException rejected) {
+            if (requestId == lyricsRequestSequence.get()) {
+                lyrics = new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(),
+                        "Не удалось запустить поиск текста");
+            }
+            LOG.debug("LRCLIB lookup could not be queued", rejected);
+        }
+    }
+
+    private Lyrics fetchLyrics(Track track) {
+        String uri = track.uri();
+        String title = track.title() == null ? "" : track.title().trim();
+        String artists = track.artists() == null ? "" : track.artists().trim();
+        String artist = artists.contains(",") ? artists.substring(0, artists.indexOf(',')).trim() : artists;
+        String album = track.albumName() == null ? "" : track.albumName().trim();
+        long durationSeconds = Math.max(0L, Math.round(track.durationMs() / 1000.0));
+        if (title.isEmpty() || artist.isEmpty() || durationSeconds <= 0 || durationSeconds > 3600) {
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
+                    "Недостаточно данных для поиска текста");
+        }
+
+        try {
+            if (album.isEmpty()) {
+                return searchLyricsFallback(uri, title, artist, durationSeconds);
+            }
+            String query = "track_name=" + encodeQuery(title)
+                    + "&artist_name=" + encodeQuery(artist)
+                    + "&album_name=" + encodeQuery(album)
+                    + "&duration=" + durationSeconds;
+            URI endpoint = URI.create("https://lrclib.net/api/get?" + query);
+            HttpResponse<String> response = sendLrclibGet(endpoint, Duration.ofSeconds(15));
+
+            if (response.statusCode() == 200) {
+                return lyricsFromJson(uri, JsonParser.parseString(response.body()).getAsJsonObject());
+            }
+            if (response.statusCode() == 429 || response.statusCode() == 503) {
+                String retryAfter = response.headers().firstValue("Retry-After").orElse("?");
+                rememberLrclibCooldown(response);
+                return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(),
+                        "LRCLIB временно ограничил запросы. Повтори позже (" + retryAfter + " сек.)");
+            }
+            if (response.statusCode() == 404) {
+                // One fallback search handles minor album/artist metadata differences.
+                // sendLrclibGet enforces the service's 200–500 ms spacing recommendation.
+                return searchLyricsFallback(uri, title, artist, durationSeconds);
+            }
+            return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(),
+                    "LRCLIB: HTTP " + response.statusCode());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(), "Поиск текста прерван");
+        } catch (Exception e) {
+            LOG.debug("LRCLIB lookup failed for {}", title, e);
+            return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(), "Не удалось связаться с LRCLIB");
+        }
+    }
+
+    private Lyrics searchLyricsFallback(String uri, String title, String artist, long durationSeconds) throws Exception {
+        String query = "track_name=" + encodeQuery(title) + "&artist_name=" + encodeQuery(artist);
+        URI endpoint = URI.create("https://lrclib.net/api/search?" + query);
+        HttpResponse<String> response = sendLrclibGet(endpoint, Duration.ofSeconds(12));
+        if (response.statusCode() == 429 || response.statusCode() == 503) {
+            String retryAfter = response.headers().firstValue("Retry-After").orElse("?");
+            rememberLrclibCooldown(response);
+            return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(),
+                    "LRCLIB временно ограничил запросы. Повтори позже (" + retryAfter + " сек.)");
+        }
+        if (response.statusCode() != 200) {
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Текст для этого трека не найден");
+        }
+        JsonElement root = JsonParser.parseString(response.body());
+        if (!root.isJsonArray()) {
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Текст для этого трека не найден");
+        }
+        JsonObject best = null;
+        long bestDiff = Long.MAX_VALUE;
+        String normalizedTitle = normalizeLyricsMatch(title);
+        String normalizedArtist = normalizeLyricsMatch(artist);
+        for (JsonElement element : root.getAsJsonArray()) {
+            if (!element.isJsonObject()) continue;
+            JsonObject candidate = element.getAsJsonObject();
+            String candidateTitle = str(candidate, "trackName");
+            String candidateArtist = normalizeLyricsMatch(str(candidate, "artistName"));
+            if (!normalizeLyricsMatch(candidateTitle).equals(normalizedTitle)) continue;
+            if (!candidateArtist.isEmpty() && !candidateArtist.contains(normalizedArtist)
+                    && !normalizedArtist.contains(candidateArtist)) continue;
+            long candidateDuration = candidate.has("duration") && !candidate.get("duration").isJsonNull()
+                    ? Math.round(candidate.get("duration").getAsDouble()) : 0L;
+            long diff = Math.abs(candidateDuration - durationSeconds);
+            if (candidateDuration > 0 && diff <= 2 && diff < bestDiff) {
+                best = candidate;
+                bestDiff = diff;
+            }
+        }
+        if (best == null) {
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Текст для этого трека не найден");
+        }
+        return lyricsFromJson(uri, best);
+    }
+
+    /** All LRCLIB requests go through one serial path with a small spacing between calls. */
+    private HttpResponse<String> sendLrclibGet(URI endpoint, Duration timeout) throws Exception {
+        long now = System.currentTimeMillis();
+        long nextAllowed = Math.max(nextLyricsRequestAtMs, lrclibCooldownUntilMs);
+        if (nextAllowed > now) Thread.sleep(nextAllowed - now);
+
+        HttpRequest request = HttpRequest.newBuilder(endpoint)
+                .timeout(timeout)
+                .header("Accept", "application/json")
+                .header("User-Agent", LRCLIB_USER_AGENT)
+                .GET().build();
+        try {
+            return Net.http().send(request, HttpResponse.BodyHandlers.ofString());
+        } finally {
+            nextLyricsRequestAtMs = System.currentTimeMillis() + LRCLIB_REQUEST_GAP_MS;
+        }
+    }
+
+    /** Respect LRCLIB's Retry-After globally, including when the user changes tracks. */
+    private void rememberLrclibCooldown(HttpResponse<?> response) {
+        long retrySeconds = 5L;
+        String value = response.headers().firstValue("Retry-After").orElse("").trim();
+        try {
+            if (!value.isEmpty()) retrySeconds = Math.max(1L, Long.parseLong(value));
+        } catch (NumberFormatException ignored) {
+            // The documented API uses seconds. Keep a safe short backoff for malformed values.
+        }
+        retrySeconds = Math.min(retrySeconds, 300L);
+        long jitterMs = java.util.concurrent.ThreadLocalRandom.current().nextLong(0L, 301L);
+        long until = System.currentTimeMillis() + retrySeconds * 1_000L + jitterMs;
+        lrclibCooldownUntilMs = Math.max(lrclibCooldownUntilMs, until);
+        nextLyricsRequestAtMs = Math.max(nextLyricsRequestAtMs, lrclibCooldownUntilMs);
+    }
+
+    private static Lyrics lyricsFromJson(String uri, JsonObject object) {
+        boolean instrumental = bool(object, "instrumental");
+        String plain = str(object, "plainLyrics");
+        String synced = str(object, "syncedLyrics");
+        List<String> plainLines = new ArrayList<>();
+        if (!plain.isBlank()) {
+            for (String line : plain.replace("\r", "").split("\\n")) {
+                String clean = line.strip();
+                if (!clean.isEmpty()) plainLines.add(clean);
+            }
+        }
+        List<LyricLine> syncedLines = parseSyncedLyrics(synced);
+        if (instrumental) {
+            return new Lyrics(uri, LyricsStatus.INSTRUMENTAL, true, List.of(), List.of(), "Инструментальная композиция");
+        }
+        if (plainLines.isEmpty() && syncedLines.isEmpty()) {
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Текст для этого трека не найден");
+        }
+        return new Lyrics(uri, LyricsStatus.FOUND, false, plainLines, syncedLines, "");
+    }
+
+    private static List<LyricLine> parseSyncedLyrics(String raw) {
+        if (raw == null || raw.isBlank()) return List.of();
+        List<LyricLine> lines = new ArrayList<>();
+        for (String rawLine : raw.replace("\r", "").split("\\n")) {
+            Matcher matcher = LRC_TIMESTAMP.matcher(rawLine);
+            List<Long> times = new ArrayList<>(2);
+            while (matcher.find()) {
+                long minutes = Long.parseLong(matcher.group(1));
+                long seconds = Long.parseLong(matcher.group(2));
+                String fraction = matcher.group(3) == null ? "0" : matcher.group(3);
+                if (fraction.length() == 1) fraction += "00";
+                else if (fraction.length() == 2) fraction += "0";
+                else if (fraction.length() > 3) fraction = fraction.substring(0, 3);
+                long millis = Long.parseLong(fraction);
+                times.add(minutes * 60_000L + seconds * 1_000L + millis);
+            }
+            String text = LRC_TIMESTAMP.matcher(rawLine).replaceAll("").strip();
+            if (text.isEmpty()) continue;
+            for (long time : times) lines.add(new LyricLine(time, text));
+        }
+        lines.sort(java.util.Comparator.comparingLong(LyricLine::timeMs));
+        return List.copyOf(lines);
+    }
+
+    private static String encodeQuery(String value) {
+        return URLEncoder.encode(value == null ? "" : value, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static String normalizeLyricsMatch(String value) {
+        return value == null ? "" : value.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("\\([^)]*\\)", " ")
+                .replaceAll("[^\\p{L}\\p{N}]", "")
+                .trim();
     }
 
     private static String artistsOf(JsonObject item) {

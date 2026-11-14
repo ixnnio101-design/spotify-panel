@@ -82,7 +82,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -116,6 +116,10 @@ public final class WorldPanel {
     private static boolean paintedSearchPreparing;
     private static boolean paintedPlaying;
     private static int paintedVolume = -1;
+    private static SpotifyClient.Lyrics paintedLyricsRef;
+    private static int paintedLyricsLineIndex = Integer.MIN_VALUE;
+    private static int paintedLyricsScroll = Integer.MIN_VALUE;
+    private static int lyricsScroll;
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
@@ -229,6 +233,8 @@ public final class WorldPanel {
     private static final double SEARCH_RESULTS_TOP = 12.5;
     private static final int SEARCH_RESULT_ROW_HEIGHT = 35;
     private static final int SEARCH_VISIBLE_ROWS = 8;
+    private static final int LYRICS_VISIBLE_LINES = 5;
+    private static final int LYRICS_LINE_HEIGHT = 18;
 
     private WorldPanel() {}
 
@@ -612,11 +618,16 @@ public final class WorldPanel {
         if (uv == null) return;
         int tx = (int) (uv[0] * UI_W);
         int ty = (int) (uv[1] * UI_H);
-        // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
+        // 1 = library sidebar, 2 = track table, 3 = other panel areas, 4 = unsynced lyrics.
         scrollArea = 3;
         if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) && ty <= py(2.4)) scrollArea = 1;
         else if (tx >= px(-9.4) && tx <= px(5.2)
                 && ty >= py(searchMode() ? SEARCH_RESULTS_TOP : 9.2) && ty <= py(2.4)) scrollArea = 2;
+        else {
+            UiRect lyricRect = nowPlayingLyricsRect();
+            if (tx >= lyricRect.x() && tx <= lyricRect.right()
+                    && ty >= lyricRect.y() && ty <= lyricRect.bottom()) scrollArea = 4;
+        }
     }
 
     private static void applyWheel(int playlistCount, int itemCount, int visibleTrackRows) {
@@ -625,6 +636,15 @@ public final class WorldPanel {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
             else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - visibleTrackRows), trackScroll + direction));
+            else if (scrollArea == 4) {
+                SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
+                if (currentLyrics.status() == SpotifyClient.LyricsStatus.FOUND
+                        && currentLyrics.syncedLines().isEmpty()) {
+                    lyricsScroll = Math.max(0, Math.min(
+                            Math.max(0, currentLyrics.plainLines().size() - LYRICS_VISIBLE_LINES),
+                            lyricsScroll + direction));
+                }
+            }
             wheelDelta -= Math.signum(wheelDelta);
         }
     }
@@ -888,10 +908,28 @@ public final class WorldPanel {
             paintedCaretPhase = searchFocused ? System.currentTimeMillis() / 500L : Long.MIN_VALUE;
         }
 
+        SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
+        int currentLyricsLine = currentSyncedLyricIndex(currentLyrics, snapshot.currentProgress());
         if (trackChanged || statusChanged) {
+            if (trackChanged) lyricsScroll = 0;
             repaintRegion(overlayTexture, nowPlayingRect(), g -> paintNowPlaying(g, snapshot));
-        } else if (playingChanged) {
-            repaintRegion(overlayTexture, nowPlayingStatusRect(), g -> paintNowPlayingStatus(g, snapshot));
+            paintedLyricsRef = currentLyrics;
+            paintedLyricsLineIndex = currentLyricsLine;
+            paintedLyricsScroll = lyricsScroll;
+        } else {
+            if (playingChanged) {
+                repaintRegion(overlayTexture, nowPlayingStatusRect(), g -> paintNowPlayingStatus(g, snapshot));
+            }
+            boolean lyricsChanged = currentLyrics != paintedLyricsRef
+                    || currentLyricsLine != paintedLyricsLineIndex
+                    || lyricsScroll != paintedLyricsScroll;
+            if (lyricsChanged) {
+                repaintRegion(overlayTexture, nowPlayingLyricsRect(),
+                        g -> paintNowPlayingLyrics(g, snapshot, currentLyrics));
+                paintedLyricsRef = currentLyrics;
+                paintedLyricsLineIndex = currentLyricsLine;
+                paintedLyricsScroll = lyricsScroll;
+            }
         }
 
         if (trackChanged) {
@@ -1049,6 +1087,10 @@ public final class WorldPanel {
         paintedTrackDuration = trackDuration;
         paintedStatus = snapshot.status();
         paintedPlaying = snapshot.playing();
+        SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
+        paintedLyricsRef = currentLyrics;
+        paintedLyricsLineIndex = currentSyncedLyricIndex(currentLyrics, snapshot.currentProgress());
+        paintedLyricsScroll = lyricsScroll;
         // Dynamic painted values are advanced only by the region that actually
         // uploads them. Do not overwrite these here: throttled scroll/progress
         // regions must remain dirty until their next partial refresh.
@@ -1141,10 +1183,28 @@ public final class WorldPanel {
         return new UiRect(x0, y0 + transitionOffset - 1, x1 - x0, y1 - y0 + 2);
     }
 
+    private static int nowPlayingCardX0() { return px(5.4); }
+    private static int nowPlayingCardX1() { return px(10.8); }
+    private static int nowPlayingCoverX() {
+        int size = nowPlayingCoverSize();
+        return nowPlayingCardX0() + (nowPlayingCardX1() - nowPlayingCardX0() - size) / 2;
+    }
+    private static int nowPlayingCoverY() { return py(12.5) + 5; }
+    private static int nowPlayingCoverSize() {
+        return Math.min(136, Math.min(nowPlayingCardX1() - nowPlayingCardX0() - 20,
+                py(7.5) - py(12.5) - 10));
+    }
+    private static int nowPlayingInfoTop() { return nowPlayingCoverY() + nowPlayingCoverSize(); }
+    private static int nowPlayingLabelBaseline() { return nowPlayingInfoTop() + 17; }
+    private static int nowPlayingTitleBaseline() { return nowPlayingInfoTop() + 40; }
+    private static int nowPlayingArtistBaseline() { return nowPlayingInfoTop() + 60; }
+    private static int nowPlayingStatusBaseline() { return nowPlayingInfoTop() + 80; }
+    private static int nowPlayingLyricsHeaderBaseline() { return nowPlayingInfoTop() + 101; }
+    private static int nowPlayingLyricsFirstBaseline() { return nowPlayingInfoTop() + 121; }
+
     private static UiRect nowPlayingCoverRect() {
-        int coverX = px(5.6), coverY = py(12.5);
-        int coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
-        return new UiRect(coverX + 2, coverY + 2, coverSize, coverSize);
+        int x = nowPlayingCoverX(), y = nowPlayingCoverY(), size = nowPlayingCoverSize();
+        return new UiRect(x - 2, y - 2, size + 4, size + 4);
     }
 
     private static UiRect bottomCoverRect() {
@@ -1158,8 +1218,16 @@ public final class WorldPanel {
     }
 
     private static UiRect nowPlayingStatusRect() {
-        int x0 = px(5.4), x1 = px(10.8), baseline = py(7.1) + 101;
-        return new UiRect(x0, baseline - 22, x1 - x0, 30);
+        int x0 = nowPlayingCardX0(), x1 = nowPlayingCardX1();
+        int baseline = nowPlayingStatusBaseline();
+        return new UiRect(x0 + 5, baseline - 17, x1 - x0 - 10, 23);
+    }
+
+    private static UiRect nowPlayingLyricsRect() {
+        int x0 = nowPlayingCardX0() + 7, x1 = nowPlayingCardX1() - 7;
+        int top = nowPlayingLyricsHeaderBaseline() - 12;
+        int bottom = py(2.4) - 4;
+        return new UiRect(x0, top, x1 - x0, Math.max(1, bottom - top));
     }
 
     private static UiRect bottomMetadataRect() {
@@ -1641,49 +1709,142 @@ public final class WorldPanel {
     }
 
     private static void paintNowPlaying(Graphics2D g, SpotifyClient.Snapshot s) {
-        int x0 = px(5.4), x1 = px(10.8), y0 = py(12.7), y1 = py(2.4);
+        int x0 = nowPlayingCardX0(), x1 = nowPlayingCardX1();
+        int y0 = py(12.7), y1 = py(2.4);
         g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
         paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(255, 255, 255, 25), 1, 8);
         g.setColor(new Color(30, 215, 96, 175));
         g.fillRect(x0 + 8, y0 + 8, 18, 3);
 
-        int coverX = px(5.6), coverY = py(12.5), coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
+        int coverX = nowPlayingCoverX(), coverY = nowPlayingCoverY(), coverSize = nowPlayingCoverSize();
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
-        drawCover(g, cover, 128, coverX + 5, coverY + 5, coverSize - 10);
+        drawCover(g, cover, 128, coverX, coverY, coverSize);
         g.setColor(new Color(30, 215, 96, 210));
-        g.setStroke(new BasicStroke(2.5f));
-        g.drawRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8);
+        g.setStroke(new BasicStroke(2.2f));
+        g.drawRect(coverX - 1, coverY - 1, coverSize + 2, coverSize + 2);
 
-        int textY = py(7.1);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 15));
-        g.setColor(new Color(30, 235, 105));
-        drawReadableText(g, "СЕЙЧАС ИГРАЕТ", coverX + 4, textY + 17, new Color(30, 245, 110));
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 27));
+        int textLeft = x0 + 9;
+        int textWidth = x1 - x0 - 18;
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 13));
+        drawReadableText(g, "СЕЙЧАС ИГРАЕТ", textLeft, nowPlayingLabelBaseline(), new Color(30, 245, 110));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 20));
         g.setColor(Color.WHITE);
         String title = s.track() == null ? titleForInactive(s) : s.track().title();
-        drawReadableText(g, fit(g, safe(title, "Ничего не играет"), x1 - x0 - 16), coverX + 4, textY + 49, Color.WHITE);
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 17));
-        g.setColor(new Color(248, 250, 248));
+        drawReadableText(g, fit(g, safe(title, "Ничего не играет"), textWidth),
+                textLeft, nowPlayingTitleBaseline(), Color.WHITE);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
         String artist = s.track() == null ? statusDetail(s) : s.track().artists();
-        drawReadableText(g, fit(g, safe(artist, ""), x1 - x0 - 16), coverX + 4, textY + 76, new Color(246, 248, 246));
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
-        g.setColor(new Color(220, 230, 223));
-        drawReadableText(g, s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА", coverX + 4, textY + 101, new Color(230, 238, 232));
+        drawReadableText(g, fit(g, safe(artist, ""), textWidth),
+                textLeft, nowPlayingArtistBaseline(), new Color(220, 228, 222));
+        paintNowPlayingStatusContent(g, s);
+        paintNowPlayingLyricsContent(g, s, SpotifyPanelMod.spotify.lyrics());
+    }
+
+    private static void paintNowPlayingLyrics(Graphics2D g, SpotifyClient.Snapshot snapshot,
+                                               SpotifyClient.Lyrics lyrics) {
+        UiRect rect = nowPlayingLyricsRect();
+        g.setColor(new Color(7, 11, 8, 248));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        paintNowPlayingLyricsContent(g, snapshot, lyrics);
+    }
+
+    private static void paintNowPlayingLyricsContent(Graphics2D g, SpotifyClient.Snapshot snapshot,
+                                                      SpotifyClient.Lyrics lyrics) {
+        int x0 = nowPlayingCardX0() + 9;
+        int width = nowPlayingCardX1() - nowPlayingCardX0() - 18;
+        int headerY = nowPlayingLyricsHeaderBaseline();
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
+        drawReadableText(g, "ТЕКСТ ПЕСНИ · LRCLIB", x0, headerY, new Color(30, 215, 96));
+
+        if (lyrics == null || lyrics.status() == SpotifyClient.LyricsStatus.IDLE) {
+            drawLyricsMessage(g, "Включи трек", x0, width, headerY + 19);
+            return;
+        }
+        if (lyrics.status() == SpotifyClient.LyricsStatus.LOADING) {
+            drawLyricsMessage(g, "Ищем текст...", x0, width, headerY + 19);
+            return;
+        }
+        if (lyrics.status() == SpotifyClient.LyricsStatus.INSTRUMENTAL || lyrics.instrumental()) {
+            drawLyricsMessage(g, "Инструментальная композиция", x0, width, headerY + 19);
+            return;
+        }
+        if (lyrics.status() == SpotifyClient.LyricsStatus.NOT_FOUND) {
+            drawLyricsMessage(g, "Текст не найден", x0, width, headerY + 19);
+            return;
+        }
+        if (lyrics.status() == SpotifyClient.LyricsStatus.ERROR) {
+            String message = lyrics.message().isBlank() ? "Сервис текста недоступен" : lyrics.message();
+            drawLyricsMessage(g, fit(g, message, width), x0, width, headerY + 19);
+            return;
+        }
+
+        if (!lyrics.syncedLines().isEmpty()) {
+            List<SpotifyClient.LyricLine> lines = lyrics.syncedLines();
+            int active = currentSyncedLyricIndex(lyrics, snapshot.currentProgress());
+            int first = Math.max(0, active - 1);
+            for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
+                int index = first + row;
+                if (index >= lines.size()) break;
+                SpotifyClient.LyricLine line = lines.get(index);
+                Color color = index == active ? new Color(245, 250, 246)
+                        : index < active ? new Color(115, 132, 121) : new Color(195, 207, 198);
+                g.setFont(new Font(Font.SANS_SERIF, index == active ? Font.BOLD : Font.PLAIN,
+                        index == active ? 14 : 13));
+                String text = fit(g, line.text(), width);
+                drawCenteredReadableText(g, text, x0, width,
+                        nowPlayingLyricsFirstBaseline() + row * LYRICS_LINE_HEIGHT, color);
+            }
+        } else if (!lyrics.plainLines().isEmpty()) {
+            List<String> lines = lyrics.plainLines();
+            int maxScroll = Math.max(0, lines.size() - LYRICS_VISIBLE_LINES);
+            int first = Math.max(0, Math.min(lyricsScroll, maxScroll));
+            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
+            for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
+                int index = first + row;
+                if (index >= lines.size()) break;
+                drawCenteredReadableText(g, fit(g, lines.get(index), width), x0, width,
+                        nowPlayingLyricsFirstBaseline() + row * LYRICS_LINE_HEIGHT,
+                        new Color(220, 230, 223));
+            }
+        } else {
+            drawLyricsMessage(g, "Текст не найден", x0, width, headerY + 19);
+        }
+    }
+
+    private static void drawLyricsMessage(Graphics2D g, String message, int x, int width, int baseline) {
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+        drawCenteredReadableText(g, message, x, width, baseline, new Color(145, 158, 148));
+    }
+
+    private static void drawCenteredReadableText(Graphics2D g, String text, int x, int width,
+                                                  int baseline, Color color) {
+        if (text == null || text.isEmpty()) return;
+        int drawX = x + Math.max(0, (width - g.getFontMetrics().stringWidth(text)) / 2);
+        drawReadableText(g, text, drawX, baseline, color);
+    }
+
+    private static int currentSyncedLyricIndex(SpotifyClient.Lyrics lyrics, long progressMs) {
+        if (lyrics == null || lyrics.syncedLines().isEmpty()) return -1;
+        List<SpotifyClient.LyricLine> lines = lyrics.syncedLines();
+        int active = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).timeMs() <= progressMs) active = i;
+            else break;
+        }
+        return active;
     }
 
     private static void paintNowPlayingCoverPartial(Graphics2D g, SpotifyClient.Snapshot s) {
         UiRect rect = nowPlayingCoverRect();
         g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
-
-        int coverX = px(5.6), coverY = py(12.5);
-        int coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
+        int coverX = nowPlayingCoverX(), coverY = nowPlayingCoverY(), coverSize = nowPlayingCoverSize();
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
-        drawCover(g, cover, 128, coverX + 5, coverY + 5, coverSize - 10);
+        drawCover(g, cover, 128, coverX, coverY, coverSize);
         g.setColor(new Color(30, 215, 96, 210));
-        g.setStroke(new BasicStroke(2.5f));
-        g.drawRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8);
+        g.setStroke(new BasicStroke(2.2f));
+        g.drawRect(coverX - 1, coverY - 1, coverSize + 2, coverSize + 2);
     }
 
     private static void paintBottomCoverPartial(Graphics2D g, SpotifyClient.Snapshot s) {
@@ -1842,12 +2003,13 @@ public final class WorldPanel {
         UiRect rect = nowPlayingStatusRect();
         g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
-        int coverX = px(5.6);
-        int textY = py(7.1);
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
-        g.setColor(new Color(220, 230, 223));
+        paintNowPlayingStatusContent(g, s);
+    }
+
+    private static void paintNowPlayingStatusContent(Graphics2D g, SpotifyClient.Snapshot s) {
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         drawReadableText(g, s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА",
-                coverX + 4, textY + 101, new Color(230, 238, 232));
+                nowPlayingCardX0() + 9, nowPlayingStatusBaseline(), new Color(220, 230, 223));
     }
 
     // -------------------------------------------------------------------- model geometry
