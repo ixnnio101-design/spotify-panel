@@ -46,9 +46,9 @@
 - 3D-модель, перспектива, список/поиск, координаты кликов и схема частичного GPU upload не менялись. Повторные запросы ограничены по частоте и идут в существующем фоновом executor, render thread не ждёт сеть.
 - Gradle и Minecraft не запускались; выполнен синтаксический разбор Java, проверка источников и целостности ZIP.
 
-Camera stabilization correction (first-person walking bob)
-- The previous anchor-only stabilization did not remove the shake because Minecraft 1.21.11 applies walking bob through the world projection matrix, not by modifying CameraRenderState.pos.
-- Added a panel-only inverse of the exact vanilla bob transform (translation + Z/X rotations) using the same camera partial tick and interpolated player bob values.
-- Applied the compensated model-view matrix to both Blockbench material planes and the dynamic overlay.
-- View bob remains enabled for the rest of Minecraft; the panel remains a world-space 3D surface with perspective, depth testing, and the existing click geometry.
-- Third-person placement is unchanged.
+ИСПРАВЛЕНИЕ КОМПЕНСАЦИИ ПОКАЧИВАНИЯ КАМЕРЫ (14 ноября 2026)
+- Исправлена ошибка предыдущей версии: обратная матрица walking bob применялась непосредственно в матрице объекта, хотя глобальный поворот камеры применяется отдельно. Из-за смешения координат камеры и мира панель могла дёргаться и вращаться в разные стороны.
+- Компенсация теперь переносится из пространства камеры в мировое пространство сопряжением `R_camera * Bob^-1 * R_camera^-1`, после чего применяется к матрице только панели.
+- Для расчёта используются те же интерполированные walk-distance/bob и partial tick, что и в штатном `GameRenderer.bobView` Minecraft 1.21.11.
+- Изменение применяется одинаково к Blockbench-плоскостям и динамическому overlay через один объектный transform; остальной мир сохраняет стандартное View Bobbing.
+- 3D-модель, перспективу, UV, world-space геометрию, клики и третье лицо не менял. Gradle и Minecraft не запускал; требуется проверка движения в игре.

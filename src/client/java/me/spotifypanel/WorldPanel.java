@@ -82,7 +82,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -437,11 +437,17 @@ public final class WorldPanel {
     }
 
     /**
-     * Cancels only Minecraft's first-person walking bob for the panel. In 1.21.11
-     * GameRenderer multiplies the world projection by T(bob) * Rz(bob) * Rx(bob).
-     * Pre-multiplying its inverse into this panel's model-view matrix removes that
-     * screen-space shake without disabling view bobbing for the rest of the world.
-     * The panel remains world-space geometry with normal perspective and depth testing.
+     * Cancels Minecraft's first-person walking bob for this panel only.
+     *
+     * In 1.21.11 GameRenderer builds projection = P * B, where B is the
+     * camera-space transform T(bob) * Rz(bob) * Rx(bob). The camera view rotation
+     * is applied separately by the world renderer, not by this event's object
+     * matrix. Therefore the inverse bob must be conjugated into world space:
+     * R * inverse(B) * inverse(R) * objectMatrix.
+     *
+     * Applying inverse(B) directly to objectMatrix mixes camera-space and
+     * world-space axes, which causes the panel to jump sideways and rotate while
+     * walking. This version preserves the real 3D world geometry and depth test.
      */
     private static Matrix4f buildStablePanelMatrix(MinecraftClient mc, ClientPlayerEntity player,
                                                     Matrix4f worldPositionMatrix) {
@@ -452,8 +458,9 @@ public final class WorldPanel {
             return stableMatrix;
         }
 
-        // This is the same partial tick stored by Camera.update and read by bobView.
-        float bobTickDelta = mc.gameRenderer.getCamera().getLastTickProgress();
+        // GameRenderer.bobView uses the same partial tick stored by Camera.update.
+        var camera = mc.gameRenderer.getCamera();
+        float bobTickDelta = camera.getLastTickProgress();
         var playerState = player.getState();
         float walkDistance = playerState.getReverseLerpedDistanceMoved(bobTickDelta);
         float bobAmount = playerState.lerpMovement(bobTickDelta);
@@ -470,15 +477,23 @@ public final class WorldPanel {
         float rotateZDegrees = sin * bobAmount * 3.0f;
         float rotateXDegrees = Math.abs((float) Math.cos(phase - 0.2f) * bobAmount) * 5.0f;
 
-        // Match GameRenderer.bobView order exactly: translate, Z rotation, X rotation.
+        // Exact transform order from GameRenderer.bobView in Minecraft 1.21.11.
         Matrix4f inverseVanillaBob = new Matrix4f()
                 .translate(translateX, translateY, 0.0f)
                 .rotateZ((float) Math.toRadians(rotateZDegrees))
                 .rotateX((float) Math.toRadians(rotateXDegrees))
                 .invert();
 
-        // projection * bob * inverseBob * modelView == projection * modelView
-        return inverseVanillaBob.mul(stableMatrix);
+        // WorldRenderContext's object matrix is in world axes; the global camera
+        // view rotation is multiplied separately by LevelRenderer. Conjugate the
+        // camera-space inverse into world axes before applying it to the panel.
+        Matrix4f cameraRotation = new Matrix4f().rotation(camera.getRotation());
+        Matrix4f inverseCameraRotation = new Matrix4f(cameraRotation).invert();
+        Matrix4f inverseBobInWorldSpace = cameraRotation
+                .mul(inverseVanillaBob)
+                .mul(inverseCameraRotation);
+
+        return inverseBobInWorldSpace.mul(stableMatrix);
     }
 
     private static void hookScroll(long handle) {
