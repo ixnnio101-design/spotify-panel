@@ -5,7 +5,11 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.AddressMode;
+import com.mojang.blaze3d.textures.FilterMode;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.GpuSampler;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.render.Camera;
@@ -37,6 +41,7 @@ import javax.imageio.ImageIO;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.OptionalDouble;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -51,8 +56,14 @@ import java.util.Map;
 public final class WorldPanel {
     public static final boolean ENABLED = true;
 
-    private static final int TEX_W = 768;
-    private static final int TEX_H = 500;
+    // Keep all UI layout and pointer coordinates in this logical space. The
+    // backing texture is rendered at 2x so glyphs, thin strokes and small icons
+    // retain more detail after the surface is viewed obliquely in the world.
+    private static final int UI_W = 768;
+    private static final int UI_H = 500;
+    private static final int RENDER_SCALE = 2;
+    private static final int TEX_W = UI_W * RENDER_SCALE;
+    private static final int TEX_H = UI_H * RENDER_SCALE;
     // The updated Blockbench model spans 22 x 14 units. Keep the same world scale
     // per model unit as the previous model so the interface does not change physical size.
     private static final double MODEL_WIDTH = 1.82 * 22.0 / 20.0;
@@ -75,7 +86,33 @@ public final class WorldPanel {
     private static final Identifier OVERLAY_TEXTURE_ID = Identifier.of("spotify-panel", "dynamic/model_overlay");
     private static NativeImageBackedTexture overlayTexture;
     private static long lastOverlayUpdateNs;
-    // Reuse these buffers instead of allocating a 768x500 image on every UI refresh.
+
+    private static final class HighQualityOverlayTexture extends NativeImageBackedTexture {
+        private final GpuSampler panelSampler;
+
+        private HighQualityOverlayTexture(int width, int height) {
+            super("Spotify Blockbench live overlay", width, height, false);
+            int supportedAnisotropy = RenderSystem.getDevice().getMaxSupportedAnisotropy();
+            int anisotropy = Math.max(1, Math.min(4, supportedAnisotropy));
+            this.panelSampler = RenderSystem.getDevice().createSampler(
+                    AddressMode.CLAMP_TO_EDGE,
+                    AddressMode.CLAMP_TO_EDGE,
+                    FilterMode.LINEAR,
+                    FilterMode.LINEAR,
+                    anisotropy,
+                    OptionalDouble.of(0.0)
+            );
+            this.sampler = panelSampler;
+        }
+
+        @Override
+        public void close() {
+            super.close();
+            panelSampler.close();
+        }
+    }
+
+    // Reuse this 2x backing image instead of allocating a new high-resolution image on every UI refresh.
     // Rendering happens on the client render thread, so these buffers are not shared concurrently.
     private static final BufferedImage OVERLAY_IMAGE = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
     private static final Map<Integer, BufferedImage> COVER_IMAGE_BUFFERS = new HashMap<>();
@@ -458,8 +495,8 @@ public final class WorldPanel {
         Vec3d faceCenter = modelPoint(MODEL_OVERLAY_X, MODEL_CENTER_Y, 0, cx, cy, cz, wx, wz, nx, nz);
         double[] uv = intersectUv(cameraPos, ray, faceCenter, wx, wz, nx, nz, MODEL_WIDTH, MODEL_HEIGHT);
         if (uv == null) return;
-        int tx = (int) (uv[0] * TEX_W);
-        int ty = (int) (uv[1] * TEX_H);
+        int tx = (int) (uv[0] * UI_W);
+        int ty = (int) (uv[1] * UI_H);
         // 1 = library sidebar, 2 = track table, 3 = any other part of the panel.
         scrollArea = 3;
         if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) && ty <= py(2.4)) scrollArea = 1;
@@ -595,7 +632,7 @@ public final class WorldPanel {
 
     private static void ensureOverlayTexture(MinecraftClient mc) {
         if (overlayTexture != null) return;
-        overlayTexture = new NativeImageBackedTexture("Spotify Blockbench live overlay", TEX_W, TEX_H, false);
+        overlayTexture = new HighQualityOverlayTexture(TEX_W, TEX_H);
         mc.getTextureManager().registerTexture(OVERLAY_TEXTURE_ID, overlayTexture);
         lastOverlayUpdateNs = 0;
     }
@@ -622,6 +659,9 @@ public final class WorldPanel {
         g.setComposite(java.awt.AlphaComposite.Clear);
         g.fillRect(0, 0, TEX_W, TEX_H);
         g.setComposite(java.awt.AlphaComposite.SrcOver);
+        // All existing layout values, fonts, stroke widths and hit areas remain
+        // expressed in UI_W x UI_H units. Java2D rasterizes them at 2x density.
+        g.scale(RENDER_SCALE, RENDER_SCALE);
         prepare(g);
 
         paintSidebar(g, libraryEntries, selected);
@@ -1270,8 +1310,8 @@ public final class WorldPanel {
             wasLeftDown = down;
             return;
         }
-        int tx = (int) Math.round(uv[0] * TEX_W);
-        int ty = (int) Math.round(uv[1] * TEX_H);
+        int tx = (int) Math.round(uv[0] * UI_W);
+        int ty = (int) Math.round(uv[1] * UI_H);
         SpotifyClient client = SpotifyPanelMod.spotify;
 
         int bottomTop = py(2.3), bottomBottom = py(0.2);
@@ -1536,6 +1576,9 @@ public final class WorldPanel {
 
     private static void prepare(Graphics2D g) {
         g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        g.setRenderingHint(RenderingHints.KEY_COLOR_RENDERING, RenderingHints.VALUE_COLOR_RENDER_QUALITY);
+        g.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
+        g.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
@@ -1563,11 +1606,11 @@ public final class WorldPanel {
     }
 
     private static int px(double modelZ) {
-        return (int) Math.round((modelZ + 11.0) / 22.0 * TEX_W);
+        return (int) Math.round((modelZ + 11.0) / 22.0 * UI_W);
     }
 
     private static int py(double modelY) {
-        return (int) Math.round((14.0 - modelY) / 14.0 * TEX_H);
+        return (int) Math.round((14.0 - modelY) / 14.0 * UI_H);
     }
 
     private static String safe(String value, String fallback) {
