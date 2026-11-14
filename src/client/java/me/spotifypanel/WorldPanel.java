@@ -85,8 +85,10 @@ public final class WorldPanel {
     private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
-    // World anchor follows the player's interpolated coordinates, exactly one block ahead.
-    // It is not camera-relative and is not rendered as a child/attachment of the player.
+    // In first person, use the interpolated render-camera position as the anchor point.
+    // This carries the panel along with vanilla camera bob while retaining body-yaw orientation,
+    // so it remains a 3D world object in front of the player instead of becoming a flat HUD.
+    private static final double CAMERA_Y_OFFSET = -0.34;
     private static final double AHEAD = 1.0;
     private static final int FULL_BRIGHT = LightmapTextureManager.MAX_LIGHT_COORDINATE;
 
@@ -320,10 +322,13 @@ public final class WorldPanel {
         hookSearchInput(mc.getWindow().getHandle());
         if (!(mc.currentScreen instanceof ChatScreen)) searchFocused = false;
         runPendingSearch(mc);
-        // Position is recalculated from the player's interpolated WORLD coordinates every frame.
-        // Only the body direction is used to find the point one block ahead; camera/head yaw is ignored.
-        Vec3d body = player.getLerpedPos(tickDelta);
+        // The panel keeps following the player's torso heading, but in first person its anchor
+        // point follows the interpolated render camera. Minecraft adds view-bobbing to that camera
+        // while walking/running; a torso-height world anchor does not receive the same motion and
+        // therefore appears to shake relative to the screen. Matching the camera position cancels
+        // that relative translation while keeping the same 3D model, yaw, perspective and depth.
         long now = System.nanoTime();
+        Vec3d body = player.getLerpedPos(tickDelta);
         double targetBodyYaw = player.getBodyYaw();
         if (!bodyYawInitialized) {
             smoothedBodyYaw = targetBodyYaw;
@@ -338,14 +343,18 @@ public final class WorldPanel {
         double bodyRad = Math.toRadians(smoothedBodyYaw);
         double fx = -Math.sin(bodyRad), fz = Math.cos(bodyRad);
         double rx = -Math.cos(bodyRad), rz = -Math.sin(bodyRad);
-        double cx = body.x + fx * AHEAD;
-        double cz = body.z + fz * AHEAD;
-        // The flat panel faces back toward the player, with no side offset or extra tilt.
+        boolean firstPerson = mc.options.getPerspective().isFirstPerson();
+        Vec3d anchor = firstPerson ? cameraPos : body;
+        double cx = anchor.x + fx * AHEAD;
+        double cz = anchor.z + fz * AHEAD;
+        // The camera offset matches the old torso anchor's average eye-height offset (about -0.34 m).
+        // Third-person keeps the original body-height placement so the panel remains ahead of the model.
+        double centerY = firstPerson ? cameraPos.y + CAMERA_Y_OFFSET : body.y + 1.28;
+        // The flat panel still faces back toward the player's torso, with no extra side offset or tilt.
         double wx = rx;
         double wz = rz;
         double nx = -fx;
         double nz = -fz;
-        double centerY = body.y + 1.28;
 
         List<SpotifyClient.LibraryEntry> libraryEntries = SpotifyPanelMod.spotify.library();
         SpotifyClient.LibraryEntry selected = selectedLibraryEntry(libraryEntries);
