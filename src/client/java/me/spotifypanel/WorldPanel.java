@@ -82,7 +82,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -322,11 +322,9 @@ public final class WorldPanel {
         hookSearchInput(mc.getWindow().getHandle());
         if (!(mc.currentScreen instanceof ChatScreen)) searchFocused = false;
         runPendingSearch(mc);
-        // The panel keeps following the player's torso heading, but in first person its anchor
-        // point follows the interpolated render camera. Minecraft adds view-bobbing to that camera
-        // while walking/running; a torso-height world anchor does not receive the same motion and
-        // therefore appears to shake relative to the screen. Matching the camera position cancels
-        // that relative translation while keeping the same 3D model, yaw, perspective and depth.
+        // Keep the panel's first-person anchor relative to the interpolated render camera.
+        // The separate vanilla projection bob is cancelled only in this panel's model-view matrix
+        // below, so walking does not shake the panel while the rest of the world remains unchanged.
         long now = System.nanoTime();
         Vec3d body = player.getLerpedPos(tickDelta);
         double targetBodyYaw = player.getBodyYaw();
@@ -404,7 +402,11 @@ public final class WorldPanel {
 
         matrices.push();
         matrices.translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
-        Matrix4f matrix = matrices.peek().getPositionMatrix();
+        // Vanilla applies walking bob to the WORLD PROJECTION matrix (GameRenderer.bobView),
+        // not to CameraRenderState.pos. Following cameraPos alone therefore does not cancel
+        // the shake: the projection still translates and rotates the panel every step.
+        // Cancel that exact transform for this panel only; the rest of the world keeps bobbing.
+        Matrix4f matrix = buildStablePanelMatrix(mc, player, matrices.peek().getPositionMatrix());
 
         // Render the 15 Blockbench elements as thin, world-space planes. Their small X offsets
         // are preserved as subtle layer separation, but no thickness or side faces are invented.
@@ -428,10 +430,55 @@ public final class WorldPanel {
         }
 
         // A transparent live-information layer is mapped to the model's front surface, not screen coordinates.
-        drawOverlay(context, matrices, cx, centerY, cz, wx, wz, nx, nz);
+        drawOverlay(context, matrix, cx, centerY, cz, wx, wz, nx, nz);
         matrices.pop();
 
         handleMouse(mc, cameraPos, cx, centerY, cz, wx, wz, nx, nz, libraryEntries, selected, items);
+    }
+
+    /**
+     * Cancels only Minecraft's first-person walking bob for the panel. In 1.21.11
+     * GameRenderer multiplies the world projection by T(bob) * Rz(bob) * Rx(bob).
+     * Pre-multiplying its inverse into this panel's model-view matrix removes that
+     * screen-space shake without disabling view bobbing for the rest of the world.
+     * The panel remains world-space geometry with normal perspective and depth testing.
+     */
+    private static Matrix4f buildStablePanelMatrix(MinecraftClient mc, ClientPlayerEntity player,
+                                                    Matrix4f worldPositionMatrix) {
+        Matrix4f stableMatrix = new Matrix4f(worldPositionMatrix);
+        if (!mc.options.getPerspective().isFirstPerson()
+                || !mc.options.getBobView().getValue()
+                || mc.getCameraEntity() != player) {
+            return stableMatrix;
+        }
+
+        // This is the same partial tick stored by Camera.update and read by bobView.
+        float bobTickDelta = mc.gameRenderer.getCamera().getLastTickProgress();
+        var playerState = player.getState();
+        float walkDistance = playerState.getReverseLerpedDistanceMoved(bobTickDelta);
+        float bobAmount = playerState.lerpMovement(bobTickDelta);
+        if (!Float.isFinite(walkDistance) || !Float.isFinite(bobAmount)
+                || Math.abs(bobAmount) < 1.0e-7f) {
+            return stableMatrix;
+        }
+
+        float phase = walkDistance * (float) Math.PI;
+        float sin = (float) Math.sin(phase);
+        float cos = (float) Math.cos(phase);
+        float translateX = sin * bobAmount * 0.5f;
+        float translateY = -Math.abs(cos * bobAmount);
+        float rotateZDegrees = sin * bobAmount * 3.0f;
+        float rotateXDegrees = Math.abs((float) Math.cos(phase - 0.2f) * bobAmount) * 5.0f;
+
+        // Match GameRenderer.bobView order exactly: translate, Z rotation, X rotation.
+        Matrix4f inverseVanillaBob = new Matrix4f()
+                .translate(translateX, translateY, 0.0f)
+                .rotateZ((float) Math.toRadians(rotateZDegrees))
+                .rotateX((float) Math.toRadians(rotateXDegrees))
+                .invert();
+
+        // projection * bob * inverseBob * modelView == projection * modelView
+        return inverseVanillaBob.mul(stableMatrix);
     }
 
     private static void hookScroll(long handle) {
@@ -1839,32 +1886,31 @@ public final class WorldPanel {
                 .normal(0.0f, 1.0f, 0.0f);
     }
 
-    private static void drawOverlay(WorldRenderContext context, MatrixStack matrices,
+    private static void drawOverlay(WorldRenderContext context, Matrix4f matrix,
                                     double cx, double cy, double cz, double wx, double wz, double nx, double nz) {
         if (overlayTexture == null) return;
         VertexConsumer vc = context.consumers().getBuffer(RenderLayers.entityCutoutNoCull(OVERLAY_TEXTURE_ID));
-        MatrixStack.Entry entry = matrices.peek();
         Vec3d p0 = modelPoint(MODEL_OVERLAY_X, 0, -11, cx, cy, cz, wx, wz, nx, nz);
         Vec3d p1 = modelPoint(MODEL_OVERLAY_X, 0, 11, cx, cy, cz, wx, wz, nx, nz);
         Vec3d p2 = modelPoint(MODEL_OVERLAY_X, 14.0, 11, cx, cy, cz, wx, wz, nx, nz);
         Vec3d p3 = modelPoint(MODEL_OVERLAY_X, 14.0, -11, cx, cy, cz, wx, wz, nx, nz);
         // The overlay is offset forward from the model surfaces and emitted once,
         // avoiding coplanar alpha blending and the resulting sparkle/flicker.
-        overlayVertex(vc, entry, p0, 0, 1, nx, nz);
-        overlayVertex(vc, entry, p1, 1, 1, nx, nz);
-        overlayVertex(vc, entry, p2, 1, 0, nx, nz);
-        overlayVertex(vc, entry, p3, 0, 0, nx, nz);
+        overlayVertex(vc, matrix, p0, 0, 1);
+        overlayVertex(vc, matrix, p1, 1, 1);
+        overlayVertex(vc, matrix, p2, 1, 0);
+        overlayVertex(vc, matrix, p3, 0, 0);
     }
 
-    private static void overlayVertex(VertexConsumer vc, MatrixStack.Entry entry, Vec3d p,
-                                      float u, float v, double nx, double nz) {
-        vc.vertex(entry, (float) p.x, (float) p.y, (float) p.z)
+    private static void overlayVertex(VertexConsumer vc, Matrix4f matrix, Vec3d p,
+                                      float u, float v) {
+        vc.vertex(matrix, (float) p.x, (float) p.y, (float) p.z)
                 .color(255, 255, 255, 255)
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
                 .light(FULL_BRIGHT)
-                // Constant normal prevents yaw-dependent diffuse shading on the overlay.
-                .normal(entry, 0.0f, 1.0f, 0.0f);
+                // Constant normal prevents diffuse shading from changing with player yaw.
+                .normal(0.0f, 1.0f, 0.0f);
     }
 
     // -------------------------------------------------------------------- click handling against the model's world-space front
