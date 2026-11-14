@@ -37,6 +37,9 @@ import java.awt.RenderingHints;
 import java.awt.geom.Path2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import javax.imageio.ImageIO;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -47,6 +50,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * Renders the user's flat, layered Blockbench Spotify panel in world space.
@@ -57,13 +61,15 @@ public final class WorldPanel {
     public static final boolean ENABLED = true;
 
     // Keep all UI layout and pointer coordinates in this logical space. The
-    // backing texture is rendered at 2x so glyphs, thin strokes and small icons
-    // retain more detail after the surface is viewed obliquely in the world.
+    // backing texture uses 1.5x supersampling so glyphs and small icons remain
+    // sharper than the original 1x raster without the previous 4x pixel cost.
     private static final int UI_W = 768;
     private static final int UI_H = 500;
-    private static final int RENDER_SCALE = 2;
-    private static final int TEX_W = UI_W * RENDER_SCALE;
-    private static final int TEX_H = UI_H * RENDER_SCALE;
+    // 1.5x supersampling keeps text/icons sharper than the original 1x canvas,
+    // while avoiding the 4x pixel cost of the previous 2x backing texture.
+    private static final double RENDER_SCALE = 1.5;
+    private static final int TEX_W = (int) Math.round(UI_W * RENDER_SCALE);
+    private static final int TEX_H = (int) Math.round(UI_H * RENDER_SCALE);
     // The updated Blockbench model spans 22 x 14 units. Keep the same world scale
     // per model unit as the previous model so the interface does not change physical size.
     private static final double MODEL_WIDTH = 1.82 * 22.0 / 20.0;
@@ -85,7 +91,37 @@ public final class WorldPanel {
     private static final Identifier MATERIAL_TEXTURE_ID = Identifier.of("spotify-panel", "textures/misc/panel_material.png");
     private static final Identifier OVERLAY_TEXTURE_ID = Identifier.of("spotify-panel", "dynamic/model_overlay");
     private static NativeImageBackedTexture overlayTexture;
-    private static long lastOverlayUpdateNs;
+    // Overlay is retained in memory and only dirty UI regions are repainted/uploaded.
+    // The 3D quad still renders every world frame; this cache only controls texture work.
+    private static boolean overlayInitialized;
+    private static List<SpotifyClient.LibraryEntry> paintedLibraryRef;
+    private static List<SpotifyClient.Item> paintedItemsRef;
+    private static List<SpotifyClient.Item> paintedSearchResultsRef;
+    private static String paintedSelectedKey = "";
+    private static String paintedSearchText = "";
+    private static String paintedSearchError = "";
+    private static String paintedTrackUri = "";
+    private static String paintedTrackTitle = "";
+    private static String paintedTrackArtists = "";
+    private static String paintedTrackCover = "";
+    private static long paintedTrackDuration;
+    private static SpotifyClient.Status paintedStatus;
+    private static boolean paintedSearchMode;
+    private static boolean paintedSearchFocused;
+    private static boolean paintedSearchLoading;
+    private static boolean paintedSearchPreparing;
+    private static boolean paintedPlaying;
+    private static int paintedVolume = -1;
+    private static long paintedProgressSecond = Long.MIN_VALUE;
+    private static long lastProgressRegionPaintNs;
+    private static long lastVolumeRegionPaintNs;
+    private static long lastScrollRegionPaintNs;
+    private static long lastHighlightRegionPaintNs;
+    private static long paintedCaretPhase = Long.MIN_VALUE;
+    private static double paintedSideScroll = Double.NaN;
+    private static double paintedTrackScroll = Double.NaN;
+    private static double paintedViewTransition = Double.NaN;
+    private static int paintedHighlightSignature = Integer.MIN_VALUE;
 
     private static final class HighQualityOverlayTexture extends NativeImageBackedTexture {
         private final GpuSampler panelSampler;
@@ -93,7 +129,7 @@ public final class WorldPanel {
         private HighQualityOverlayTexture(int width, int height) {
             super("Spotify Blockbench live overlay", width, height, false);
             int supportedAnisotropy = RenderSystem.getDevice().getMaxSupportedAnisotropy();
-            int anisotropy = Math.max(1, Math.min(4, supportedAnisotropy));
+            int anisotropy = Math.max(1, Math.min(2, supportedAnisotropy));
             this.panelSampler = RenderSystem.getDevice().createSampler(
                     AddressMode.CLAMP_TO_EDGE,
                     AddressMode.CLAMP_TO_EDGE,
@@ -112,9 +148,16 @@ public final class WorldPanel {
         }
     }
 
-    // Reuse this 2x backing image instead of allocating a new high-resolution image on every UI refresh.
+    // Reuse the supersampled backing image instead of allocating a new image per refresh.
     // Rendering happens on the client render thread, so these buffers are not shared concurrently.
     private static final BufferedImage OVERLAY_IMAGE = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
+    // Direct RGBA upload buffer avoids calling NativeImage.setColorArgb once per pixel.
+    // Minecraft 1.21.11's CommandEncoder accepts a ByteBuffer for texture uploads.
+    private static final ByteBuffer OVERLAY_UPLOAD_BUFFER = ByteBuffer
+            .allocateDirect(TEX_W * TEX_H * Integer.BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN);
+    private static final IntBuffer OVERLAY_UPLOAD_INTS = OVERLAY_UPLOAD_BUFFER.asIntBuffer();
+    private static final int[] OVERLAY_RGBA_PIXELS = new int[TEX_W * TEX_H];
     private static final Map<Integer, BufferedImage> COVER_IMAGE_BUFFERS = new HashMap<>();
     // Three smooth, pure-white Spotify-style speaker sprites for muted, low and high volume.
     private static final BufferedImage VOLUME_ICON_MUTED = loadVolumeIcon(
@@ -181,6 +224,11 @@ public final class WorldPanel {
 
     private record ModelPart(String name, double x0, double y0, double z0,
                              double x1, double y1, double z1, int frontColor, int sideColor) {}
+
+    private record UiRect(int x, int y, int width, int height) {
+        int right() { return x + width; }
+        int bottom() { return y + height; }
+    }
 
     public static void register() {
         if (ENABLED) WorldRenderEvents.BEFORE_TRANSLUCENT.register(WorldPanel::draw);
@@ -335,19 +383,7 @@ public final class WorldPanel {
         updateScrollAnimation(now, snapshot, items);
 
         ensureOverlayTexture(mc);
-        boolean scrolling = Math.abs(sideScrollVisual - sideScroll) > 0.004
-                || Math.abs(trackScrollVisual - trackScroll) > 0.004;
-        boolean animatingView = viewTransition < 0.995;
-        // Playback time is animated even when idle; mouse dragging gets a 60 Hz texture
-        // refresh so the slider follows the pointer instead of stepping every ~65-250 ms.
-        long overlayIntervalNs;
-        if (dragMode != DRAG_NONE || scrolling || animatingView || searchFocused || searchLoading) overlayIntervalNs = 16_666_667L;
-        else if (snapshot.playing()) overlayIntervalNs = 33_333_333L;
-        else overlayIntervalNs = 180_000_000L;
-        if (now - lastOverlayUpdateNs >= overlayIntervalNs) {
-            lastOverlayUpdateNs = now;
-            upload(overlayTexture, paintOverlay(snapshot, libraryEntries, selected, items));
-        }
+        refreshOverlayIncrementally(snapshot, libraryEntries, selected, items, panelJustOpened, now);
 
         matrices.push();
         matrices.translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
@@ -634,18 +670,362 @@ public final class WorldPanel {
         if (overlayTexture != null) return;
         overlayTexture = new HighQualityOverlayTexture(TEX_W, TEX_H);
         mc.getTextureManager().registerTexture(OVERLAY_TEXTURE_ID, overlayTexture);
-        lastOverlayUpdateNs = 0;
+        overlayInitialized = false;
     }
 
     private static void upload(NativeImageBackedTexture texture, BufferedImage image) {
-        NativeImage target = texture.getImage();
-        if (target == null) return;
-        int[] pixels = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
-        for (int y = 0; y < image.getHeight(); y++) {
-            int base = y * image.getWidth();
-            for (int x = 0; x < image.getWidth(); x++) target.setColorArgb(x, y, pixels[base + x]);
+        if (texture.getGlTexture() == null) return;
+
+        int[] argb = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
+
+        // NativeImage.Format.RGBA is byte-ordered RGBA on little-endian systems.
+        // Convert Java2D's 0xAARRGGBB pixels to 0xAABBGGRR in a reusable heap
+        // array, then copy the whole array into the direct upload buffer in one
+        // bulk operation. This is used for the initial/full refresh; later changes
+        // use uploadRegion() to transfer only dirty rectangles.
+        for (int i = 0; i < argb.length; i++) {
+            int pixel = argb[i];
+            OVERLAY_RGBA_PIXELS[i] = (pixel & 0xFF00FF00)
+                    | ((pixel & 0x00FF0000) >>> 16)
+                    | ((pixel & 0x000000FF) << 16);
         }
-        texture.upload();
+
+        OVERLAY_UPLOAD_INTS.clear();
+        OVERLAY_UPLOAD_INTS.put(OVERLAY_RGBA_PIXELS);
+        OVERLAY_UPLOAD_BUFFER.position(0);
+        OVERLAY_UPLOAD_BUFFER.limit(TEX_W * TEX_H * Integer.BYTES);
+        RenderSystem.getDevice().createCommandEncoder().writeToTexture(
+                texture.getGlTexture(), OVERLAY_UPLOAD_BUFFER, NativeImage.Format.RGBA,
+                0, 0, 0, 0, TEX_W, TEX_H
+        );
+    }
+
+    /**
+     * Detects which visual groups changed and repaints only those groups.
+     * Static regions remain in OVERLAY_IMAGE and are never regenerated for playhead ticks.
+     */
+    private static void refreshOverlayIncrementally(SpotifyClient.Snapshot snapshot,
+                                                     List<SpotifyClient.LibraryEntry> libraryEntries,
+                                                     SpotifyClient.LibraryEntry selected,
+                                                     List<SpotifyClient.Item> items,
+                                                     boolean panelJustOpened, long now) {
+        String selectedKey = selected == null ? "" : selected.key();
+        String trackUri = snapshot.track() == null ? "" : safe(snapshot.track().uri(), "");
+        String trackTitle = snapshot.track() == null ? titleForInactive(snapshot)
+                : safe(snapshot.track().title(), "");
+        String trackArtists = snapshot.track() == null ? statusDetail(snapshot)
+                : safe(snapshot.track().artists(), "");
+        String trackCover = snapshot.track() == null ? "" : safe(snapshot.track().coverUrl(), "");
+        long trackDuration = snapshot.track() == null ? 0L : snapshot.track().durationMs();
+        boolean isSearchMode = searchMode();
+
+        if (!overlayInitialized || panelJustOpened) {
+            // Texture allocation can complete one render tick after registration.
+            // Do not mark the cache initialized until the full base image was uploaded.
+            if (overlayTexture.getGlTexture() == null) return;
+            upload(overlayTexture, paintOverlay(snapshot, libraryEntries, selected, items));
+            overlayInitialized = true;
+            rememberOverlayState(snapshot, libraryEntries, selectedKey, items, isSearchMode,
+                    trackUri, trackTitle, trackArtists, trackCover, trackDuration, now);
+            paintedVolume = (int) Math.round(Math.max(0.0, Math.min(100.0, displayedVolume)));
+            paintedProgressSecond = Math.max(0L, Math.round(displayedProgressMs) / 1000L);
+            paintedSideScroll = sideScrollVisual;
+            paintedTrackScroll = trackScrollVisual;
+            paintedViewTransition = viewTransition;
+            paintedHighlightSignature = highlightSignature();
+            paintedCaretPhase = searchFocused ? System.currentTimeMillis() / 500L : Long.MIN_VALUE;
+            lastProgressRegionPaintNs = now;
+            lastVolumeRegionPaintNs = now;
+            lastScrollRegionPaintNs = now;
+            lastHighlightRegionPaintNs = now;
+            return;
+        }
+
+        boolean libraryChanged = libraryEntries != paintedLibraryRef;
+        boolean selectionChanged = !selectedKey.equals(paintedSelectedKey);
+        boolean itemsChanged = items != paintedItemsRef;
+        boolean modeChanged = isSearchMode != paintedSearchMode;
+        boolean searchTextChanged = !searchText.equals(paintedSearchText);
+        boolean searchFocusChanged = searchFocused != paintedSearchFocused;
+        boolean searchLoadingChanged = searchLoading != paintedSearchLoading;
+        boolean searchPreparing = searchDebounceAtMs > 0;
+        boolean searchPreparingChanged = searchPreparing != paintedSearchPreparing;
+        boolean searchErrorChanged = !searchError.equals(paintedSearchError);
+        boolean searchResultsChanged = searchResults != paintedSearchResultsRef;
+        boolean trackChanged = !trackUri.equals(paintedTrackUri)
+                || !trackTitle.equals(paintedTrackTitle)
+                || !trackArtists.equals(paintedTrackArtists)
+                || !trackCover.equals(paintedTrackCover)
+                || trackDuration != paintedTrackDuration;
+        boolean statusChanged = snapshot.status() != paintedStatus;
+        boolean playingChanged = snapshot.playing() != paintedPlaying;
+
+        boolean contentChanged = !isSearchMode && (selectionChanged || itemsChanged || libraryChanged);
+        boolean resultsChanged = modeChanged || (isSearchMode && (searchTextChanged || searchLoadingChanged
+                || searchPreparingChanged || searchErrorChanged || searchResultsChanged));
+
+        if (libraryChanged || selectionChanged) {
+            repaintRegion(overlayTexture, sidebarRect(), g -> paintSidebar(g, libraryEntries, selected));
+            paintedSideScroll = sideScrollVisual;
+        }
+
+        if (modeChanged || contentChanged || resultsChanged) {
+            repaintRegion(overlayTexture, contentRect(), g -> {
+                if (isSearchMode) {
+                    paintSearchResults(g, snapshot);
+                } else {
+                    paintHeaderAndTrackWithTransition(g, snapshot, items, selected);
+                }
+            });
+            paintedViewTransition = viewTransition;
+            paintedTrackScroll = trackScrollVisual;
+            paintedHighlightSignature = highlightSignature();
+            lastScrollRegionPaintNs = now;
+            lastHighlightRegionPaintNs = now;
+        } else if (isSearchMode && Math.abs(trackScrollVisual - paintedTrackScroll) > 0.001
+                && now - lastScrollRegionPaintNs >= 41_666_667L) {
+            repaintRegion(overlayTexture, contentRect(), g -> paintSearchResults(g, snapshot));
+            paintedTrackScroll = trackScrollVisual;
+            lastScrollRegionPaintNs = now;
+        } else if (!isSearchMode && Math.abs(trackScrollVisual - paintedTrackScroll) > 0.001
+                && now - lastScrollRegionPaintNs >= 41_666_667L) {
+            repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+            paintedTrackScroll = trackScrollVisual;
+            lastScrollRegionPaintNs = now;
+        }
+
+        if (searchTextChanged || searchFocusChanged || searchPreparingChanged
+                || (searchFocused && (System.currentTimeMillis() / 500L) != paintedCaretPhase)) {
+            repaintRegion(overlayTexture, searchBarRect(), WorldPanel::paintSearchBar);
+            paintedCaretPhase = searchFocused ? System.currentTimeMillis() / 500L : Long.MIN_VALUE;
+        }
+
+        if (trackChanged || statusChanged) {
+            repaintRegion(overlayTexture, nowPlayingRect(), g -> paintNowPlaying(g, snapshot));
+        } else if (playingChanged) {
+            repaintRegion(overlayTexture, nowPlayingStatusRect(), g -> paintNowPlayingStatus(g, snapshot));
+        }
+
+        if (trackChanged) {
+            repaintRegion(overlayTexture, bottomMetadataRect(), g -> paintBottomMetadataPartial(g, snapshot));
+            if (isSearchMode) {
+                repaintRegion(overlayTexture, contentRect(), g -> paintSearchResults(g, snapshot));
+                paintedTrackScroll = trackScrollVisual;
+            } else {
+                repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+                paintedHighlightSignature = highlightSignature();
+                lastHighlightRegionPaintNs = now;
+            }
+        }
+        if (playingChanged) {
+            repaintRegion(overlayTexture, bottomPlayButtonRect(), g -> paintBottomPlayButtonPartial(g, snapshot));
+        }
+
+        int volumeNow = (int) Math.round(Math.max(0.0, Math.min(100.0, displayedVolume)));
+        boolean volumeNeedsPaint = volumeNow != paintedVolume
+                && (dragMode != DRAG_VOLUME || now - lastVolumeRegionPaintNs >= 33_333_333L);
+        if (volumeNeedsPaint) {
+            repaintRegion(overlayTexture, bottomVolumeRect(), g -> paintBottomVolumePartial(g, volumeNow));
+            paintedVolume = volumeNow;
+            lastVolumeRegionPaintNs = now;
+        }
+
+        boolean scrollMoving = Math.abs(sideScrollVisual - paintedSideScroll) > 0.001;
+        if (scrollMoving && now - lastScrollRegionPaintNs >= 41_666_667L) {
+            repaintRegion(overlayTexture, sidebarRect(), g -> paintSidebar(g, libraryEntries, selected));
+            paintedSideScroll = sideScrollVisual;
+            lastScrollRegionPaintNs = now;
+        }
+
+        boolean transitionMoving = Math.abs(viewTransition - paintedViewTransition) > 0.001;
+        if (!isSearchMode && transitionMoving && now - lastScrollRegionPaintNs >= 41_666_667L) {
+            repaintRegion(overlayTexture, contentRect(), g -> {
+                paintHeaderAndTrackWithTransition(g, snapshot, items, selected);
+            });
+            paintedViewTransition = viewTransition;
+            paintedTrackScroll = trackScrollVisual;
+            lastScrollRegionPaintNs = now;
+        }
+
+        int currentHighlightSignature = highlightSignature();
+        if (!isSearchMode && currentHighlightSignature != paintedHighlightSignature
+                && now - lastHighlightRegionPaintNs >= 41_666_667L) {
+            repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+            paintedHighlightSignature = currentHighlightSignature;
+            lastHighlightRegionPaintNs = now;
+        }
+
+        long progressSecond = Math.max(0L, Math.round(displayedProgressMs) / 1000L);
+        boolean progressChanged = trackChanged || progressSecond != paintedProgressSecond
+                || (snapshot.playing() && now - lastProgressRegionPaintNs >= 66_666_667L)
+                || (dragMode == DRAG_SEEK && now - lastProgressRegionPaintNs >= 33_333_333L);
+        if (progressChanged) {
+            repaintRegion(overlayTexture, bottomProgressRect(), g -> paintBottomProgressPartial(g, snapshot));
+            paintedProgressSecond = progressSecond;
+            lastProgressRegionPaintNs = now;
+        }
+
+        rememberOverlayState(snapshot, libraryEntries, selectedKey, items, isSearchMode,
+                trackUri, trackTitle, trackArtists, trackCover, trackDuration, now);
+    }
+
+    private static int highlightSignature() {
+        // Order-independent hash: stable full-opacity highlights do not trigger redraws,
+        // while any actual alpha change during a track-transition fade invalidates the rows.
+        long sum = 0L;
+        long xor = 0L;
+        for (Map.Entry<String, Double> entry : playingHighlightAlpha.entrySet()) {
+            long value = ((long) entry.getKey().hashCode() << 32)
+                    ^ Math.round(entry.getValue() * 10_000.0);
+            sum += value;
+            xor ^= Long.rotateLeft(value, (int) (value & 31));
+        }
+        long combined = sum ^ xor;
+        return (int) (combined ^ (combined >>> 32));
+    }
+
+    private static void rememberOverlayState(SpotifyClient.Snapshot snapshot,
+                                             List<SpotifyClient.LibraryEntry> libraryEntries,
+                                             String selectedKey, List<SpotifyClient.Item> items,
+                                             boolean isSearchMode, String trackUri, String trackTitle,
+                                             String trackArtists, String trackCover, long trackDuration,
+                                             long now) {
+        paintedLibraryRef = libraryEntries;
+        paintedSelectedKey = selectedKey;
+        paintedItemsRef = items;
+        paintedSearchResultsRef = searchResults;
+        paintedSearchMode = isSearchMode;
+        paintedSearchText = searchText;
+        paintedSearchFocused = searchFocused;
+        paintedSearchLoading = searchLoading;
+        paintedSearchPreparing = searchDebounceAtMs > 0;
+        paintedSearchError = searchError;
+        paintedTrackUri = trackUri;
+        paintedTrackTitle = trackTitle;
+        paintedTrackArtists = trackArtists;
+        paintedTrackCover = trackCover;
+        paintedTrackDuration = trackDuration;
+        paintedStatus = snapshot.status();
+        paintedPlaying = snapshot.playing();
+        // Dynamic painted values are advanced only by the region that actually
+        // uploads them. Do not overwrite these here: throttled scroll/progress
+        // regions must remain dirty until their next partial refresh.
+        overlayInitialized = true;
+    }
+
+    private static void repaintRegion(NativeImageBackedTexture texture, UiRect logicalRect,
+                                      Consumer<Graphics2D> painter) {
+        if (texture == null || texture.getGlTexture() == null || logicalRect.width() <= 0 || logicalRect.height() <= 0) return;
+        int x = Math.max(0, (int) Math.floor(logicalRect.x() * RENDER_SCALE));
+        int y = Math.max(0, (int) Math.floor(logicalRect.y() * RENDER_SCALE));
+        int right = Math.min(TEX_W, (int) Math.ceil(logicalRect.right() * RENDER_SCALE));
+        int bottom = Math.min(TEX_H, (int) Math.ceil(logicalRect.bottom() * RENDER_SCALE));
+        int width = right - x, height = bottom - y;
+        if (width <= 0 || height <= 0) return;
+
+        Graphics2D g = OVERLAY_IMAGE.createGraphics();
+        // Set and clear the dirty rectangle in backing-texture pixels before applying
+        // the logical UI scale. Its clip then constrains every painter to this region.
+        g.setClip(x, y, width, height);
+        g.setComposite(java.awt.AlphaComposite.Clear);
+        g.fillRect(x, y, width, height);
+        g.setComposite(java.awt.AlphaComposite.SrcOver);
+        g.scale(RENDER_SCALE, RENDER_SCALE);
+        prepare(g);
+        painter.accept(g);
+        g.dispose();
+        uploadRegion(texture, x, y, width, height);
+    }
+
+    private static void uploadRegion(NativeImageBackedTexture texture, int x, int y, int width, int height) {
+        int[] pixels = ((DataBufferInt) OVERLAY_IMAGE.getRaster().getDataBuffer()).getData();
+        OVERLAY_UPLOAD_INTS.clear();
+        for (int row = 0; row < height; row++) {
+            int source = (y + row) * TEX_W + x;
+            for (int col = 0; col < width; col++) {
+                int argb = pixels[source + col];
+                int rgba = (argb & 0xFF00FF00)
+                        | ((argb & 0x00FF0000) >>> 16)
+                        | ((argb & 0x000000FF) << 16);
+                OVERLAY_UPLOAD_INTS.put(rgba);
+            }
+        }
+        OVERLAY_UPLOAD_BUFFER.position(0);
+        OVERLAY_UPLOAD_BUFFER.limit(width * height * Integer.BYTES);
+        RenderSystem.getDevice().createCommandEncoder().writeToTexture(
+                texture.getGlTexture(), OVERLAY_UPLOAD_BUFFER, NativeImage.Format.RGBA,
+                0, 0, x, y, width, height
+        );
+        OVERLAY_UPLOAD_BUFFER.clear();
+    }
+
+    private static UiRect sidebarRect() {
+        int x0 = px(-10.8), x1 = px(-9.6), y0 = py(12.7), y1 = py(2.4);
+        return new UiRect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    private static UiRect searchBarRect() {
+        int x0 = px(-3.85), x1 = px(3.85), y0 = py(13.78), y1 = py(12.92);
+        return new UiRect(x0 - 3, y0 - 3, x1 - x0 + 6, y1 - y0 + 6);
+    }
+
+    private static UiRect contentRect() {
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(12.5), y1 = py(2.4);
+        return new UiRect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    private static UiRect trackTableRect() {
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
+        return new UiRect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    private static UiRect nowPlayingRect() {
+        int x0 = px(5.4), x1 = px(10.8), y0 = py(12.7), y1 = py(2.4);
+        return new UiRect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    private static UiRect nowPlayingStatusRect() {
+        int x0 = px(5.4), x1 = px(10.8), baseline = py(7.1) + 101;
+        return new UiRect(x0, baseline - 22, x1 - x0, 30);
+    }
+
+    private static UiRect bottomMetadataRect() {
+        int left = px(-10.4) - 4;
+        int center = (px(-3.0) + px(3.0)) / 2;
+        int y0 = py(2.3) + 4, y1 = py(0.2) - 3;
+        return new UiRect(left, y0, center - 70 - left, y1 - y0);
+    }
+
+    private static UiRect bottomPlayButtonRect() {
+        int center = (px(-3.0) + px(3.0)) / 2;
+        int y = py(2.3) + 26;
+        return new UiRect(center - 17, y - 17, 34, 34);
+    }
+
+    private static UiRect bottomProgressRect() {
+        int barX = px(-3.0), barRight = px(3.0), barY = py(0.2) - 12;
+        return new UiRect(barX - 38, barY - 19, barRight - barX + 43, 29);
+    }
+
+    private static UiRect bottomVolumeRect() {
+        int left = volumeGroupLeft() - 3;
+        int right = volumeSliderX1() + 3;
+        int centerY = volumeSliderY();
+        return new UiRect(left, centerY - 20, right - left, 40);
+    }
+
+    private static void paintHeaderAndTrackWithTransition(Graphics2D g, SpotifyClient.Snapshot snapshot,
+                                                            List<SpotifyClient.Item> items,
+                                                            SpotifyClient.LibraryEntry selected) {
+        java.awt.Composite previousComposite = g.getComposite();
+        java.awt.geom.AffineTransform previousTransform = g.getTransform();
+        float transitionAlpha = (float) Math.max(0.0, Math.min(1.0, viewTransition));
+        g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, transitionAlpha));
+        g.translate(0, Math.round((1.0 - viewTransition) * 10.0));
+        paintPlaylistHeader(g, selected, items);
+        paintTrackTable(g, snapshot, items, selected);
+        g.setTransform(previousTransform);
+        g.setComposite(previousComposite);
     }
 
     // -------------------------------------------------------------------- live overlay painting
@@ -660,7 +1040,7 @@ public final class WorldPanel {
         g.fillRect(0, 0, TEX_W, TEX_H);
         g.setComposite(java.awt.AlphaComposite.SrcOver);
         // All existing layout values, fonts, stroke widths and hit areas remain
-        // expressed in UI_W x UI_H units. Java2D rasterizes them at 2x density.
+        // expressed in UI_W x UI_H units. Java2D rasterizes them at supersampled density.
         g.scale(RENDER_SCALE, RENDER_SCALE);
         prepare(g);
 
@@ -1178,6 +1558,89 @@ public final class WorldPanel {
                 (int) ((volumeBarRight - volumeBarX) * visualVolume / 100.0), 4);
     }
 
+    private static void paintBottomMetadataPartial(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = bottomMetadataRect();
+        g.setColor(new Color(4, 7, 5, 250));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        int y0 = py(2.3), leftCover = px(-10.4), leftY = y0 + 12;
+        int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
+        drawCover(g, cover, 48, leftCover, leftY, 50);
+        int center = (px(-3.0) + px(3.0)) / 2;
+        int trackTextX = leftCover + 58;
+        int trackTextMax = Math.max(120, Math.min(190, center - 60 - trackTextX));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 17));
+        drawReadableText(g, fit(g, s.track() == null ? "Spotify" : s.track().title(), trackTextMax),
+                trackTextX, leftY + 22, Color.WHITE);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 15));
+        drawReadableText(g, fit(g, s.track() == null ? "Подключи аккаунт" : s.track().artists(), trackTextMax),
+                trackTextX, leftY + 43, new Color(238, 242, 239));
+    }
+
+    private static void paintBottomPlayButtonPartial(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = bottomPlayButtonRect();
+        g.setColor(new Color(4, 7, 5, 250));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        int center = (px(-3.0) + px(3.0)) / 2;
+        int controlCenterY = py(2.3) + 26;
+        g.setColor(new Color(30, 215, 96));
+        fillPixelButton(g, center - 13, controlCenterY - 13, 26, 26);
+        g.setColor(new Color(4, 16, 8));
+        if (s.playing()) {
+            g.fillRect(center - 5, controlCenterY - 7, 4, 14);
+            g.fillRect(center + 2, controlCenterY - 7, 4, 14);
+        } else {
+            g.fillPolygon(new Polygon(new int[]{center - 4, center - 4, center + 8},
+                    new int[]{controlCenterY - 8, controlCenterY + 8, controlCenterY}, 3));
+        }
+    }
+
+    private static void paintBottomProgressPartial(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = bottomProgressRect();
+        g.setColor(new Color(4, 7, 5, 250));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        long duration = s.track() == null ? 0 : Math.max(0, s.track().durationMs());
+        long visualProgress = progressVisualInitialized ? Math.round(displayedProgressMs) : s.currentProgress();
+        long progress = duration == 0 ? 0 : Math.max(0, Math.min(duration, visualProgress));
+        double fraction = duration == 0 ? 0 : progress / (double) duration;
+        int barX = px(-3.0), barRight = px(3.0), barY = py(0.2) - 12;
+        g.setColor(new Color(103, 122, 109, 170));
+        g.fillRect(barX, barY, barRight - barX, 4);
+        g.setColor(new Color(30, 215, 96));
+        g.fillRect(barX, barY, (int) ((barRight - barX) * fraction), 4);
+        g.setFont(new Font(Font.MONOSPACED, Font.BOLD, 14));
+        g.setColor(new Color(238, 242, 239));
+        drawUiText(g, formatTime(progress), barX, barY - 5, g.getColor());
+        String total = formatTime(duration);
+        drawUiText(g, total, barRight - g.getFontMetrics().stringWidth(total), barY - 5, g.getColor());
+    }
+
+    private static void paintBottomVolumePartial(Graphics2D g, int volume) {
+        UiRect rect = bottomVolumeRect();
+        g.setColor(new Color(4, 7, 5, 250));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        int volumeBarX = volumeSliderX0(), volumeBarRight = volumeSliderX1();
+        int volumeCenterY = volumeSliderY();
+        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 16, volume);
+        int volumeBarY = volumeCenterY - 2;
+        g.setColor(new Color(75, 94, 81));
+        g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
+        g.setColor(new Color(30, 215, 96));
+        g.fillRect(volumeBarX, volumeBarY,
+                (int) ((volumeBarRight - volumeBarX) * volume / 100.0), 4);
+    }
+
+    private static void paintNowPlayingStatus(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = nowPlayingStatusRect();
+        g.setColor(new Color(7, 11, 8, 248));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        int coverX = px(5.6);
+        int textY = py(7.1);
+        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
+        g.setColor(new Color(220, 230, 223));
+        drawReadableText(g, s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА",
+                coverX + 4, textY + 101, new Color(230, 238, 232));
+    }
+
     // -------------------------------------------------------------------- model geometry
 
     private static void drawModelPart(VertexConsumer vc, Matrix4f matrix,
@@ -1582,7 +2045,7 @@ public final class WorldPanel {
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
-        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
     }
 
     private static void drawCover(Graphics2D g, int[] pixels, int size, int x, int y, int target) {
