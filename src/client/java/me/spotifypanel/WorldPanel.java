@@ -87,7 +87,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -138,7 +138,8 @@ public final class WorldPanel {
     private static String lyricsVisualTrackUri = "";
     private static long lastLyricsRegionPaintNs;
     private static final long LYRICS_REGION_FRAME_NS = 33_333_333L; // smooth text motion at up to 30 Hz
-    private static final Font LYRICS_WRAP_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 12);
+    // Larger, clean lyric type is easier to read in the narrow world-space card.
+    private static final Font LYRICS_WRAP_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 14);
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
@@ -252,8 +253,8 @@ public final class WorldPanel {
     private static final double SEARCH_RESULTS_TOP = 12.5;
     private static final int SEARCH_RESULT_ROW_HEIGHT = 35;
     private static final int SEARCH_VISIBLE_ROWS = 8;
-    private static final int LYRICS_VISIBLE_LINES = 5;
-    private static final int LYRICS_LINE_HEIGHT = 18;
+    private static final int LYRICS_VISIBLE_LINES = 6;
+    private static final int LYRICS_LINE_HEIGHT = 19;
 
     private WorldPanel() {}
 
@@ -1223,8 +1224,7 @@ public final class WorldPanel {
     private static int nowPlayingTitleBaseline() { return nowPlayingInfoTop() + 40; }
     private static int nowPlayingArtistBaseline() { return nowPlayingInfoTop() + 60; }
     private static int nowPlayingStatusBaseline() { return nowPlayingInfoTop() + 80; }
-    private static int nowPlayingLyricsHeaderBaseline() { return nowPlayingInfoTop() + 101; }
-    private static int nowPlayingLyricsFirstBaseline() { return nowPlayingInfoTop() + 121; }
+    private static int nowPlayingLyricsTop() { return nowPlayingInfoTop() + 89; }
 
     private static UiRect nowPlayingCoverRect() {
         int x = nowPlayingCoverX(), y = nowPlayingCoverY(), size = nowPlayingCoverSize();
@@ -1249,7 +1249,7 @@ public final class WorldPanel {
 
     private static UiRect nowPlayingLyricsRect() {
         int x0 = nowPlayingCardX0() + 7, x1 = nowPlayingCardX1() - 7;
-        int top = nowPlayingLyricsHeaderBaseline() - 12;
+        int top = nowPlayingLyricsTop();
         int bottom = py(2.4) - 4;
         return new UiRect(x0, top, x1 - x0, Math.max(1, bottom - top));
     }
@@ -1774,17 +1774,14 @@ public final class WorldPanel {
         Shape oldClip = g.getClip();
         Paint oldPaint = g.getPaint();
         Stroke oldStroke = g.getStroke();
-        g.setPaint(new java.awt.GradientPaint(rect.x(), rect.y(), new Color(12, 27, 31, 248),
-                rect.x(), rect.bottom(), new Color(7, 17, 21, 250)));
+        // Solid dark fill and one continuous, fully opaque turquoise outline.
+        // No glow or top accent: the border stays visually clean at oblique angles.
+        g.setPaint(new java.awt.GradientPaint(rect.x(), rect.y(), new Color(8, 18, 20, 252),
+                rect.x(), rect.bottom(), new Color(5, 12, 14, 252)));
         g.fill(card);
-        g.setColor(new Color(47, 203, 190, 48));
-        g.setStroke(new BasicStroke(3.2f));
+        g.setColor(new Color(35, 225, 210, 255));
+        g.setStroke(new BasicStroke(2.0f));
         g.draw(card);
-        g.setColor(new Color(72, 218, 204, 218));
-        g.setStroke(new BasicStroke(1.25f));
-        g.draw(card);
-        g.setColor(new Color(133, 241, 225, 145));
-        g.fillRoundRect(rect.x() + 11, rect.y() + 2, 34, 2, 2, 2);
 
         RoundRectangle2D.Double innerClip = new RoundRectangle2D.Double(
                 rect.x() + 5.0, rect.y() + 5.0,
@@ -1798,41 +1795,36 @@ public final class WorldPanel {
 
     private static void paintNowPlayingLyricsContent(Graphics2D g, SpotifyClient.Snapshot snapshot,
                                                       SpotifyClient.Lyrics lyrics, UiRect rect) {
-        int x0 = rect.x() + 11;
-        int width = Math.max(20, rect.width() - 22);
-        int headerY = nowPlayingLyricsHeaderBaseline();
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 11));
-        drawReadableText(g, "ТЕКСТ ПЕСНИ", x0, headerY, new Color(105, 231, 216));
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 8));
-        String source = "LRCLIB";
-        drawReadableText(g, source, rect.right() - 11 - g.getFontMetrics().stringWidth(source),
-                headerY, new Color(87, 173, 168));
+        // The card has no title/source labels; use that space for the lyrics themselves.
+        int x0 = rect.x() + 12;
+        int width = Math.max(20, rect.width() - 24);
+        int messageBaseline = rect.y() + rect.height() / 2 + 5;
 
         if (lyrics == null || lyrics.status() == SpotifyClient.LyricsStatus.IDLE) {
-            drawLyricsMessage(g, "Включи трек", x0, width, headerY + 19);
+            drawLyricsMessage(g, "Включи трек", x0, width, messageBaseline);
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.LOADING) {
-            drawLyricsMessage(g, "Ищем текст...", x0, width, headerY + 19);
+            drawLyricsMessage(g, "Ищем текст...", x0, width, messageBaseline);
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.INSTRUMENTAL || lyrics.instrumental()) {
-            drawLyricsMessage(g, "Инструментальная композиция", x0, width, headerY + 19);
+            drawLyricsMessage(g, "Инструментальная композиция", x0, width, messageBaseline);
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.NOT_FOUND) {
-            drawLyricsMessage(g, "Текст не найден", x0, width, headerY + 19);
+            drawLyricsMessage(g, "Текст не найден", x0, width, messageBaseline);
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.ERROR) {
             String message = lyrics.message().isBlank() ? "Сервис текста недоступен" : lyrics.message();
-            drawLyricsMessage(g, message, x0, width, headerY + 19);
+            drawLyricsMessage(g, message, x0, width, messageBaseline);
             return;
         }
 
         ensureLyricsLayout(lyrics);
         if (lyricsDisplayLines.isEmpty()) {
-            drawLyricsMessage(g, "Текст не найден", x0, width, headerY + 19);
+            drawLyricsMessage(g, "Текст не найден", x0, width, messageBaseline);
             return;
         }
 
@@ -1842,39 +1834,40 @@ public final class WorldPanel {
         double transition = lyrics.syncedLines().isEmpty() ? 0.0
                 : currentSyncedLyricBlend(lyrics, progressVisualInitialized
                 ? Math.round(displayedProgressMs) : snapshot.currentProgress());
-        drawLyricsLines(g, lyricsDisplayLines, active, transition, x0, width, headerY);
+        drawLyricsLines(g, lyricsDisplayLines, active, transition, x0, width, rect);
     }
 
     private static void drawLyricsLines(Graphics2D g, List<LyricsDisplayLine> lines,
                                         int activeSourceIndex, double transition,
-                                        int x, int width, int headerBaseline) {
+                                        int x, int width, UiRect rect) {
         int first = Math.max(0, (int) Math.floor(lyricsVisualScroll));
         double fraction = Math.max(0.0, Math.min(0.999, lyricsVisualScroll - first));
-        int baseline = headerBaseline + 20;
+        int baseline = rect.y() + 21;
         Shape oldClip = g.getClip();
-        UiRect rect = nowPlayingLyricsRect();
-        g.clipRect(rect.x() + 7, baseline - 14, rect.width() - 14,
-                Math.max(1, rect.bottom() - baseline + 4));
+        // Keep glyphs inside the turquoise outline without clipping ascenders/descenders.
+        g.clipRect(rect.x() + 7, rect.y() + 5, rect.width() - 14, rect.height() - 10);
 
         g.setFont(LYRICS_WRAP_FONT);
-        for (int row = 0; row <= LYRICS_VISIBLE_LINES; row++) {
+        for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
             int displayIndex = first + row;
             if (displayIndex >= lines.size()) break;
             LyricsDisplayLine line = lines.get(displayIndex);
             int y = baseline + row * LYRICS_LINE_HEIGHT - (int) Math.round(fraction * LYRICS_LINE_HEIGHT);
             Color color;
             if (activeSourceIndex < 0) {
-                color = new Color(214, 226, 220);
+                color = new Color(238, 245, 242);
             } else if (line.sourceIndex() < activeSourceIndex) {
-                color = new Color(112, 133, 124);
+                color = new Color(170, 190, 184);
             } else if (line.sourceIndex() == activeSourceIndex) {
-                color = blend(new Color(245, 250, 246), new Color(128, 151, 141), transition);
+                color = blend(new Color(250, 255, 253), new Color(72, 232, 211), transition * 0.30);
             } else if (line.sourceIndex() == activeSourceIndex + 1) {
-                color = blend(new Color(166, 188, 179), new Color(245, 250, 246), transition);
+                color = blend(new Color(211, 228, 222), new Color(250, 255, 253), transition * 0.70);
             } else {
-                color = new Color(178, 197, 188);
+                color = new Color(218, 231, 226);
             }
-            drawCenteredReadableText(g, line.text(), x, width, y, color);
+            // Lyrics are deliberately drawn without the global drop shadow; it blurred
+            // narrow strokes against the dark card in the world-space projection.
+            drawUiText(g, line.text(), x, y, color);
         }
         g.setClip(oldClip);
     }
@@ -1883,18 +1876,18 @@ public final class WorldPanel {
         g.setFont(LYRICS_WRAP_FONT);
         List<String> wrapped = wrapLyricsText(g, message, width);
         int rows = Math.min(3, wrapped.size());
-        int start = baseline - Math.max(0, rows - 1) * 7;
+        int start = baseline - Math.max(0, rows - 1) * 9;
         for (int i = 0; i < rows; i++) {
-            drawCenteredReadableText(g, wrapped.get(i), x, width,
-                    start + i * 14, new Color(145, 174, 165));
+            drawCenteredLyricsText(g, wrapped.get(i), x, width,
+                    start + i * LYRICS_LINE_HEIGHT, new Color(225, 239, 234));
         }
     }
 
-    private static void drawCenteredReadableText(Graphics2D g, String text, int x, int width,
-                                                  int baseline, Color color) {
+    private static void drawCenteredLyricsText(Graphics2D g, String text, int x, int width,
+                                                int baseline, Color color) {
         if (text == null || text.isEmpty()) return;
         int drawX = x + Math.max(0, (width - g.getFontMetrics().stringWidth(text)) / 2);
-        drawReadableText(g, text, drawX, baseline, color);
+        drawUiText(g, text, drawX, baseline, color);
     }
 
     private static void ensureLyricsLayout(SpotifyClient.Lyrics lyrics) {
@@ -1903,7 +1896,7 @@ public final class WorldPanel {
         Graphics2D metrics = OVERLAY_IMAGE.createGraphics();
         try {
             metrics.setFont(LYRICS_WRAP_FONT);
-            int width = Math.max(24, nowPlayingLyricsRect().width() - 22);
+            int width = Math.max(24, nowPlayingLyricsRect().width() - 24);
             if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
                 if (!lyrics.syncedLines().isEmpty()) {
                     for (int i = 0; i < lyrics.syncedLines().size(); i++) {
