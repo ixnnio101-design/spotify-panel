@@ -31,10 +31,15 @@ import org.lwjgl.glfw.GLFWKeyCallback;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Paint;
+import java.awt.Stroke;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.RenderingHints;
+import java.awt.Shape;
 import java.awt.geom.Path2D;
+import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
@@ -82,7 +87,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -120,6 +125,20 @@ public final class WorldPanel {
     private static int paintedLyricsLineIndex = Integer.MIN_VALUE;
     private static int paintedLyricsScroll = Integer.MIN_VALUE;
     private static int lyricsScroll;
+    // The LRCLIB text itself is still requested without persistent caching. This small
+    // render layout exists only for the currently displayed response and is discarded
+    // as soon as SpotifyClient publishes a different Lyrics instance.
+    private record LyricsDisplayLine(int sourceIndex, String text) {}
+    private static SpotifyClient.Lyrics lyricsLayoutRef;
+    private static List<LyricsDisplayLine> lyricsDisplayLines = List.of();
+    private static double lyricsVisualScroll;
+    private static double paintedLyricsVisualScroll = Double.NaN;
+    private static double paintedLyricsBlend = Double.NaN;
+    private static boolean lyricsVisualScrollInitialized;
+    private static String lyricsVisualTrackUri = "";
+    private static long lastLyricsRegionPaintNs;
+    private static final long LYRICS_REGION_FRAME_NS = 33_333_333L; // smooth text motion at up to 30 Hz
+    private static final Font LYRICS_WRAP_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 12);
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
@@ -638,10 +657,11 @@ public final class WorldPanel {
             else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - visibleTrackRows), trackScroll + direction));
             else if (scrollArea == 4) {
                 SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
-                if (currentLyrics.status() == SpotifyClient.LyricsStatus.FOUND
+                if (currentLyrics != null && currentLyrics.status() == SpotifyClient.LyricsStatus.FOUND
                         && currentLyrics.syncedLines().isEmpty()) {
+                    ensureLyricsLayout(currentLyrics);
                     lyricsScroll = Math.max(0, Math.min(
-                            Math.max(0, currentLyrics.plainLines().size() - LYRICS_VISIBLE_LINES),
+                            Math.max(0, lyricsDisplayLines.size() - LYRICS_VISIBLE_LINES),
                             lyricsScroll + direction));
                 }
             }
@@ -661,6 +681,7 @@ public final class WorldPanel {
             progressVisualInitialized = true;
             scrollVisualInitialized = true;
             lastUiAnimationNs = now;
+            updateLyricsVisualScroll(0.0, snapshot);
             return;
         }
         double dt = Math.max(0.0, Math.min(0.1, (now - lastUiAnimationNs) / 1_000_000_000.0));
@@ -694,6 +715,7 @@ public final class WorldPanel {
             displayedProgressMs += (targetProgress - displayedProgressMs) * playheadEase;
             if (Math.abs(targetProgress - displayedProgressMs) < 12.0) displayedProgressMs = targetProgress;
         }
+        updateLyricsVisualScroll(dt, snapshot);
 
         // Smooth and stabilize the confirmed Spotify track URI before animating the row.
         // A brief 204/empty snapshot is common around track transitions; keep the previous
@@ -829,6 +851,7 @@ public final class WorldPanel {
             overlayInitialized = true;
             rememberOverlayState(snapshot, libraryEntries, selectedKey, items, isSearchMode,
                     trackUri, trackTitle, trackArtists, trackCover, trackDuration, now);
+            rememberLyricsPaintedState(snapshot, now);
             paintedVolume = (int) Math.round(Math.max(0.0, Math.min(100.0, displayedVolume)));
             paintedProgressSecond = Math.max(0L, Math.round(displayedProgressMs) / 1000L);
             paintedSideScroll = sideScrollVisual;
@@ -909,26 +932,29 @@ public final class WorldPanel {
         }
 
         SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
-        int currentLyricsLine = currentSyncedLyricIndex(currentLyrics, snapshot.currentProgress());
+        ensureLyricsLayout(currentLyrics);
+        long lyricProgressMs = progressVisualInitialized ? Math.round(displayedProgressMs) : snapshot.currentProgress();
+        int currentLyricsLine = currentSyncedLyricIndex(currentLyrics, lyricProgressMs);
+        double currentLyricsBlend = currentSyncedLyricBlend(currentLyrics, lyricProgressMs);
         if (trackChanged || statusChanged) {
             if (trackChanged) lyricsScroll = 0;
             repaintRegion(overlayTexture, nowPlayingRect(), g -> paintNowPlaying(g, snapshot));
-            paintedLyricsRef = currentLyrics;
-            paintedLyricsLineIndex = currentLyricsLine;
-            paintedLyricsScroll = lyricsScroll;
+            rememberLyricsPaintedState(currentLyrics, currentLyricsLine, currentLyricsBlend, now);
         } else {
             if (playingChanged) {
                 repaintRegion(overlayTexture, nowPlayingStatusRect(), g -> paintNowPlayingStatus(g, snapshot));
             }
-            boolean lyricsChanged = currentLyrics != paintedLyricsRef
+            boolean lyricsStateChanged = currentLyrics != paintedLyricsRef
                     || currentLyricsLine != paintedLyricsLineIndex
                     || lyricsScroll != paintedLyricsScroll;
-            if (lyricsChanged) {
+            boolean lyricsAnimationMoving = Math.abs(lyricsVisualScroll - paintedLyricsVisualScroll) > 0.003
+                    || Math.abs(currentLyricsBlend - paintedLyricsBlend) > 0.001;
+            boolean lyricsAnimationDue = lyricsAnimationMoving
+                    && now - lastLyricsRegionPaintNs >= LYRICS_REGION_FRAME_NS;
+            if (lyricsStateChanged || lyricsAnimationDue) {
                 repaintRegion(overlayTexture, nowPlayingLyricsRect(),
                         g -> paintNowPlayingLyrics(g, snapshot, currentLyrics));
-                paintedLyricsRef = currentLyrics;
-                paintedLyricsLineIndex = currentLyricsLine;
-                paintedLyricsScroll = lyricsScroll;
+                rememberLyricsPaintedState(currentLyrics, currentLyricsLine, currentLyricsBlend, now);
             }
         }
 
@@ -1087,10 +1113,8 @@ public final class WorldPanel {
         paintedTrackDuration = trackDuration;
         paintedStatus = snapshot.status();
         paintedPlaying = snapshot.playing();
-        SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
-        paintedLyricsRef = currentLyrics;
-        paintedLyricsLineIndex = currentSyncedLyricIndex(currentLyrics, snapshot.currentProgress());
-        paintedLyricsScroll = lyricsScroll;
+        // Dynamic lyric state is remembered only after the lyrics dirty region
+        // has actually been uploaded (or the full now-playing card was painted).
         // Dynamic painted values are advanced only by the region that actually
         // uploads them. Do not overwrite these here: throttled scroll/progress
         // regions must remain dirty until their next partial refresh.
@@ -1738,24 +1762,51 @@ public final class WorldPanel {
         drawReadableText(g, fit(g, safe(artist, ""), textWidth),
                 textLeft, nowPlayingArtistBaseline(), new Color(220, 228, 222));
         paintNowPlayingStatusContent(g, s);
-        paintNowPlayingLyricsContent(g, s, SpotifyPanelMod.spotify.lyrics());
+        paintNowPlayingLyrics(g, s, SpotifyPanelMod.spotify.lyrics());
     }
 
     private static void paintNowPlayingLyrics(Graphics2D g, SpotifyClient.Snapshot snapshot,
                                                SpotifyClient.Lyrics lyrics) {
         UiRect rect = nowPlayingLyricsRect();
-        g.setColor(new Color(7, 11, 8, 248));
-        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
-        paintNowPlayingLyricsContent(g, snapshot, lyrics);
+        RoundRectangle2D.Double card = new RoundRectangle2D.Double(
+                rect.x() + 1.0, rect.y() + 1.0,
+                Math.max(1, rect.width() - 2), Math.max(1, rect.height() - 2), 11, 11);
+        Shape oldClip = g.getClip();
+        Paint oldPaint = g.getPaint();
+        Stroke oldStroke = g.getStroke();
+        g.setPaint(new java.awt.GradientPaint(rect.x(), rect.y(), new Color(12, 27, 31, 248),
+                rect.x(), rect.bottom(), new Color(7, 17, 21, 250)));
+        g.fill(card);
+        g.setColor(new Color(47, 203, 190, 48));
+        g.setStroke(new BasicStroke(3.2f));
+        g.draw(card);
+        g.setColor(new Color(72, 218, 204, 218));
+        g.setStroke(new BasicStroke(1.25f));
+        g.draw(card);
+        g.setColor(new Color(133, 241, 225, 145));
+        g.fillRoundRect(rect.x() + 11, rect.y() + 2, 34, 2, 2, 2);
+
+        RoundRectangle2D.Double innerClip = new RoundRectangle2D.Double(
+                rect.x() + 5.0, rect.y() + 5.0,
+                Math.max(1, rect.width() - 10), Math.max(1, rect.height() - 10), 7, 7);
+        g.clip(innerClip);
+        paintNowPlayingLyricsContent(g, snapshot, lyrics, rect);
+        g.setClip(oldClip);
+        g.setPaint(oldPaint);
+        g.setStroke(oldStroke);
     }
 
     private static void paintNowPlayingLyricsContent(Graphics2D g, SpotifyClient.Snapshot snapshot,
-                                                      SpotifyClient.Lyrics lyrics) {
-        int x0 = nowPlayingCardX0() + 9;
-        int width = nowPlayingCardX1() - nowPlayingCardX0() - 18;
+                                                      SpotifyClient.Lyrics lyrics, UiRect rect) {
+        int x0 = rect.x() + 11;
+        int width = Math.max(20, rect.width() - 22);
         int headerY = nowPlayingLyricsHeaderBaseline();
-        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 12));
-        drawReadableText(g, "ТЕКСТ ПЕСНИ · LRCLIB", x0, headerY, new Color(30, 215, 96));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 11));
+        drawReadableText(g, "ТЕКСТ ПЕСНИ", x0, headerY, new Color(105, 231, 216));
+        g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 8));
+        String source = "LRCLIB";
+        drawReadableText(g, source, rect.right() - 11 - g.getFontMetrics().stringWidth(source),
+                headerY, new Color(87, 173, 168));
 
         if (lyrics == null || lyrics.status() == SpotifyClient.LyricsStatus.IDLE) {
             drawLyricsMessage(g, "Включи трек", x0, width, headerY + 19);
@@ -1775,46 +1826,68 @@ public final class WorldPanel {
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.ERROR) {
             String message = lyrics.message().isBlank() ? "Сервис текста недоступен" : lyrics.message();
-            drawLyricsMessage(g, fit(g, message, width), x0, width, headerY + 19);
+            drawLyricsMessage(g, message, x0, width, headerY + 19);
             return;
         }
 
-        if (!lyrics.syncedLines().isEmpty()) {
-            List<SpotifyClient.LyricLine> lines = lyrics.syncedLines();
-            int active = currentSyncedLyricIndex(lyrics, snapshot.currentProgress());
-            int first = Math.max(0, active - 1);
-            for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
-                int index = first + row;
-                if (index >= lines.size()) break;
-                SpotifyClient.LyricLine line = lines.get(index);
-                Color color = index == active ? new Color(245, 250, 246)
-                        : index < active ? new Color(115, 132, 121) : new Color(195, 207, 198);
-                g.setFont(new Font(Font.SANS_SERIF, index == active ? Font.BOLD : Font.PLAIN,
-                        index == active ? 14 : 13));
-                String text = fit(g, line.text(), width);
-                drawCenteredReadableText(g, text, x0, width,
-                        nowPlayingLyricsFirstBaseline() + row * LYRICS_LINE_HEIGHT, color);
-            }
-        } else if (!lyrics.plainLines().isEmpty()) {
-            List<String> lines = lyrics.plainLines();
-            int maxScroll = Math.max(0, lines.size() - LYRICS_VISIBLE_LINES);
-            int first = Math.max(0, Math.min(lyricsScroll, maxScroll));
-            g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
-            for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
-                int index = first + row;
-                if (index >= lines.size()) break;
-                drawCenteredReadableText(g, fit(g, lines.get(index), width), x0, width,
-                        nowPlayingLyricsFirstBaseline() + row * LYRICS_LINE_HEIGHT,
-                        new Color(220, 230, 223));
-            }
-        } else {
+        ensureLyricsLayout(lyrics);
+        if (lyricsDisplayLines.isEmpty()) {
             drawLyricsMessage(g, "Текст не найден", x0, width, headerY + 19);
+            return;
         }
+
+        int active = lyrics.syncedLines().isEmpty() ? -1
+                : currentSyncedLyricIndex(lyrics, progressVisualInitialized
+                ? Math.round(displayedProgressMs) : snapshot.currentProgress());
+        double transition = lyrics.syncedLines().isEmpty() ? 0.0
+                : currentSyncedLyricBlend(lyrics, progressVisualInitialized
+                ? Math.round(displayedProgressMs) : snapshot.currentProgress());
+        drawLyricsLines(g, lyricsDisplayLines, active, transition, x0, width, headerY);
+    }
+
+    private static void drawLyricsLines(Graphics2D g, List<LyricsDisplayLine> lines,
+                                        int activeSourceIndex, double transition,
+                                        int x, int width, int headerBaseline) {
+        int first = Math.max(0, (int) Math.floor(lyricsVisualScroll));
+        double fraction = Math.max(0.0, Math.min(0.999, lyricsVisualScroll - first));
+        int baseline = headerBaseline + 20;
+        Shape oldClip = g.getClip();
+        UiRect rect = nowPlayingLyricsRect();
+        g.clipRect(rect.x() + 7, baseline - 14, rect.width() - 14,
+                Math.max(1, rect.bottom() - baseline + 4));
+
+        g.setFont(LYRICS_WRAP_FONT);
+        for (int row = 0; row <= LYRICS_VISIBLE_LINES; row++) {
+            int displayIndex = first + row;
+            if (displayIndex >= lines.size()) break;
+            LyricsDisplayLine line = lines.get(displayIndex);
+            int y = baseline + row * LYRICS_LINE_HEIGHT - (int) Math.round(fraction * LYRICS_LINE_HEIGHT);
+            Color color;
+            if (activeSourceIndex < 0) {
+                color = new Color(214, 226, 220);
+            } else if (line.sourceIndex() < activeSourceIndex) {
+                color = new Color(112, 133, 124);
+            } else if (line.sourceIndex() == activeSourceIndex) {
+                color = blend(new Color(245, 250, 246), new Color(128, 151, 141), transition);
+            } else if (line.sourceIndex() == activeSourceIndex + 1) {
+                color = blend(new Color(166, 188, 179), new Color(245, 250, 246), transition);
+            } else {
+                color = new Color(178, 197, 188);
+            }
+            drawCenteredReadableText(g, line.text(), x, width, y, color);
+        }
+        g.setClip(oldClip);
     }
 
     private static void drawLyricsMessage(Graphics2D g, String message, int x, int width, int baseline) {
-        g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-        drawCenteredReadableText(g, message, x, width, baseline, new Color(145, 158, 148));
+        g.setFont(LYRICS_WRAP_FONT);
+        List<String> wrapped = wrapLyricsText(g, message, width);
+        int rows = Math.min(3, wrapped.size());
+        int start = baseline - Math.max(0, rows - 1) * 7;
+        for (int i = 0; i < rows; i++) {
+            drawCenteredReadableText(g, wrapped.get(i), x, width,
+                    start + i * 14, new Color(145, 174, 165));
+        }
     }
 
     private static void drawCenteredReadableText(Graphics2D g, String text, int x, int width,
@@ -1822,6 +1895,150 @@ public final class WorldPanel {
         if (text == null || text.isEmpty()) return;
         int drawX = x + Math.max(0, (width - g.getFontMetrics().stringWidth(text)) / 2);
         drawReadableText(g, text, drawX, baseline, color);
+    }
+
+    private static void ensureLyricsLayout(SpotifyClient.Lyrics lyrics) {
+        if (lyrics == lyricsLayoutRef) return;
+        List<LyricsDisplayLine> layout = new ArrayList<>();
+        Graphics2D metrics = OVERLAY_IMAGE.createGraphics();
+        try {
+            metrics.setFont(LYRICS_WRAP_FONT);
+            int width = Math.max(24, nowPlayingLyricsRect().width() - 22);
+            if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
+                if (!lyrics.syncedLines().isEmpty()) {
+                    for (int i = 0; i < lyrics.syncedLines().size(); i++) {
+                        for (String part : wrapLyricsText(metrics, lyrics.syncedLines().get(i).text(), width)) {
+                            layout.add(new LyricsDisplayLine(i, part));
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < lyrics.plainLines().size(); i++) {
+                        for (String part : wrapLyricsText(metrics, lyrics.plainLines().get(i), width)) {
+                            layout.add(new LyricsDisplayLine(i, part));
+                        }
+                    }
+                }
+            }
+        } finally {
+            metrics.dispose();
+        }
+        lyricsDisplayLines = List.copyOf(layout);
+        lyricsLayoutRef = lyrics;
+    }
+
+    /** Wrap at word boundaries; an unusually long single word is split by code point, never ellipsized. */
+    private static List<String> wrapLyricsText(Graphics2D metrics, String raw, int maxWidth) {
+        if (raw == null || raw.isBlank()) return List.of("");
+        int available = Math.max(18, maxWidth);
+        String normalized = raw.replace('\r', ' ').replace('\n', ' ').trim().replaceAll("\\s+", " ");
+        String[] words = normalized.split(" ");
+        List<String> result = new ArrayList<>();
+        StringBuilder line = new StringBuilder();
+        FontMetrics fm = metrics.getFontMetrics();
+        for (String word : words) {
+            if (word.isEmpty()) continue;
+            String candidate = line.length() == 0 ? word : line + " " + word;
+            if (fm.stringWidth(candidate) <= available) {
+                if (line.length() > 0) line.append(' ');
+                line.append(word);
+                continue;
+            }
+            if (line.length() > 0) {
+                result.add(line.toString());
+                line.setLength(0);
+            }
+            if (fm.stringWidth(word) <= available) {
+                line.append(word);
+                continue;
+            }
+            StringBuilder chunk = new StringBuilder();
+            for (int offset = 0; offset < word.length();) {
+                int codePoint = word.codePointAt(offset);
+                String part = new String(Character.toChars(codePoint));
+                if (chunk.length() > 0 && fm.stringWidth(chunk.toString() + part) > available) {
+                    result.add(chunk.toString());
+                    chunk.setLength(0);
+                }
+                chunk.append(part);
+                offset += Character.charCount(codePoint);
+            }
+            line.append(chunk);
+        }
+        if (line.length() > 0) result.add(line.toString());
+        if (result.isEmpty()) result.add("");
+        return result;
+    }
+
+    private static int firstDisplayIndexForSource(int sourceIndex) {
+        if (sourceIndex < 0) return 0;
+        for (int i = 0; i < lyricsDisplayLines.size(); i++) {
+            if (lyricsDisplayLines.get(i).sourceIndex() == sourceIndex) return i;
+        }
+        return Math.max(0, lyricsDisplayLines.size() - 1);
+    }
+
+    private static double currentSyncedLyricBlend(SpotifyClient.Lyrics lyrics, long progressMs) {
+        if (lyrics == null || lyrics.syncedLines().isEmpty()) return 0.0;
+        List<SpotifyClient.LyricLine> lines = lyrics.syncedLines();
+        int active = currentSyncedLyricIndex(lyrics, progressMs);
+        if (active < 0 || active + 1 >= lines.size()) return 0.0;
+        long start = lines.get(active).timeMs();
+        long end = lines.get(active + 1).timeMs();
+        if (end <= start) return 0.0;
+        return Math.max(0.0, Math.min(1.0, (progressMs - start) / (double) (end - start)));
+    }
+
+    private static void updateLyricsVisualScroll(double dt, SpotifyClient.Snapshot snapshot) {
+        SpotifyClient.Lyrics lyrics = SpotifyPanelMod.spotify.lyrics();
+        ensureLyricsLayout(lyrics);
+        String trackUri = snapshot.track() == null ? "" : snapshot.track().uri();
+        String optimisticUri = SpotifyPanelMod.spotify.optimisticTrackUri();
+        if (!optimisticUri.isEmpty()) trackUri = optimisticUri;
+        if (!trackUri.equals(lyricsVisualTrackUri)) {
+            lyricsVisualTrackUri = trackUri;
+            lyricsVisualScroll = 0.0;
+            lyricsVisualScrollInitialized = false;
+        }
+
+        double target = 0.0;
+        if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
+            if (!lyrics.syncedLines().isEmpty()) {
+                long progress = progressVisualInitialized ? Math.round(displayedProgressMs) : snapshot.currentProgress();
+                int active = currentSyncedLyricIndex(lyrics, progress);
+                int activeDisplay = firstDisplayIndexForSource(active);
+                target = Math.max(0.0, activeDisplay - 1.0);
+            } else {
+                target = Math.max(0, Math.min(lyricsScroll,
+                        Math.max(0, lyricsDisplayLines.size() - LYRICS_VISIBLE_LINES)));
+            }
+        }
+        if (!lyricsVisualScrollInitialized) {
+            lyricsVisualScroll = target;
+            lyricsVisualScrollInitialized = true;
+        } else {
+            // Slower easing deliberately replaces the previous row-to-row snap with a
+            // calm, continuous vertical glide similar to Spotify's lyrics panel.
+            double ease = 1.0 - Math.exp(-Math.max(0.0, dt) * 5.5);
+            lyricsVisualScroll += (target - lyricsVisualScroll) * ease;
+            if (Math.abs(target - lyricsVisualScroll) < 0.004) lyricsVisualScroll = target;
+        }
+    }
+
+    private static void rememberLyricsPaintedState(SpotifyClient.Snapshot snapshot, long now) {
+        SpotifyClient.Lyrics lyrics = SpotifyPanelMod.spotify.lyrics();
+        long progress = progressVisualInitialized ? Math.round(displayedProgressMs) : snapshot.currentProgress();
+        rememberLyricsPaintedState(lyrics, currentSyncedLyricIndex(lyrics, progress),
+                currentSyncedLyricBlend(lyrics, progress), now);
+    }
+
+    private static void rememberLyricsPaintedState(SpotifyClient.Lyrics lyrics, int activeIndex,
+                                                    double blend, long now) {
+        paintedLyricsRef = lyrics;
+        paintedLyricsLineIndex = activeIndex;
+        paintedLyricsScroll = lyricsScroll;
+        paintedLyricsVisualScroll = lyricsVisualScroll;
+        paintedLyricsBlend = blend;
+        lastLyricsRegionPaintNs = now;
     }
 
     private static int currentSyncedLyricIndex(SpotifyClient.Lyrics lyrics, long progressMs) {
