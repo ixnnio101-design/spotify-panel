@@ -63,7 +63,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // World anchor follows the player's interpolated coordinates, exactly one block ahead.
@@ -79,9 +79,13 @@ public final class WorldPanel {
     // Rendering happens on the client render thread, so these buffers are not shared concurrently.
     private static final BufferedImage OVERLAY_IMAGE = new BufferedImage(TEX_W, TEX_H, BufferedImage.TYPE_INT_ARGB);
     private static final Map<Integer, BufferedImage> COVER_IMAGE_BUFFERS = new HashMap<>();
-    // One smooth, anti-aliased white Spotify-style speaker icon for the volume control.
-    private static final BufferedImage VOLUME_ICON = loadVolumeIcon(
-            "/assets/spotify-panel/textures/gui/volume_speaker.png");
+    // Three smooth, pure-white Spotify-style speaker sprites for muted, low and high volume.
+    private static final BufferedImage VOLUME_ICON_MUTED = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_muted.png");
+    private static final BufferedImage VOLUME_ICON_LOW = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_low.png");
+    private static final BufferedImage VOLUME_ICON_HIGH = loadVolumeIcon(
+            "/assets/spotify-panel/textures/gui/volume_speaker_high.png");
 
     private static final List<ModelPart> MODEL_PARTS = loadBlockbenchModel();
     private static boolean wasLeftDown;
@@ -1124,8 +1128,8 @@ public final class WorldPanel {
         int volumeBarX = volumeSliderX0();
         int volumeBarRight = volumeSliderX1();
         int volumeCenterY = volumeSliderY();
-        // Draw the compact white speaker at 32px UI size, centered vertically.
-        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 16);
+        // Draw the volume-sensitive white speaker at 32px UI size, centered vertically.
+        drawVolumeIcon(g, volumeGroupLeft(), volumeCenterY - 16, visualVolume);
         int volumeBarY = volumeCenterY - 2;
         g.setColor(new Color(75, 94, 81));
         g.fillRect(volumeBarX, volumeBarY, volumeBarRight - volumeBarX, 4);
@@ -1598,8 +1602,8 @@ public final class WorldPanel {
     }
 
     private static int volumeSliderX0() {
-        // Keep a comfortable 28px gap after the 32px speaker icon.
-        return volumeGroupLeft() + 60;
+        // Keep the slider close to the speaker: about 10px of clear space after its visible edge.
+        return volumeGroupLeft() + 42;
     }
 
     private static int volumeSliderX1() {
@@ -1624,8 +1628,9 @@ public final class WorldPanel {
         }
     }
 
-    private static void drawVolumeIcon(Graphics2D g, int x, int y) {
-        BufferedImage icon = VOLUME_ICON;
+    private static void drawVolumeIcon(Graphics2D g, int x, int y, int volume) {
+        BufferedImage icon = volume <= 0 ? VOLUME_ICON_MUTED
+                : volume < 45 ? VOLUME_ICON_LOW : VOLUME_ICON_HIGH;
         if (icon == null) return;
 
         Object previousInterpolation = g.getRenderingHint(RenderingHints.KEY_INTERPOLATION);
