@@ -47,9 +47,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.OptionalDouble;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
@@ -115,7 +117,13 @@ public final class WorldPanel {
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
-    private static long lastScrollRegionPaintNs;
+    // Scrolling is a high-motion interaction: refresh its small dirty region at up to 80 Hz,
+    // so every frame on a normal 60 Hz display can be updated without timer-jitter skips.
+    // Keep separate clocks so a sidebar update cannot throttle the track list (or vice versa).
+    private static final long SCROLL_REGION_FRAME_NS = 12_500_000L;
+    private static long lastSidebarScrollPaintNs;
+    private static long lastTrackScrollPaintNs;
+    private static long lastViewTransitionPaintNs;
     private static long lastHighlightRegionPaintNs;
     private static long paintedCaretPhase = Long.MIN_VALUE;
     private static double paintedSideScroll = Double.NaN;
@@ -567,9 +575,9 @@ public final class WorldPanel {
         double dt = Math.max(0.0, Math.min(0.1, (now - lastUiAnimationNs) / 1_000_000_000.0));
         lastUiAnimationNs = now;
 
-        // Ease wheel movement over a longer interval: the target changes by rows,
-        // while the rendered offset moves continuously at frame rate.
-        double scrollEase = 1.0 - Math.exp(-dt * 10.0);
+        // Responsive exponential easing: with 60 FPS region refreshes this settles quickly
+        // without snapping whole rows or feeling like the list is trailing behind the wheel.
+        double scrollEase = 1.0 - Math.exp(-dt * 18.0);
         sideScrollVisual += (sideScroll - sideScrollVisual) * scrollEase;
         trackScrollVisual += (trackScroll - trackScrollVisual) * scrollEase;
         if (Math.abs(sideScroll - sideScrollVisual) < 0.002) sideScrollVisual = sideScroll;
@@ -718,6 +726,9 @@ public final class WorldPanel {
         String trackCover = snapshot.track() == null ? "" : safe(snapshot.track().coverUrl(), "");
         long trackDuration = snapshot.track() == null ? 0L : snapshot.track().durationMs();
         boolean isSearchMode = searchMode();
+        // Completed asynchronous artwork downloads must invalidate their visible image
+        // areas. Otherwise a placeholder can remain cached until an unrelated UI change.
+        List<String> completedCoverUrls = SpotifyPanelMod.spotify.drainCompletedCoverUrls();
 
         if (!overlayInitialized || panelJustOpened) {
             // Texture allocation can complete one render tick after registration.
@@ -736,7 +747,9 @@ public final class WorldPanel {
             paintedCaretPhase = searchFocused ? System.currentTimeMillis() / 500L : Long.MIN_VALUE;
             lastProgressRegionPaintNs = now;
             lastVolumeRegionPaintNs = now;
-            lastScrollRegionPaintNs = now;
+            lastSidebarScrollPaintNs = now;
+            lastTrackScrollPaintNs = now;
+            lastViewTransitionPaintNs = now;
             lastHighlightRegionPaintNs = now;
             return;
         }
@@ -767,6 +780,7 @@ public final class WorldPanel {
         if (libraryChanged || selectionChanged) {
             repaintRegion(overlayTexture, sidebarRect(), g -> paintSidebar(g, libraryEntries, selected));
             paintedSideScroll = sideScrollVisual;
+            lastSidebarScrollPaintNs = now;
         }
 
         if (modeChanged || contentChanged || resultsChanged) {
@@ -780,18 +794,21 @@ public final class WorldPanel {
             paintedViewTransition = viewTransition;
             paintedTrackScroll = trackScrollVisual;
             paintedHighlightSignature = highlightSignature();
-            lastScrollRegionPaintNs = now;
+            lastTrackScrollPaintNs = now;
+            lastViewTransitionPaintNs = now;
             lastHighlightRegionPaintNs = now;
         } else if (isSearchMode && Math.abs(trackScrollVisual - paintedTrackScroll) > 0.001
-                && now - lastScrollRegionPaintNs >= 41_666_667L) {
-            repaintRegion(overlayTexture, contentRect(), g -> paintSearchResults(g, snapshot));
+                && now - lastTrackScrollPaintNs >= SCROLL_REGION_FRAME_NS) {
+            // Only the moving result rows are repainted; the fixed search headings stay cached.
+            repaintRegion(overlayTexture, searchRowsRect(), g -> paintSearchResults(g, snapshot));
             paintedTrackScroll = trackScrollVisual;
-            lastScrollRegionPaintNs = now;
+            lastTrackScrollPaintNs = now;
         } else if (!isSearchMode && Math.abs(trackScrollVisual - paintedTrackScroll) > 0.001
-                && now - lastScrollRegionPaintNs >= 41_666_667L) {
-            repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+                && now - lastTrackScrollPaintNs >= SCROLL_REGION_FRAME_NS) {
+            // Keep the table header static and upload only the clipped row area.
+            repaintRegion(overlayTexture, trackRowsRect(), g -> paintTrackTable(g, snapshot, items, selected));
             paintedTrackScroll = trackScrollVisual;
-            lastScrollRegionPaintNs = now;
+            lastTrackScrollPaintNs = now;
         }
 
         if (searchTextChanged || searchFocusChanged || searchPreparingChanged
@@ -811,8 +828,11 @@ public final class WorldPanel {
             if (isSearchMode) {
                 repaintRegion(overlayTexture, contentRect(), g -> paintSearchResults(g, snapshot));
                 paintedTrackScroll = trackScrollVisual;
+                lastTrackScrollPaintNs = now;
             } else {
                 repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+                paintedTrackScroll = trackScrollVisual;
+                lastTrackScrollPaintNs = now;
                 paintedHighlightSignature = highlightSignature();
                 lastHighlightRegionPaintNs = now;
             }
@@ -831,26 +851,30 @@ public final class WorldPanel {
         }
 
         boolean scrollMoving = Math.abs(sideScrollVisual - paintedSideScroll) > 0.001;
-        if (scrollMoving && now - lastScrollRegionPaintNs >= 41_666_667L) {
+        if (scrollMoving && now - lastSidebarScrollPaintNs >= SCROLL_REGION_FRAME_NS) {
             repaintRegion(overlayTexture, sidebarRect(), g -> paintSidebar(g, libraryEntries, selected));
             paintedSideScroll = sideScrollVisual;
-            lastScrollRegionPaintNs = now;
+            lastSidebarScrollPaintNs = now;
         }
 
         boolean transitionMoving = Math.abs(viewTransition - paintedViewTransition) > 0.001;
-        if (!isSearchMode && transitionMoving && now - lastScrollRegionPaintNs >= 41_666_667L) {
+        if (!isSearchMode && transitionMoving && now - lastViewTransitionPaintNs >= SCROLL_REGION_FRAME_NS) {
             repaintRegion(overlayTexture, contentRect(), g -> {
                 paintHeaderAndTrackWithTransition(g, snapshot, items, selected);
             });
             paintedViewTransition = viewTransition;
             paintedTrackScroll = trackScrollVisual;
-            lastScrollRegionPaintNs = now;
+            lastViewTransitionPaintNs = now;
+            lastTrackScrollPaintNs = now;
         }
 
         int currentHighlightSignature = highlightSignature();
         if (!isSearchMode && currentHighlightSignature != paintedHighlightSignature
-                && now - lastHighlightRegionPaintNs >= 41_666_667L) {
-            repaintRegion(overlayTexture, trackTableRect(), g -> paintTrackTable(g, snapshot, items, selected));
+                && now - lastHighlightRegionPaintNs >= SCROLL_REGION_FRAME_NS) {
+            // A changing playing-row accent is confined to the same row-only dirty area.
+            repaintRegion(overlayTexture, trackRowsRect(), g -> paintTrackTable(g, snapshot, items, selected));
+            paintedTrackScroll = trackScrollVisual;
+            lastTrackScrollPaintNs = now;
             paintedHighlightSignature = currentHighlightSignature;
             lastHighlightRegionPaintNs = now;
         }
@@ -865,8 +889,55 @@ public final class WorldPanel {
             lastProgressRegionPaintNs = now;
         }
 
+        if (!completedCoverUrls.isEmpty()) {
+            repaintCompletedCoverRegions(completedCoverUrls, libraryEntries, selected, snapshot, items, isSearchMode);
+        }
+
         rememberOverlayState(snapshot, libraryEntries, selectedKey, items, isSearchMode,
                 trackUri, trackTitle, trackArtists, trackCover, trackDuration, now);
+    }
+
+    /** Repaint only visible regions that reference an artwork URL which just loaded. */
+    private static void repaintCompletedCoverRegions(List<String> completedUrls,
+                                                      List<SpotifyClient.LibraryEntry> libraryEntries,
+                                                      SpotifyClient.LibraryEntry selected,
+                                                      SpotifyClient.Snapshot snapshot,
+                                                      List<SpotifyClient.Item> items,
+                                                      boolean isSearchMode) {
+        Set<String> completed = new HashSet<>(completedUrls);
+
+        // The library sidebar contains up to eight visible playlist/album/artist covers.
+        int first = Math.max(0, (int) Math.floor(sideScrollVisual));
+        int shown = Math.min(8, Math.max(0, libraryEntries.size() - first));
+        boolean visibleSidebarCoverReady = false;
+        for (int i = 0; i < shown; i++) {
+            String coverUrl = safe(libraryEntries.get(first + i).coverUrl(), "");
+            if (!coverUrl.isEmpty() && completed.contains(coverUrl)) {
+                visibleSidebarCoverReady = true;
+                break;
+            }
+        }
+        if (visibleSidebarCoverReady) {
+            repaintRegion(overlayTexture, sidebarRect(), g -> paintSidebar(g, libraryEntries, selected));
+            paintedSideScroll = sideScrollVisual;
+            lastSidebarScrollPaintNs = System.nanoTime();
+        }
+
+        // The selected playlist/album artwork also colors the header background.
+        // Repaint only the header (not the track table below it).
+        String selectedCover = selected == null ? "" : safe(selected.coverUrl(), "");
+        if (!isSearchMode && !selectedCover.isEmpty() && completed.contains(selectedCover)) {
+            repaintRegion(overlayTexture, playlistHeaderRect(), g ->
+                    paintPlaylistHeaderWithTransition(g, selected, items));
+        }
+
+        // The current track cover appears in two places: the large now-playing card
+        // and the compact metadata slot in the bottom transport strip.
+        String currentTrackCover = snapshot.track() == null ? "" : safe(snapshot.track().coverUrl(), "");
+        if (!currentTrackCover.isEmpty() && completed.contains(currentTrackCover)) {
+            repaintRegion(overlayTexture, nowPlayingCoverRect(), g -> paintNowPlayingCoverPartial(g, snapshot));
+            repaintRegion(overlayTexture, bottomCoverRect(), g -> paintBottomCoverPartial(g, snapshot));
+        }
     }
 
     private static int highlightSignature() {
@@ -979,6 +1050,37 @@ public final class WorldPanel {
         return new UiRect(x0, y0, x1 - x0, y1 - y0);
     }
 
+    private static UiRect trackRowsRect() {
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(9.2), y1 = py(2.4);
+        // The track painter clips rows from startY - 19 onward; its header is stationary.
+        int rowsTop = y0 + 39;
+        return new UiRect(x0, rowsTop, x1 - x0, y1 - rowsTop);
+    }
+
+    private static UiRect searchRowsRect() {
+        int x0 = px(-9.4), x1 = px(5.2), y0 = py(SEARCH_RESULTS_TOP), y1 = py(2.4);
+        // Search headings and column labels stay fixed; include the footer hint below the rows.
+        int rowsTop = y0 + 54;
+        return new UiRect(x0, rowsTop, x1 - x0, y1 - rowsTop);
+    }
+
+    private static UiRect playlistHeaderRect() {
+        int x0 = px(-9.2), x1 = px(5.0), y0 = py(12.5), y1 = py(9.2);
+        int transitionOffset = (int) Math.round((1.0 - viewTransition) * 10.0);
+        return new UiRect(x0, y0 + transitionOffset - 1, x1 - x0, y1 - y0 + 2);
+    }
+
+    private static UiRect nowPlayingCoverRect() {
+        int coverX = px(5.6), coverY = py(12.5);
+        int coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
+        return new UiRect(coverX + 2, coverY + 2, coverSize, coverSize);
+    }
+
+    private static UiRect bottomCoverRect() {
+        int leftCover = px(-10.4), leftY = py(2.3) + 12;
+        return new UiRect(leftCover - 1, leftY - 1, 52, 52);
+    }
+
     private static UiRect nowPlayingRect() {
         int x0 = px(5.4), x1 = px(10.8), y0 = py(12.7), y1 = py(2.4);
         return new UiRect(x0, y0, x1 - x0, y1 - y0);
@@ -1012,6 +1114,19 @@ public final class WorldPanel {
         int right = volumeSliderX1() + 3;
         int centerY = volumeSliderY();
         return new UiRect(left, centerY - 20, right - left, 40);
+    }
+
+    private static void paintPlaylistHeaderWithTransition(Graphics2D g,
+                                                              SpotifyClient.LibraryEntry selected,
+                                                              List<SpotifyClient.Item> items) {
+        java.awt.Composite previousComposite = g.getComposite();
+        java.awt.geom.AffineTransform previousTransform = g.getTransform();
+        float transitionAlpha = (float) Math.max(0.0, Math.min(1.0, viewTransition));
+        g.setComposite(java.awt.AlphaComposite.getInstance(java.awt.AlphaComposite.SRC_OVER, transitionAlpha));
+        g.translate(0, Math.round((1.0 - viewTransition) * 10.0));
+        paintPlaylistHeader(g, selected, items);
+        g.setTransform(previousTransform);
+        g.setComposite(previousComposite);
     }
 
     private static void paintHeaderAndTrackWithTransition(Graphics2D g, SpotifyClient.Snapshot snapshot,
@@ -1484,6 +1599,29 @@ public final class WorldPanel {
         g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 16));
         g.setColor(new Color(220, 230, 223));
         drawReadableText(g, s.playing() ? "● ВОСПРОИЗВЕДЕНИЕ" : "Ⅱ ПАУЗА", coverX + 4, textY + 101, new Color(230, 238, 232));
+    }
+
+    private static void paintNowPlayingCoverPartial(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = nowPlayingCoverRect();
+        g.setColor(new Color(7, 11, 8, 248));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+
+        int coverX = px(5.6), coverY = py(12.5);
+        int coverSize = Math.min(px(10.6) - coverX, py(7.5) - coverY);
+        int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
+        drawCover(g, cover, 128, coverX + 5, coverY + 5, coverSize - 10);
+        g.setColor(new Color(30, 215, 96, 210));
+        g.setStroke(new BasicStroke(2.5f));
+        g.drawRect(coverX + 4, coverY + 4, coverSize - 8, coverSize - 8);
+    }
+
+    private static void paintBottomCoverPartial(Graphics2D g, SpotifyClient.Snapshot s) {
+        UiRect rect = bottomCoverRect();
+        g.setColor(new Color(4, 7, 5, 250));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        int leftCover = px(-10.4), leftY = py(2.3) + 12;
+        int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 48);
+        drawCover(g, cover, 48, leftCover, leftY, 50);
     }
 
     private static void paintBottomPlayer(Graphics2D g, SpotifyClient.Snapshot s) {

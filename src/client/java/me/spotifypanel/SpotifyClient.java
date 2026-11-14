@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -470,7 +471,12 @@ public final class SpotifyClient {
     private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
     private final Map<String, Integer> coverAccents = new ConcurrentHashMap<>();
     private final Set<String> coverLoading = ConcurrentHashMap.newKeySet();
-    private final Set<String> coverFailed = ConcurrentHashMap.newKeySet();
+    // Failed artwork is retried with exponential backoff instead of being marked
+    // permanently unavailable. This handles temporary CDN/network/decode failures.
+    private final Map<String, Long> coverRetryAtMs = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> coverAttempts = new ConcurrentHashMap<>();
+    // Render thread drains these URLs and repaints only the visible artwork regions.
+    private final ConcurrentLinkedQueue<String> completedCoverUrls = new ConcurrentLinkedQueue<>();
 
     public SpotifyClient(SpotifyAuth auth) {
         this.auth = auth;
@@ -1718,22 +1724,40 @@ public final class SpotifyClient {
 
     // ------------------------------------------------------------- covers
 
-    /** Обложка, ужатая с исходных 64x64 до size x size (усреднение по площади). null, пока обложка грузится. */
+    /** Artwork pixels, asynchronously loaded and downsampled. Returns null while the first attempt/retry is pending. */
     public int[] pixels(String url, int size) {
-        if (url == null || url.isEmpty()) return null;
+        if (url == null || url.isBlank() || size <= 0) return null;
+        // Spotify artwork is served over HTTPS. Ignore malformed/non-web URLs instead of
+        // creating a permanent retry loop for an invalid value from incomplete metadata.
+        if (!url.startsWith("https://") && !url.startsWith("http://")) return null;
         String key = url + "|" + size;
         int[] m = mosaics.get(key);
         if (m != null) return m;
         int[] raw = rawCache.get(url);
         if (raw == null) {
-            if (!coverFailed.contains(url) && coverLoading.add(url)) {
-                exec.submit(() -> loadRaw(url));
+            long now = System.currentTimeMillis();
+            long retryAt = coverRetryAtMs.getOrDefault(url, 0L);
+            if (now >= retryAt && coverLoading.add(url)) {
+                try {
+                    exec.execute(() -> loadRaw(url));
+                } catch (RuntimeException rejected) {
+                    coverLoading.remove(url);
+                    LOG.debug("Artwork load could not be queued: {}", url, rejected);
+                }
             }
             return null;
         }
         m = downsample(RAW, RAW, (x, y) -> raw[y * RAW + x], size);
-        mosaics.put(key, m);
-        return m;
+        int[] existing = mosaics.putIfAbsent(key, m);
+        return existing != null ? existing : m;
+    }
+
+    /** URLs whose artwork has just become available; consumed by the world-panel renderer. */
+    public List<String> drainCompletedCoverUrls() {
+        List<String> completed = new ArrayList<>();
+        String url;
+        while ((url = completedCoverUrls.poll()) != null) completed.add(url);
+        return completed;
     }
 
     /** Returns an artwork-derived accent color for the selected library header. */
@@ -1790,23 +1814,64 @@ public final class SpotifyClient {
     }
 
     private void loadRaw(String url) {
+        long serverRetryDelayMs = 0L;
         try {
-            HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(10)).GET().build();
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(12)).GET().build();
             HttpResponse<byte[]> r = Net.http().send(req, HttpResponse.BodyHandlers.ofByteArray());
-            if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
+            if (r.statusCode() != 200) {
+                String retryAfter = r.headers().firstValue("Retry-After").orElse("");
+                try {
+                    serverRetryDelayMs = Math.min(300L, Math.max(0L, Long.parseLong(retryAfter.trim()))) * 1_000L;
+                } catch (NumberFormatException ignored) {
+                    // Most artwork CDN responses do not include Retry-After; local backoff applies.
+                }
+                throw new IOException("HTTP " + r.statusCode());
+            }
             int[] raw = decodeAwt(r.body());
             if (raw == null) raw = decodeNative(r.body());
-            if (raw != null) {
-                rawCache.put(url, raw);
-                coverAccents.put(url, extractAccentColor(raw));
-            } else {
-                coverFailed.add(url);
-            }
+            if (raw == null) throw new IOException("Unsupported or invalid artwork image");
+
+            rawCache.put(url, raw);
+            coverAccents.put(url, extractAccentColor(raw));
+            coverRetryAtMs.remove(url);
+            coverAttempts.remove(url);
+            // Publish completion only after the pixel cache is visible to readers.
+            completedCoverUrls.add(url);
         } catch (Throwable e) {
-            LOG.warn("cover load failed: {}", url, e);
-            coverFailed.add(url);
+            scheduleCoverRetry(url, e, serverRetryDelayMs);
         } finally {
             coverLoading.remove(url);
+        }
+    }
+
+    /** Retry forever, but back off to at most once per minute for a persistently bad URL. */
+    private void scheduleCoverRetry(String url, Throwable failure, long serverDelayMs) {
+        int attempt = coverAttempts.computeIfAbsent(url, ignored -> new AtomicInteger()).incrementAndGet();
+        long exponentialDelay = Math.min(60_000L, 1_500L << Math.min(6, Math.max(0, attempt - 1)));
+        long delay = Math.min(5 * 60_000L, Math.max(exponentialDelay, serverDelayMs));
+        coverRetryAtMs.put(url, System.currentTimeMillis() + delay);
+
+        // Avoid flooding the log while a CDN URL is unavailable for a long period.
+        if (attempt == 1 || attempt % 5 == 0) {
+            LOG.warn("Artwork load failed (attempt {}, retry in {} ms): {} ({})",
+                    attempt, delay, url, failure.toString());
+        } else {
+            LOG.debug("Artwork load failed (attempt {}, retry in {} ms): {}",
+                    attempt, delay, url, failure.toString());
+        }
+
+        try {
+            exec.schedule(() -> {
+                if (rawCache.containsKey(url) || !coverLoading.add(url)) return;
+                try {
+                    exec.execute(() -> loadRaw(url));
+                } catch (RuntimeException rejected) {
+                    coverLoading.remove(url);
+                    LOG.debug("Artwork retry could not be queued: {}", url, rejected);
+                }
+            }, delay, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException rejected) {
+            LOG.debug("Artwork retry could not be scheduled: {}", url, rejected);
         }
     }
 
