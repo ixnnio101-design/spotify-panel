@@ -32,14 +32,11 @@ import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.FontMetrics;
-import java.awt.Paint;
-import java.awt.Stroke;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.RenderingHints;
 import java.awt.Shape;
 import java.awt.geom.Path2D;
-import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
@@ -87,7 +84,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -138,8 +135,10 @@ public final class WorldPanel {
     private static String lyricsVisualTrackUri = "";
     private static long lastLyricsRegionPaintNs;
     private static final long LYRICS_REGION_FRAME_NS = 33_333_333L; // smooth text motion at up to 30 Hz
-    // Larger, clean lyric type is easier to read in the narrow world-space card.
+    // Regular lyrics remain calm; the active timed line uses a clearly heavier weight.
     private static final Font LYRICS_WRAP_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 14);
+    private static final Font LYRICS_ACTIVE_FONT = new Font(Font.SANS_SERIF, Font.BOLD, 16);
+    private static final Color NOW_PLAYING_FRAME_COLOR = new Color(35, 225, 210, 255);
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
@@ -1737,14 +1736,19 @@ public final class WorldPanel {
         int y0 = py(12.7), y1 = py(2.4);
         g.setColor(new Color(7, 11, 8, 248));
         g.fillRect(x0, y0, x1 - x0, y1 - y0);
-        paintPixelFrame(g, x0, y0, x1 - x0, y1 - y0, new Color(255, 255, 255, 25), 1, 8);
-        g.setColor(new Color(30, 215, 96, 175));
-        g.fillRect(x0 + 8, y0 + 8, 18, 3);
+        // One continuous turquoise frame encloses the whole now-playing card
+        // (cover, metadata, playback status and lyrics) instead of framing lyrics alone.
+        g.setColor(NOW_PLAYING_FRAME_COLOR);
+        g.fillRect(x0, y0, x1 - x0, 2);
+        g.fillRect(x0, y1 - 2, x1 - x0, 2);
+        g.fillRect(x0, y0, 2, y1 - y0);
+        g.fillRect(x1 - 2, y0, 2, y1 - y0);
 
         int coverX = nowPlayingCoverX(), coverY = nowPlayingCoverY(), coverSize = nowPlayingCoverSize();
         int[] cover = s.track() == null ? null : SpotifyPanelMod.spotify.pixels(s.track().coverUrl(), 128);
         drawCover(g, cover, 128, coverX, coverY, coverSize);
-        g.setColor(new Color(30, 215, 96, 210));
+        // Match the cover outline to the turquoise frame around the entire card.
+        g.setColor(NOW_PLAYING_FRAME_COLOR);
         g.setStroke(new BasicStroke(2.2f));
         g.drawRect(coverX - 1, coverY - 1, coverSize + 2, coverSize + 2);
 
@@ -1768,29 +1772,16 @@ public final class WorldPanel {
     private static void paintNowPlayingLyrics(Graphics2D g, SpotifyClient.Snapshot snapshot,
                                                SpotifyClient.Lyrics lyrics) {
         UiRect rect = nowPlayingLyricsRect();
-        RoundRectangle2D.Double card = new RoundRectangle2D.Double(
-                rect.x() + 1.0, rect.y() + 1.0,
-                Math.max(1, rect.width() - 2), Math.max(1, rect.height() - 2), 11, 11);
         Shape oldClip = g.getClip();
-        Paint oldPaint = g.getPaint();
-        Stroke oldStroke = g.getStroke();
-        // Solid dark fill and one continuous, fully opaque turquoise outline.
-        // No glow or top accent: the border stays visually clean at oblique angles.
-        g.setPaint(new java.awt.GradientPaint(rect.x(), rect.y(), new Color(8, 18, 20, 252),
-                rect.x(), rect.bottom(), new Color(5, 12, 14, 252)));
-        g.fill(card);
-        g.setColor(new Color(35, 225, 210, 255));
-        g.setStroke(new BasicStroke(2.0f));
-        g.draw(card);
-
-        RoundRectangle2D.Double innerClip = new RoundRectangle2D.Double(
-                rect.x() + 5.0, rect.y() + 5.0,
-                Math.max(1, rect.width() - 10), Math.max(1, rect.height() - 10), 7, 7);
-        g.clip(innerClip);
+        // Lyrics are now part of the same uninterrupted card as the cover and metadata.
+        // Repaint the same dark backing after a dirty-region clear, but do not draw a
+        // second inner frame or header around the lyrics.
+        g.setColor(new Color(7, 11, 8, 248));
+        g.fillRect(rect.x(), rect.y(), rect.width(), rect.height());
+        g.clipRect(rect.x() + 5, rect.y() + 4,
+                Math.max(1, rect.width() - 10), Math.max(1, rect.height() - 8));
         paintNowPlayingLyricsContent(g, snapshot, lyrics, rect);
         g.setClip(oldClip);
-        g.setPaint(oldPaint);
-        g.setStroke(oldStroke);
     }
 
     private static void paintNowPlayingLyricsContent(Graphics2D g, SpotifyClient.Snapshot snapshot,
@@ -1844,29 +1835,44 @@ public final class WorldPanel {
         double fraction = Math.max(0.0, Math.min(0.999, lyricsVisualScroll - first));
         int baseline = rect.y() + 21;
         Shape oldClip = g.getClip();
-        // Keep glyphs inside the turquoise outline without clipping ascenders/descenders.
-        g.clipRect(rect.x() + 7, rect.y() + 5, rect.width() - 14, rect.height() - 10);
+        // Leave enough inset for the outer card border while keeping text fully readable.
+        g.clipRect(rect.x() + 5, rect.y() + 4, rect.width() - 10, rect.height() - 8);
 
-        g.setFont(LYRICS_WRAP_FONT);
         for (int row = 0; row < LYRICS_VISIBLE_LINES; row++) {
             int displayIndex = first + row;
             if (displayIndex >= lines.size()) break;
             LyricsDisplayLine line = lines.get(displayIndex);
             int y = baseline + row * LYRICS_LINE_HEIGHT - (int) Math.round(fraction * LYRICS_LINE_HEIGHT);
+            boolean active = activeSourceIndex >= 0 && line.sourceIndex() == activeSourceIndex;
             Color color;
-            if (activeSourceIndex < 0) {
-                color = new Color(238, 245, 242);
-            } else if (line.sourceIndex() < activeSourceIndex) {
-                color = new Color(170, 190, 184);
-            } else if (line.sourceIndex() == activeSourceIndex) {
-                color = blend(new Color(250, 255, 253), new Color(72, 232, 211), transition * 0.30);
-            } else if (line.sourceIndex() == activeSourceIndex + 1) {
-                color = blend(new Color(211, 228, 222), new Color(250, 255, 253), transition * 0.70);
+            if (active) {
+                // A turquoise selection band plus a larger bold white face makes the
+                // playback-synchronised line obvious even when the panel is viewed obliquely.
+                g.setFont(LYRICS_ACTIVE_FONT);
+                FontMetrics activeMetrics = g.getFontMetrics();
+                int highlightTop = y - activeMetrics.getAscent() - 2;
+                int highlightHeight = activeMetrics.getHeight() + 4;
+                int highlightAlpha = 112 + (int) Math.round(28.0 * Math.max(0.0, Math.min(1.0, transition)));
+                g.setColor(new Color(15, 93, 91, highlightAlpha));
+                g.fillRoundRect(rect.x() + 7, highlightTop,
+                        Math.max(1, rect.width() - 14), highlightHeight, 8, 8);
+                g.setColor(NOW_PLAYING_FRAME_COLOR);
+                g.fillRoundRect(rect.x() + 8, highlightTop + 2, 3,
+                        Math.max(1, highlightHeight - 4), 3, 3);
+                color = new Color(255, 255, 255, 255);
             } else {
-                color = new Color(218, 231, 226);
+                g.setFont(LYRICS_WRAP_FONT);
+                if (activeSourceIndex < 0) {
+                    color = new Color(228, 237, 233);
+                } else if (line.sourceIndex() < activeSourceIndex) {
+                    color = new Color(151, 171, 164);
+                } else if (line.sourceIndex() == activeSourceIndex + 1) {
+                    color = new Color(220, 233, 228);
+                } else {
+                    color = new Color(190, 207, 200);
+                }
             }
-            // Lyrics are deliberately drawn without the global drop shadow; it blurred
-            // narrow strokes against the dark card in the world-space projection.
+            // No drop shadow: the active line's weight and highlight provide contrast.
             drawUiText(g, line.text(), x, y, color);
         }
         g.setClip(oldClip);
@@ -1895,7 +1901,7 @@ public final class WorldPanel {
         List<LyricsDisplayLine> layout = new ArrayList<>();
         Graphics2D metrics = OVERLAY_IMAGE.createGraphics();
         try {
-            metrics.setFont(LYRICS_WRAP_FONT);
+            metrics.setFont(LYRICS_ACTIVE_FONT);
             int width = Math.max(24, nowPlayingLyricsRect().width() - 24);
             if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
                 if (!lyrics.syncedLines().isEmpty()) {
