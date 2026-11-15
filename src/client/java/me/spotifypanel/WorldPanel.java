@@ -83,7 +83,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -127,9 +127,17 @@ public final class WorldPanel {
     private static long lastLyricsRegionPaintNs;
     private static SpotifyClient.Lyrics lyricsLayoutRef;
     private static SpotifyClient.Lyrics lyricsAnimationRef;
+    // A synced source lyric can occupy multiple visual rows after wrapping.
+    // Keep the previous/current source indices so every wrapped row in that
+    // source lyric fades together instead of highlighting only its first row.
+    private static int lyricsAnimationSourceIndex = Integer.MIN_VALUE;
+    private static int lyricsTransitionFromSourceIndex = -1;
+    private static int lyricsTransitionToSourceIndex = -1;
+    private static double lyricsTransitionFromPosition = Double.NaN;
+    private static double lyricsTransitionToPosition = Double.NaN;
     private static List<WrappedLyricLine> wrappedSyncedLyrics = List.of();
     private static List<String> wrappedPlainLyrics = List.of();
-    private static final Font LYRICS_NORMAL_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 13);
+    private static final Font LYRICS_NORMAL_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 11);
     private static final Font LYRICS_ACTIVE_FONT = new Font(Font.SANS_SERIF, Font.BOLD, 14);
     private static final long LYRICS_ANIMATION_FRAME_NS = 16_666_667L;
     private static long paintedProgressSecond = Long.MIN_VALUE;
@@ -930,11 +938,26 @@ public final class WorldPanel {
         int targetLyricsVisualLine = firstWrappedIndexForSource(currentLyricsLine);
         if (currentLyrics != lyricsAnimationRef || !Double.isFinite(lyricsVisualPosition)) {
             // A new song/lyrics response starts at its current line; do not animate from
-            // the previous song's position.
+            // the previous song's position. Treat the new active source line as settled.
             lyricsVisualPosition = targetLyricsVisualLine;
             lyricsAnimationRef = currentLyrics;
+            lyricsAnimationSourceIndex = currentLyricsLine;
+            lyricsTransitionFromSourceIndex = currentLyricsLine;
+            lyricsTransitionToSourceIndex = currentLyricsLine;
+            lyricsTransitionFromPosition = targetLyricsVisualLine;
+            lyricsTransitionToPosition = targetLyricsVisualLine;
             lastLyricsAnimationNs = now;
         } else {
+            if (currentLyricsLine != lyricsAnimationSourceIndex) {
+                // Start a new source-line transition from the current interpolated
+                // position. This also handles short lines arriving before the previous
+                // visual transition has completely settled.
+                lyricsTransitionFromSourceIndex = lyricsAnimationSourceIndex;
+                lyricsTransitionToSourceIndex = currentLyricsLine;
+                lyricsTransitionFromPosition = lyricsVisualPosition;
+                lyricsTransitionToPosition = targetLyricsVisualLine;
+                lyricsAnimationSourceIndex = currentLyricsLine;
+            }
             double lyricsDt = Math.max(0.0, Math.min(0.1,
                     (now - lastLyricsAnimationNs) / 1_000_000_000.0));
             lastLyricsAnimationNs = now;
@@ -1138,6 +1161,11 @@ public final class WorldPanel {
         if (!Double.isFinite(lyricsVisualPosition) || currentLyrics != lyricsAnimationRef) {
             lyricsVisualPosition = activeLyricsVisualLine;
             lyricsAnimationRef = currentLyrics;
+            lyricsAnimationSourceIndex = activeLyricsLine;
+            lyricsTransitionFromSourceIndex = activeLyricsLine;
+            lyricsTransitionToSourceIndex = activeLyricsLine;
+            lyricsTransitionFromPosition = activeLyricsVisualLine;
+            lyricsTransitionToPosition = activeLyricsVisualLine;
         }
         paintedLyricsRef = currentLyrics;
         paintedLyricsLineIndex = activeLyricsLine;
@@ -1854,28 +1882,28 @@ public final class WorldPanel {
             int windowStart = Math.max(0, (int) Math.floor(visual) - 1);
             double fractional = visual - Math.floor(visual);
             int last = Math.min(lines.size(), windowStart + LYRICS_VISIBLE_LINES + 2);
+            double sourceTransition = lyricsSourceTransitionProgress();
             for (int index = windowStart; index < last; index++) {
                 WrappedLyricLine line = lines.get(index);
                 int baseline = firstBaseline + (index - windowStart) * LYRICS_LINE_HEIGHT
                         - (int) Math.round(fractional * LYRICS_LINE_HEIGHT);
-                double activeWeight = Math.max(0.0, 1.0 - Math.abs(index - visual));
-                // Base tone follows the interpolated visual position, not the discrete
-                // Spotify line index, so the dim/bright transition is smooth too.
-                Color baseColor = index < visual
-                        ? new Color(130, 150, 142) : new Color(194, 211, 204);
-                Color color = blendColor(baseColor, new Color(246, 255, 252), activeWeight);
+                // All visual fragments created from the same LRCLIB timestamp share
+                // one weight. A wrapped two- or three-row lyric is highlighted as a
+                // single lyric instead of emphasizing only its first fragment.
+                double activeWeight = lyricSourceHighlightWeight(line.sourceIndex(), sourceTransition);
+                Color baseColor = line.sourceIndex() < lyricsTransitionToSourceIndex
+                        ? new Color(139, 158, 150) : new Color(191, 208, 201);
+                Color color = blendColor(baseColor, new Color(250, 255, 252), activeWeight);
                 boolean emphasized = activeWeight >= 0.45;
                 g.setFont(emphasized ? LYRICS_ACTIVE_FONT : LYRICS_NORMAL_FONT);
                 if (activeWeight > 0.08) {
                     int lineHeight = LYRICS_LINE_HEIGHT - 2;
                     int highlightY = baseline - g.getFontMetrics().getAscent() + 1;
-                    int alpha = (int) Math.round(30.0 * activeWeight);
-                    g.setColor(new Color(30, 215, 96, (int) Math.round(34.0 * activeWeight)));
+                    g.setColor(new Color(30, 215, 96, (int) Math.round(42.0 * activeWeight)));
                     g.fillRoundRect(x0 - 3, highlightY, width + 6, lineHeight, 6, 6);
                 }
                 g.setColor(color);
-                // Draw plain antialiased text without a dark offset shadow; the card itself
-                // provides enough contrast and long lines have already been wrapped.
+                // Draw plain antialiased text without a dark offset shadow.
                 g.drawString(line.text(), x0, baseline);
             }
         } else if (!wrappedPlainLyrics.isEmpty()) {
@@ -1913,6 +1941,27 @@ public final class WorldPanel {
         );
     }
 
+    private static double lyricsSourceTransitionProgress() {
+        if (lyricsTransitionFromSourceIndex == lyricsTransitionToSourceIndex) return 1.0;
+        double distance = lyricsTransitionToPosition - lyricsTransitionFromPosition;
+        if (!Double.isFinite(distance) || Math.abs(distance) < 0.0001
+                || !Double.isFinite(lyricsVisualPosition)) return 1.0;
+        double progress = (lyricsVisualPosition - lyricsTransitionFromPosition) / distance;
+        progress = Math.max(0.0, Math.min(1.0, progress));
+        // Smoothstep keeps the emphasis fade soft at both ends of the row transition.
+        return progress * progress * (3.0 - 2.0 * progress);
+    }
+
+    private static double lyricSourceHighlightWeight(int sourceIndex, double transitionProgress) {
+        if (sourceIndex < 0) return 0.0;
+        if (lyricsTransitionFromSourceIndex == lyricsTransitionToSourceIndex) {
+            return sourceIndex == lyricsTransitionToSourceIndex ? 1.0 : 0.0;
+        }
+        if (sourceIndex == lyricsTransitionToSourceIndex) return transitionProgress;
+        if (sourceIndex == lyricsTransitionFromSourceIndex) return 1.0 - transitionProgress;
+        return 0.0;
+    }
+
     private static void ensureLyricsLayout(SpotifyClient.Lyrics lyrics) {
         if (lyrics == lyricsLayoutRef) return;
         lyricsLayoutRef = lyrics;
@@ -1920,20 +1969,24 @@ public final class WorldPanel {
         List<String> plain = new ArrayList<>();
         if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
             Graphics2D measureGraphics = OVERLAY_IMAGE.createGraphics();
-            measureGraphics.setFont(LYRICS_NORMAL_FONT);
-            FontMetrics metrics = measureGraphics.getFontMetrics();
-            // Leave extra width reserve for the slightly larger bold active line.
+            // Synced lines must fit even when every wrapped fragment of the active
+            // source lyric is shown in the larger bold font. Plain lyrics use the
+            // smaller surrounding-line font.
+            measureGraphics.setFont(LYRICS_ACTIVE_FONT);
+            FontMetrics syncedMetrics = measureGraphics.getFontMetrics();
             int textWidth = Math.max(24, nowPlayingLyricsRect().width() - 34);
             if (!lyrics.syncedLines().isEmpty()) {
                 for (int sourceIndex = 0; sourceIndex < lyrics.syncedLines().size(); sourceIndex++) {
                     SpotifyClient.LyricLine source = lyrics.syncedLines().get(sourceIndex);
-                    for (String fragment : wrapLyricsText(source.text(), metrics, textWidth)) {
+                    for (String fragment : wrapLyricsText(source.text(), syncedMetrics, textWidth)) {
                         synced.add(new WrappedLyricLine(sourceIndex, fragment));
                     }
                 }
             } else {
+                measureGraphics.setFont(LYRICS_NORMAL_FONT);
+                FontMetrics plainMetrics = measureGraphics.getFontMetrics();
                 for (String source : lyrics.plainLines()) {
-                    plain.addAll(wrapLyricsText(source, metrics, textWidth));
+                    plain.addAll(wrapLyricsText(source, plainMetrics, textWidth));
                 }
             }
             measureGraphics.dispose();
@@ -1944,8 +1997,14 @@ public final class WorldPanel {
                 Math.max(0, wrappedPlainLyrics.size() - LYRICS_VISIBLE_LINES)));
         if (lyrics != lyricsAnimationRef) {
             long progress = progressVisualInitialized ? Math.round(displayedProgressMs) : 0L;
-            lyricsVisualPosition = firstWrappedIndexForSource(currentSyncedLyricIndex(lyrics, progress));
+            int sourceIndex = currentSyncedLyricIndex(lyrics, progress);
+            lyricsVisualPosition = firstWrappedIndexForSource(sourceIndex);
             lyricsAnimationRef = lyrics;
+            lyricsAnimationSourceIndex = sourceIndex;
+            lyricsTransitionFromSourceIndex = sourceIndex;
+            lyricsTransitionToSourceIndex = sourceIndex;
+            lyricsTransitionFromPosition = lyricsVisualPosition;
+            lyricsTransitionToPosition = lyricsVisualPosition;
             lastLyricsAnimationNs = System.nanoTime();
         }
     }

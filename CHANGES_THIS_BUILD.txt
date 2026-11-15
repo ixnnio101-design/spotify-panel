@@ -75,3 +75,7 @@
 - Исправлено очищение прежнего текста при Spotify 204, `item: null`, 401 и потере авторизации.
 - Для LRCLIB передаётся идентифицирующий User-Agent. Перед публичным релизом в User-Agent требуется добавить действительную ссылку на страницу проекта или контакт разработчика в соответствии с документацией LRCLIB.
 - Проверен синтаксический разбор Java и JSON. Gradle и Minecraft не запускались.
+
+- Fixed synced-lyrics highlighting for wrapped source lines: every visual fragment originating from the same LRC timestamp now shares one active weight/background/font emphasis.
+- Made non-active lyric context smaller (11 px); active lyric fragments remain 14 px bold. Synced wrapping uses active-font metrics to prevent the emphasized text from overflowing the card.
+- Kept the smooth transition between source lyric timestamps, LRCLIB no-cache behavior, partial dirty-region rendering, Spotify-green frame, and 3D camera stabilization unchanged.
