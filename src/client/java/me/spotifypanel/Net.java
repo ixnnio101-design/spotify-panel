@@ -4,6 +4,10 @@ import java.net.InetSocketAddress;
 import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 
 /** Общий HttpClient мода. Если в конфиге задан HTTP-прокси ("host:port") — все запросы идут через него. */
 public final class Net {
@@ -29,6 +33,24 @@ public final class Net {
         synchronized (Net.class) {
             client = c;
         }
+    }
+
+    /** Parse Retry-After in either delta-seconds or RFC 1123 HTTP-date form. */
+    public static long retryAfterDelayMillis(String value, long fallbackMs, long maxMs) {
+        if (value == null || value.isBlank()) return Math.min(Math.max(0L, fallbackMs), Math.max(0L, maxMs));
+        String v = value.trim();
+        long delay;
+        try {
+            delay = Math.multiplyExact(Math.max(0L, Long.parseLong(v)), 1_000L);
+        } catch (NumberFormatException | ArithmeticException numericFailure) {
+            try {
+                Instant target = ZonedDateTime.parse(v, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
+                delay = Math.max(0L, Duration.between(Instant.now(), target).toMillis());
+            } catch (DateTimeParseException dateFailure) {
+                delay = Math.max(0L, fallbackMs);
+            }
+        }
+        return Math.min(Math.max(0L, delay), Math.max(0L, maxMs));
     }
 
     private static HttpClient build(String hostPort) {

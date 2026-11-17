@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -158,11 +159,19 @@ public final class SpotifyClient {
         t.setDaemon(true);
         return t;
     });
+    private volatile Future<?> lyricsFuture;
     private final AtomicLong lyricsRequestSequence = new AtomicLong();
     private volatile String lyricsRequestedUri = "";
     private volatile Lyrics lyrics = Lyrics.empty();
     // LiriQo cooldown is shared across track changes; honor Retry-After globally.
     private volatile long liriqoCooldownUntilMs;
+
+    // Artwork network I/O and decoding must not occupy the player/library scheduler.
+    private final ScheduledExecutorService coverExec = Executors.newScheduledThreadPool(2, r -> {
+        Thread t = new Thread(r, "spotifypanel-covers");
+        t.setDaemon(true);
+        return t;
+    });
 
     private final ExecutorService ctl = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "spotifypanel-ctl");
@@ -653,14 +662,9 @@ public final class SpotifyClient {
         }
         HttpResponse<String> response = Net.http().send(b.build(), HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() == 429) {
-            String retryAfter = response.headers().firstValue("Retry-After").orElse("5");
-            long delayMs;
-            try {
-                delayMs = Math.max(1_000L, Long.parseLong(retryAfter.trim()) * 1_000L);
-            } catch (NumberFormatException ignored) {
-                delayMs = 5_000L;
-            }
-            extendApiCooldown(System.currentTimeMillis() + delayMs);
+            long delayMs = Net.retryAfterDelayMillis(
+                    response.headers().firstValue("Retry-After").orElse(""), 5_000L, 5 * 60_000L);
+            extendApiCooldown(System.currentTimeMillis() + Math.max(1_000L, delayMs));
         }
 
         if (cacheableGet && response.statusCode() == 304 && cached != null) {
@@ -860,6 +864,9 @@ public final class SpotifyClient {
 
     private void clearCurrentLyrics() {
         lyricsRequestSequence.incrementAndGet();
+        Future<?> previous = lyricsFuture;
+        if (previous != null) previous.cancel(true);
+        lyricsFuture = null;
         lyricsRequestedUri = "";
         if (lyrics.status() != LyricsStatus.IDLE || !lyrics.trackUri().isEmpty()) {
             lyrics = Lyrics.empty();
@@ -876,9 +883,11 @@ public final class SpotifyClient {
         if (uri.equals(lyricsRequestedUri)) return;
         lyricsRequestedUri = uri;
         long requestId = lyricsRequestSequence.incrementAndGet();
+        Future<?> previous = lyricsFuture;
+        if (previous != null) previous.cancel(true);
         lyrics = new Lyrics(uri, LyricsStatus.LOADING, false, List.of(), List.of(), "Ищем текст...");
         try {
-            lyricsExecutor.execute(() -> {
+            lyricsFuture = lyricsExecutor.submit(() -> {
                 if (requestId != lyricsRequestSequence.get()) return;
                 Lyrics result = fetchLyrics(track);
                 if (requestId == lyricsRequestSequence.get()
@@ -942,16 +951,10 @@ public final class SpotifyClient {
 
         HttpResponse<String> response = Net.http().send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() == 429 || response.statusCode() == 503) {
-            long retrySeconds = 5L;
-            String retryAfter = response.headers().firstValue("Retry-After").orElse("").trim();
-            try {
-                if (!retryAfter.isEmpty()) retrySeconds = Math.max(1L, Long.parseLong(retryAfter));
-            } catch (NumberFormatException ignored) {
-                // Keep a conservative retry delay for an absent or non-numeric header.
-            }
-            retrySeconds = Math.min(retrySeconds, 300L);
+            long retryDelayMs = Net.retryAfterDelayMillis(
+                    response.headers().firstValue("Retry-After").orElse(""), 5_000L, 300_000L);
             liriqoCooldownUntilMs = Math.max(liriqoCooldownUntilMs,
-                    System.currentTimeMillis() + retrySeconds * 1_000L);
+                    System.currentTimeMillis() + Math.max(1_000L, retryDelayMs));
             return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(),
                     "LiriQo временно ограничил запросы. Повтори позже");
         }
@@ -1033,27 +1036,6 @@ public final class SpotifyClient {
         if (plainLines.isEmpty() && syncedLines.isEmpty()) {
             return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
                     "LiriQo не нашёл текст для этого трека");
-        }
-        return new Lyrics(uri, LyricsStatus.FOUND, false, plainLines, syncedLines, "");
-    }
-
-    private static Lyrics lyricsFromJson(String uri, JsonObject object) {
-        boolean instrumental = bool(object, "instrumental");
-        String plain = str(object, "plainLyrics");
-        String synced = str(object, "syncedLyrics");
-        List<String> plainLines = new ArrayList<>();
-        if (!plain.isBlank()) {
-            for (String line : plain.replace("\r", "").split("\\n")) {
-                String clean = line.strip();
-                if (!clean.isEmpty()) plainLines.add(clean);
-            }
-        }
-        List<LyricLine> syncedLines = parseSyncedLyrics(synced);
-        if (instrumental) {
-            return new Lyrics(uri, LyricsStatus.INSTRUMENTAL, true, List.of(), List.of(), "Инструментальная композиция");
-        }
-        if (plainLines.isEmpty() && syncedLines.isEmpty()) {
-            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Текст для этого трека не найден");
         }
         return new Lyrics(uri, LyricsStatus.FOUND, false, plainLines, syncedLines, "");
     }
@@ -1166,9 +1148,9 @@ public final class SpotifyClient {
             HttpResponse<String> r = send("GET", endpoint + separator + "limit=50&offset=" + offset, null);
             if (r.statusCode() != 200) {
                 if (r.statusCode() == 429) {
-                    String ra = r.headers().firstValue("Retry-After").orElse("5");
-                    try { retryAfterMs = Math.max(retryAfterMs, Long.parseLong(ra.trim()) * 1000L); }
-                    catch (NumberFormatException ignored) { retryAfterMs = Math.max(retryAfterMs, 5_000); }
+                    long delay = Net.retryAfterDelayMillis(
+                            r.headers().firstValue("Retry-After").orElse(""), 5_000L, 5 * 60_000L);
+                    retryAfterMs = Math.max(retryAfterMs, delay);
                 }
                 if (r.statusCode() == 401) auth.invalidate();
                 throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
@@ -1363,9 +1345,9 @@ public final class SpotifyClient {
             HttpResponse<String> r = send("GET", path, null);
             if (r.statusCode() != 200) {
                 if (r.statusCode() == 429) {
-                    String ra = r.headers().firstValue("Retry-After").orElse("5");
-                    try { retryAfterMs = Math.max(retryAfterMs, Long.parseLong(ra.trim()) * 1000L); }
-                    catch (NumberFormatException ignored) { retryAfterMs = Math.max(retryAfterMs, 5_000); }
+                    long delay = Net.retryAfterDelayMillis(
+                            r.headers().firstValue("Retry-After").orElse(""), 5_000L, 5 * 60_000L);
+                    retryAfterMs = Math.max(retryAfterMs, delay);
                 }
                 if (r.statusCode() == 401) auth.invalidate();
                 throw new IOException("HTTP " + r.statusCode() + (apiMessage(r.body()).isEmpty() ? "" : ": " + apiMessage(r.body())));
@@ -1995,7 +1977,7 @@ public final class SpotifyClient {
             long retryAt = coverRetryAtMs.getOrDefault(url, 0L);
             if (now >= retryAt && coverLoading.add(url)) {
                 try {
-                    exec.execute(() -> loadRaw(url));
+                    coverExec.execute(() -> loadRaw(url));
                 } catch (RuntimeException rejected) {
                     coverLoading.remove(url);
                     LOG.debug("Artwork load could not be queued: {}", url, rejected);
@@ -2075,12 +2057,8 @@ public final class SpotifyClient {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(12)).GET().build();
             HttpResponse<byte[]> r = Net.http().send(req, HttpResponse.BodyHandlers.ofByteArray());
             if (r.statusCode() != 200) {
-                String retryAfter = r.headers().firstValue("Retry-After").orElse("");
-                try {
-                    serverRetryDelayMs = Math.min(300L, Math.max(0L, Long.parseLong(retryAfter.trim()))) * 1_000L;
-                } catch (NumberFormatException ignored) {
-                    // Most artwork CDN responses do not include Retry-After; local backoff applies.
-                }
+                serverRetryDelayMs = Net.retryAfterDelayMillis(
+                        r.headers().firstValue("Retry-After").orElse(""), 0L, 300_000L);
                 throw new IOException("HTTP " + r.statusCode());
             }
             int[] raw = decodeAwt(r.body());
@@ -2093,7 +2071,9 @@ public final class SpotifyClient {
             coverAttempts.remove(url);
             // Publish completion only after the pixel cache is visible to readers.
             completedCoverUrls.add(url);
-        } catch (Throwable e) {
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
             scheduleCoverRetry(url, e, serverRetryDelayMs);
         } finally {
             coverLoading.remove(url);
@@ -2101,7 +2081,7 @@ public final class SpotifyClient {
     }
 
     /** Retry forever, but back off to at most once per minute for a persistently bad URL. */
-    private void scheduleCoverRetry(String url, Throwable failure, long serverDelayMs) {
+    private void scheduleCoverRetry(String url, Exception failure, long serverDelayMs) {
         int attempt = coverAttempts.computeIfAbsent(url, ignored -> new AtomicInteger()).incrementAndGet();
         long exponentialDelay = Math.min(60_000L, 1_500L << Math.min(6, Math.max(0, attempt - 1)));
         long delay = Math.min(5 * 60_000L, Math.max(exponentialDelay, serverDelayMs));
@@ -2117,10 +2097,10 @@ public final class SpotifyClient {
         }
 
         try {
-            exec.schedule(() -> {
+            coverExec.schedule(() -> {
                 if (rawCache.containsKey(url) || !coverLoading.add(url)) return;
                 try {
-                    exec.execute(() -> loadRaw(url));
+                    coverExec.execute(() -> loadRaw(url));
                 } catch (RuntimeException rejected) {
                     coverLoading.remove(url);
                     LOG.debug("Artwork retry could not be queued: {}", url, rejected);
@@ -2134,7 +2114,7 @@ public final class SpotifyClient {
     private static int[] decodeNative(byte[] bytes) {
         try (NativeImage img = NativeImage.read(new ByteArrayInputStream(bytes))) {
             return downsample(img.getWidth(), img.getHeight(), img::getColorArgb, RAW);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             LOG.warn("NativeImage decode failed", e);
             return null;
         }
@@ -2145,7 +2125,7 @@ public final class SpotifyClient {
             BufferedImage img = ImageIO.read(new ByteArrayInputStream(bytes));
             if (img == null) return null;
             return downsample(img.getWidth(), img.getHeight(), img::getRGB, RAW);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             LOG.warn("ImageIO decode failed", e);
             return null;
         }

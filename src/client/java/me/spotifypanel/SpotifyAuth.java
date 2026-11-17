@@ -163,11 +163,11 @@ public final class SpotifyAuth {
             mc.execute(() -> {
                 try {
                     mc.keyboard.setClipboard(url);
-                } catch (Throwable ignored) {
+                } catch (RuntimeException ignored) {
                 }
                 try {
                     Util.getOperatingSystem().open(URI.create(url));
-                } catch (Throwable ignored) {
+                } catch (Exception ignored) {
                 }
             });
             say.accept("Открываю браузер для входа в Spotify. Если не открылся — ссылка скопирована в буфер обмена (Ctrl+V в браузер).");
@@ -194,11 +194,13 @@ public final class SpotifyAuth {
                     URI target = URI.create("http://127.0.0.1" + parts[1]);
                     Map<String, String> params = parseQuery(target.getRawQuery());
                     boolean isCallback = "/callback".equals(target.getPath());
-                    if (isCallback && params.containsKey("error")) {
-                        respond(s, "Вход отменён: " + params.get("error"));
-                        throw new IOException(params.get("error"));
+                    boolean validState = state.equals(params.get("state"));
+                    if (isCallback && validState && params.containsKey("error")) {
+                        String oauthError = params.get("error");
+                        respond(s, "Вход отменён: " + oauthError);
+                        throw new IOException(oauthError);
                     }
-                    if (isCallback && params.containsKey("code") && state.equals(params.get("state"))) {
+                    if (isCallback && validState && params.containsKey("code")) {
                         respond(s, "Готово! Можно закрыть вкладку и вернуться в Minecraft.");
                         code = params.get("code");
                     } else {
@@ -223,13 +225,19 @@ public final class SpotifyAuth {
     private static void respond(Socket s, String text) throws IOException {
         byte[] body = ("<!doctype html><meta charset=utf-8><title>Spotify Panel</title>"
                 + "<body style=\"font-family:sans-serif;background:#101418;color:#fff;text-align:center;padding-top:20vh\">"
-                + "<h2>" + text + "</h2></body>").getBytes(StandardCharsets.UTF_8);
+                + "<h2>" + escapeHtml(text) + "</h2></body>").getBytes(StandardCharsets.UTF_8);
         String head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: "
                 + body.length + "\r\n\r\n";
         OutputStream out = s.getOutputStream();
         out.write(head.getBytes(StandardCharsets.US_ASCII));
         out.write(body);
         out.flush();
+    }
+
+    private static String escapeHtml(String value) {
+        if (value == null) return "";
+        return value.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;");
     }
 
     private static Map<String, String> parseQuery(String raw) {
