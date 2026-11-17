@@ -5,7 +5,7 @@
 ## Что отображается
 
 - Обложка альбома и текущий трек берутся из данных Spotify.
-- Текст текущей песни по запросу загружается из LRCLIB по названию, основному исполнителю, альбому и длительности трека. Если доступны временные метки LRC, текущая строка подсвечивается по прогрессу Spotify; обычный текст можно прокручивать колёсиком над правой колонкой. Под блоком указывается источник LRCLIB. Текст хранится только в оперативной памяти для текущего трека и очищается при переключении или отсутствии активного трека; отдельный кэш, история и запись текстов на диск не используются. Запрос выполняется один раз при смене трека, в фоне, не блокируя отрисовку. При 429/503 соблюдается `Retry-After` и пауза между запросами. Для поиска требуется подключение к интернету; если сервис не находит текст, панель показывает соответствующее сообщение.
+- Текст текущей песни по запросу загружается через LiriQo по названию, основному исполнителю, альбому и длительности трека. LiriQo объединяет несколько поставщиков текстов и возвращает обычный текст и/или синхронизированные строки; если временные метки доступны, текущая строка подсвечивается по прогрессу Spotify. Обычный текст можно прокручивать колёсиком над правой колонкой. В моде используется только endpoint LiriQo, без отдельного запасного сервиса и без API-ключа для стандартных публичных запросов. Текст хранится только в оперативной памяти для текущего трека и очищается при переключении или отсутствии активного трека; отдельный кэш, история и запись текстов на диск не используются. Запрос выполняется один раз при смене трека, в фоне, не блокируя отрисовку. При 429/503 учитывается `Retry-After`; поиск требует подключения к интернету.
 - Название трека, исполнитель, состояние воспроизведения, прогресс и громкость рисуются в динамическую текстуру Java-кодом.
 - Основная форма панели загружается из `assets/spotify-panel/models/panel.bbmodel` — это обновлённая плоская модель Blockbench с 15 отдельными частями, включая широкую подложку `search_corpus` и отдельный корпус ввода `search`.
 - Каждый элемент из Blockbench отрисовывается как плоская поверхность в мировых координатах. Исходные координаты X задают только небольшой разнос слоёв по глубине; искусственная толщина и боковые грани не добавляются.
@@ -42,3 +42,8 @@
 ### Latest playback fixes
 
 Clicking a playlist icon opens the playlist and starts its first available track. Selecting a track in Liked Songs starts it through its album context and exact track offset; the panel's Next/Previous controls then follow the saved-tracks list rather than the album. The volume slider updates locally immediately and coalesces outgoing Spotify API requests to avoid a queue of stale values.
+
+
+### Lyrics provider
+
+The mod uses the public LiriQo API as its only client-side lyrics endpoint. LiriQo aggregates multiple upstream providers and returns a normalized response with plain and, when available, timestamped lyrics. Standard public requests do not require an API key. The mod does not add a separate fallback service, and lyrics are not cached between tracks or written to disk. Before public distribution, verify the rights and terms needed to display lyrics returned by third-party providers.

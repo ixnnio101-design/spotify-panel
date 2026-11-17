@@ -83,7 +83,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -1887,7 +1887,7 @@ public final class WorldPanel {
                 WrappedLyricLine line = lines.get(index);
                 int baseline = firstBaseline + (index - windowStart) * LYRICS_LINE_HEIGHT
                         - (int) Math.round(fractional * LYRICS_LINE_HEIGHT);
-                // All visual fragments created from the same LRCLIB timestamp share
+                // All visual fragments created from the same LiriQo timestamp share
                 // one weight. A wrapped two- or three-row lyric is highlighted as a
                 // single lyric instead of emphasizing only its first fragment.
                 double activeWeight = lyricSourceHighlightWeight(line.sourceIndex(), sourceTransition);
