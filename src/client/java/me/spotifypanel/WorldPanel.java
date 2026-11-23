@@ -83,7 +83,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -119,8 +119,6 @@ public final class WorldPanel {
     private static int paintedVolume = -1;
     private static SpotifyClient.Lyrics paintedLyricsRef;
     private static int paintedLyricsLineIndex = Integer.MIN_VALUE;
-    private static int paintedLyricsScroll = Integer.MIN_VALUE;
-    private static int lyricsScroll;
     private static double lyricsVisualPosition = Double.NaN;
     private static double paintedLyricsVisualPosition = Double.NaN;
     private static long lastLyricsAnimationNs;
@@ -136,7 +134,6 @@ public final class WorldPanel {
     private static double lyricsTransitionFromPosition = Double.NaN;
     private static double lyricsTransitionToPosition = Double.NaN;
     private static List<WrappedLyricLine> wrappedSyncedLyrics = List.of();
-    private static List<String> wrappedPlainLyrics = List.of();
     private static final Font LYRICS_NORMAL_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 11);
     private static final Font LYRICS_ACTIVE_FONT = new Font(Font.SANS_SERIF, Font.BOLD, 14);
     private static final long LYRICS_ANIMATION_FRAME_NS = 8_333_333L; // up to 120 Hz
@@ -640,16 +637,11 @@ public final class WorldPanel {
         if (uv == null) return;
         int tx = (int) (uv[0] * UI_W);
         int ty = (int) (uv[1] * UI_H);
-        // 1 = library sidebar, 2 = track table, 3 = other panel areas, 4 = unsynced lyrics.
+        // 1 = library sidebar, 2 = track table, 3 = other panel areas.
         scrollArea = 3;
         if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) && ty <= py(2.4)) scrollArea = 1;
         else if (tx >= px(-9.4) && tx <= px(5.2)
                 && ty >= py(searchMode() ? SEARCH_RESULTS_TOP : 9.2) && ty <= py(2.4)) scrollArea = 2;
-        else {
-            UiRect lyricRect = nowPlayingLyricsRect();
-            if (tx >= lyricRect.x() && tx <= lyricRect.right()
-                    && ty >= lyricRect.y() && ty <= lyricRect.bottom()) scrollArea = 4;
-        }
     }
 
     private static void applyWheel(int playlistCount, int itemCount, int visibleTrackRows) {
@@ -658,16 +650,6 @@ public final class WorldPanel {
             int direction = wheelDelta > 0 ? -1 : 1;
             if (scrollArea == 1) sideScroll = Math.max(0, Math.min(Math.max(0, playlistCount - 7), sideScroll + direction));
             else if (scrollArea == 2) trackScroll = Math.max(0, Math.min(Math.max(0, itemCount - visibleTrackRows), trackScroll + direction));
-            else if (scrollArea == 4) {
-                SpotifyClient.Lyrics currentLyrics = SpotifyPanelMod.spotify.lyrics();
-                if (currentLyrics.status() == SpotifyClient.LyricsStatus.FOUND
-                        && currentLyrics.syncedLines().isEmpty()) {
-                    ensureLyricsLayout(currentLyrics);
-                    lyricsScroll = Math.max(0, Math.min(
-                            Math.max(0, wrappedPlainLyrics.size() - LYRICS_VISIBLE_LINES),
-                            lyricsScroll + direction));
-                }
-            }
             wheelDelta -= Math.signum(wheelDelta);
         }
     }
@@ -973,11 +955,9 @@ public final class WorldPanel {
         }
         boolean lyricsAnimationMoving = Math.abs(targetLyricsVisualLine - lyricsVisualPosition) > 0.008;
         if (trackChanged || statusChanged) {
-            if (trackChanged) lyricsScroll = 0;
             repaintRegion(overlayTexture, nowPlayingRect(), g -> paintNowPlaying(g, snapshot));
             paintedLyricsRef = currentLyrics;
             paintedLyricsLineIndex = currentLyricsLine;
-            paintedLyricsScroll = lyricsScroll;
             paintedLyricsVisualPosition = lyricsVisualPosition;
             lastLyricsRegionPaintNs = now;
         } else {
@@ -985,8 +965,7 @@ public final class WorldPanel {
                 repaintRegion(overlayTexture, nowPlayingStatusRect(), g -> paintNowPlayingStatus(g, snapshot));
             }
             boolean lyricsChanged = currentLyrics != paintedLyricsRef
-                    || currentLyricsLine != paintedLyricsLineIndex
-                    || lyricsScroll != paintedLyricsScroll;
+                    || currentLyricsLine != paintedLyricsLineIndex;
             boolean lyricsAnimationFrame = lyricsAnimationMoving
                     && Math.abs(lyricsVisualPosition - paintedLyricsVisualPosition) > 0.002
                     && now - lastLyricsRegionPaintNs >= LYRICS_ANIMATION_FRAME_NS;
@@ -995,8 +974,7 @@ public final class WorldPanel {
                         g -> paintNowPlayingLyrics(g, snapshot, currentLyrics));
                 paintedLyricsRef = currentLyrics;
                 paintedLyricsLineIndex = currentLyricsLine;
-                paintedLyricsScroll = lyricsScroll;
-                paintedLyricsVisualPosition = lyricsVisualPosition;
+                    paintedLyricsVisualPosition = lyricsVisualPosition;
                 lastLyricsRegionPaintNs = now;
             }
         }
@@ -1171,7 +1149,6 @@ public final class WorldPanel {
         }
         paintedLyricsRef = currentLyrics;
         paintedLyricsLineIndex = activeLyricsLine;
-        paintedLyricsScroll = lyricsScroll;
         paintedLyricsVisualPosition = lyricsVisualPosition;
         lastLyricsAnimationNs = System.nanoTime();
         lastLyricsRegionPaintNs = lastLyricsAnimationNs;
@@ -1853,7 +1830,7 @@ public final class WorldPanel {
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.LOADING) {
-            drawLyricsMessage(g, "Ищем текст...", x0, width, firstBaseline);
+            drawLyricsMessage(g, "Ищем синхронизированный текст...", x0, width, firstBaseline);
             g.setClip(previousClip);
             return;
         }
@@ -1863,7 +1840,7 @@ public final class WorldPanel {
             return;
         }
         if (lyrics.status() == SpotifyClient.LyricsStatus.NOT_FOUND) {
-            drawLyricsMessage(g, "Текст не найден", x0, width, firstBaseline);
+            drawLyricsMessage(g, "Синхронизированный текст не найден", x0, width, firstBaseline);
             g.setClip(previousClip);
             return;
         }
@@ -1905,21 +1882,11 @@ public final class WorldPanel {
                     g.fillRoundRect(x0 - 3, highlightY, width + 6, lineHeight, 6, 6);
                 }
                 g.setColor(color);
-                // Draw plain antialiased text without a dark offset shadow.
+                // Draw crisp antialiased text without a dark offset shadow.
                 g.drawString(line.text(), x0, baseline);
             }
-        } else if (!wrappedPlainLyrics.isEmpty()) {
-            int maxScroll = Math.max(0, wrappedPlainLyrics.size() - LYRICS_VISIBLE_LINES);
-            int first = Math.max(0, Math.min(lyricsScroll, maxScroll));
-            g.setFont(LYRICS_NORMAL_FONT);
-            g.setColor(new Color(226, 237, 233));
-            int visible = Math.min(LYRICS_VISIBLE_LINES, wrappedPlainLyrics.size() - first);
-            for (int row = 0; row < visible; row++) {
-                String text = wrappedPlainLyrics.get(first + row);
-                g.drawString(text, x0, firstBaseline + row * LYRICS_LINE_HEIGHT);
-            }
         } else {
-            drawLyricsMessage(g, "Текст не найден", x0, width, firstBaseline);
+            drawLyricsMessage(g, "Синхронизированный текст не найден", x0, width, firstBaseline);
         }
         g.setClip(previousClip);
     }
@@ -1968,7 +1935,6 @@ public final class WorldPanel {
         if (lyrics == lyricsLayoutRef) return;
         lyricsLayoutRef = lyrics;
         List<WrappedLyricLine> synced = new ArrayList<>();
-        List<String> plain = new ArrayList<>();
         if (lyrics != null && lyrics.status() == SpotifyClient.LyricsStatus.FOUND) {
             Graphics2D measureGraphics = OVERLAY_IMAGE.createGraphics();
             // Synced lines must fit even when every wrapped fragment of the active
@@ -1984,19 +1950,10 @@ public final class WorldPanel {
                         synced.add(new WrappedLyricLine(sourceIndex, fragment));
                     }
                 }
-            } else {
-                measureGraphics.setFont(LYRICS_NORMAL_FONT);
-                FontMetrics plainMetrics = measureGraphics.getFontMetrics();
-                for (String source : lyrics.plainLines()) {
-                    plain.addAll(wrapLyricsText(source, plainMetrics, textWidth));
-                }
             }
             measureGraphics.dispose();
         }
         wrappedSyncedLyrics = List.copyOf(synced);
-        wrappedPlainLyrics = List.copyOf(plain);
-        lyricsScroll = Math.max(0, Math.min(lyricsScroll,
-                Math.max(0, wrappedPlainLyrics.size() - LYRICS_VISIBLE_LINES)));
         if (lyrics != lyricsAnimationRef) {
             long progress = progressVisualInitialized ? Math.round(displayedProgressMs) : 0L;
             int sourceIndex = currentSyncedLyricIndex(lyrics, progress);
@@ -2460,7 +2417,11 @@ public final class WorldPanel {
         if (tx >= px(-10.8) && tx <= px(-9.6) && ty >= py(12.7) + 45 && ty <= py(2.4)) {
             double relativeSlot = (ty - (py(12.7) + 53)) / 46.0;
             int visibleSlot = Math.max(0, (int) Math.floor(relativeSlot));
-            int entryIndex = Math.max(0, (int) Math.floor(Math.max(0.0, relativeSlot) + sideScrollVisual));
+            // Hit-test against the scroll offset that was actually painted. The animation
+            // state may advance between texture uploads; using it here could select the
+            // neighboring playlist while the visible rows still show the previous offset.
+            double hitSideScroll = Double.isFinite(paintedSideScroll) ? paintedSideScroll : sideScrollVisual;
+            int entryIndex = Math.max(0, (int) Math.floor(Math.max(0.0, relativeSlot) + hitSideScroll));
             if (visibleSlot < 7 && entryIndex < libraryEntries.size()) {
                 SpotifyClient.LibraryEntry clickedEntry = libraryEntries.get(entryIndex);
                 selectedLibraryKey = clickedEntry.key();
@@ -2479,8 +2440,12 @@ public final class WorldPanel {
         // Search results occupy the central track area while a query is present.
         if (searchMode() && tx >= px(-9.4) && tx <= px(5.2)
                 && ty >= py(SEARCH_RESULTS_TOP) + 59 && ty <= py(2.4)) {
+            // The texture can be one frame behind the live easing value. Resolve clicks
+            // against the exact scroll position used by the last row paint, not the newer
+            // animation target, otherwise a fast wheel scroll can launch an adjacent track.
+            double hitTrackScroll = Double.isFinite(paintedTrackScroll) ? paintedTrackScroll : trackScrollVisual;
             int itemIndex = (int) Math.floor((ty - (py(SEARCH_RESULTS_TOP) + 59))
-                    / (double) SEARCH_RESULT_ROW_HEIGHT + trackScrollVisual);
+                    / (double) SEARCH_RESULT_ROW_HEIGHT + hitTrackScroll);
             if (itemIndex >= 0 && itemIndex < searchResults.size()) {
                 client.playSearchResult(searchResults.get(itemIndex), SpotifyPanelMod::say);
             }
@@ -2491,7 +2456,11 @@ public final class WorldPanel {
         // Content rows inside the selected library section.
         if (!searchMode() && selected != null && items != null && tx >= px(-9.4) && tx <= px(5.2)
                 && ty >= py(9.2) + 43 && ty <= py(2.4)) {
-            int itemIndex = (int) Math.floor((ty - (py(9.2) + 43)) / 42.0 + trackScrollVisual);
+            // Match the row positions currently visible in the texture. trackScrollVisual
+            // is updated every render tick, while the clipped texture is repainted at a
+            // capped rate; using it directly can pick the wrong URI during rapid scrolling.
+            double hitTrackScroll = Double.isFinite(paintedTrackScroll) ? paintedTrackScroll : trackScrollVisual;
+            int itemIndex = (int) Math.floor((ty - (py(9.2) + 43)) / 42.0 + hitTrackScroll);
             if (itemIndex >= 0 && itemIndex < items.size()) {
                 client.playLibraryItem(selected, items.get(itemIndex), SpotifyPanelMod::say);
                 wasLeftDown = down;

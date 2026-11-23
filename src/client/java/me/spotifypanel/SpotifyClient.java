@@ -103,9 +103,13 @@ public final class SpotifyClient {
         }
     }
 
-    public record Item(String title, String artists, long durationMs, String uri, String albumUri) {
+    public record Item(String title, String artists, long durationMs, String uri, String albumUri,
+                       String coverUrl, String albumName) {
+        public Item(String title, String artists, long durationMs, String uri, String albumUri) {
+            this(title, artists, durationMs, uri, albumUri, "", "");
+        }
         public Item(String title, String artists, long durationMs, String uri) {
-            this(title, artists, durationMs, uri, "");
+            this(title, artists, durationMs, uri, "", "", "");
         }
     }
 
@@ -157,7 +161,8 @@ public final class SpotifyClient {
     });
 
     /** Команды управления идут строго по очереди, чтобы громкость/перемотка не приходили в перепутанном порядке. */
-    /** One coordinator plus three independent provider workers; the first valid result wins. */
+    /** One coordinator plus three independent provider workers. */
+    private static final long LYRICS_MAX_SEARCH_MS = 8_000L;
     private final ExecutorService lyricsExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "spotifypanel-lyrics-coordinator");
         t.setDaemon(true);
@@ -256,6 +261,7 @@ public final class SpotifyClient {
     // Optimistic UI target: highlight the last user-selected row immediately,
     // while waiting for Spotify to confirm the actual player state.
     private volatile String optimisticTrackUri = "";
+    private volatile Track optimisticTrack;
     private volatile long optimisticTrackUntilMs = 0;
     private volatile long optimisticTrackSetAtMs = 0;
 
@@ -269,13 +275,25 @@ public final class SpotifyClient {
     }
 
     private void setOptimisticTrack(Item item) {
-        optimisticTrackUri = item == null ? "" : item.uri();
+        // Only track/episode rows identify a playable item. Artist rows contain album URIs,
+        // whose now-playing item is the first track rather than the album itself.
+        String uri = item == null ? "" : item.uri();
+        boolean playableItem = uri.startsWith("spotify:track:") || uri.startsWith("spotify:episode:");
         optimisticTrackSetAtMs = System.currentTimeMillis();
-        optimisticTrackUntilMs = optimisticTrackUri.isEmpty() ? 0 : optimisticTrackSetAtMs + 5000;
-        if (item != null) {
-            // Warm the shared cover cache before the now-playing card needs the image.
-            // The API snapshot supplies the canonical cover URL; this just primes known cached URLs.
+        if (!playableItem) {
+            clearOptimisticTrack();
+            return;
         }
+        optimisticTrack = new Track(item.title(), item.artists(), item.coverUrl(),
+                item.durationMs(), uri, item.albumName());
+        optimisticTrackUri = uri;
+        optimisticTrackUntilMs = optimisticTrackSetAtMs + 5_000L;
+    }
+
+    private void clearOptimisticTrack() {
+        optimisticTrack = null;
+        optimisticTrackUri = "";
+        optimisticTrackUntilMs = 0L;
     }
 
     private void cancelLikedAdvanceTask() {
@@ -585,7 +603,20 @@ public final class SpotifyClient {
         visibleSelection = entry;
     }
 
-    public Snapshot snapshot() { return snapshot; }
+    public Snapshot snapshot() {
+        Snapshot actual = snapshot;
+        Track selected = optimisticTrack;
+        long now = System.currentTimeMillis();
+        if (selected == null || now >= optimisticTrackUntilMs
+                || (actual.track() != null && selected.uri().equals(actual.track().uri()))) {
+            return actual;
+        }
+        // Show the exact row the player was asked to start immediately. This prevents
+        // the old cover/title from appearing beside newly playing audio while Spotify's
+        // /me/player endpoint is still catching up. The authoritative snapshot is untouched.
+        return new Snapshot(Status.ACTIVE, true, selected, 0L, optimisticTrackSetAtMs,
+                actual.device(), actual.volume(), actual.shuffle(), actual.repeat(), "");
+    }
 
     /** Lyrics for the currently playing track only. Previous tracks are never cached. */
     public Lyrics lyrics() { return lyrics; }
@@ -912,8 +943,7 @@ public final class SpotifyClient {
         if (!optimisticUri.isEmpty()) {
             if (optimisticUri.equals(uri)
                     || System.currentTimeMillis() - optimisticTrackSetAtMs >= 5_000L) {
-                optimisticTrackUntilMs = 0;
-                optimisticTrackUri = "";
+                clearOptimisticTrack();
             }
         }
     }
@@ -943,11 +973,12 @@ public final class SpotifyClient {
         long requestId = lyricsRequestSequence.incrementAndGet();
         Future<?> previous = lyricsFuture;
         if (previous != null) previous.cancel(true);
-        lyrics = new Lyrics(uri, LyricsStatus.LOADING, false, List.of(), List.of(), "Ищем текст...");
+        lyrics = new Lyrics(uri, LyricsStatus.LOADING, false, List.of(), List.of(),
+                "Ищем синхронизированный текст...");
         try {
             lyricsFuture = lyricsExecutor.submit(() -> {
                 if (requestId != lyricsRequestSequence.get()) return;
-                Lyrics result = fetchLyrics(track);
+                Lyrics result = fetchLyrics(track, requestId);
                 if (requestId == lyricsRequestSequence.get()
                         && snapshot.track() != null && uri.equals(snapshot.track().uri())) {
                     lyrics = result;
@@ -962,7 +993,7 @@ public final class SpotifyClient {
         }
     }
 
-    private Lyrics fetchLyrics(Track track) {
+    private Lyrics fetchLyrics(Track track, long requestId) {
         String uri = track.uri();
         String title = track.title() == null ? "" : track.title().trim();
         String artists = track.artists() == null ? "" : track.artists().trim();
@@ -985,13 +1016,25 @@ public final class SpotifyClient {
 
         Lyrics lastError = null;
         Lyrics instrumentalCandidate = null;
+        long searchDeadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(LYRICS_MAX_SEARCH_MS);
+        int completedCount = 0;
         try {
-            for (int completed = 0; completed < requests.size(); completed++) {
-                Future<Lyrics> finished = completion.take();
+            while (completedCount < requests.size()) {
+                long remainingNanos = searchDeadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0L) break;
+
+                Future<Lyrics> finished = completion.poll(remainingNanos, TimeUnit.NANOSECONDS);
+                if (finished == null) break;
+                completedCount++;
                 try {
                     Lyrics candidate = finished.get();
-                    if (candidate != null && candidate.status() == LyricsStatus.FOUND) {
-                        LOG.debug("Lyrics found by {} for {} ({} timed lines)",
+                    // A provider is a winner only when it returned actual timed lines.
+                    // Plain-only lyrics are deliberately ignored; no plain-text fallback
+                    // is displayed or allowed to cancel the other providers.
+                    if (candidate != null && candidate.status() == LyricsStatus.FOUND
+                            && !candidate.syncedLines().isEmpty()) {
+                        LOG.debug("Synced lyrics found by {} for {} ({} timed lines)",
                                 candidate.message().isBlank() ? "provider" : candidate.message(),
                                 title, candidate.syncedLines().size());
                         return candidate;
@@ -1008,14 +1051,15 @@ public final class SpotifyClient {
             Thread.currentThread().interrupt();
             return new Lyrics(uri, LyricsStatus.ERROR, false, List.of(), List.of(), "Поиск текста прерван");
         } finally {
-            // Once a winner is found (or the track changes), do not leave other providers running.
+            // Stop every unfinished provider as soon as one returns synced lyrics,
+            // the overall deadline expires, or the track changes.
             for (Future<Lyrics> request : requests) request.cancel(true);
         }
 
         if (instrumentalCandidate != null) return instrumentalCandidate;
         if (lastError != null) return lastError;
         return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
-                "Ни один источник не нашёл текст для этого трека");
+                "Синхронизированный текст не найден");
     }
 
     @FunctionalInterface
@@ -1079,17 +1123,13 @@ public final class SpotifyClient {
             return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Lyrica не нашёл текст");
         }
         List<LyricLine> timed = parseLyricaTimedLines(data);
-        String plain = str(data, "lyrics");
-        List<String> plainLines = splitLyrics(plain);
-        if (plainLines.isEmpty() && !timed.isEmpty()) {
-            for (LyricLine line : timed) plainLines.add(line.text());
-        }
-        if (plainLines.isEmpty() && timed.isEmpty()) {
+        if (timed.isEmpty()) {
             if (bool(data, "instrumental")) return new Lyrics(uri, LyricsStatus.INSTRUMENTAL,
                     true, List.of(), List.of(), "Инструментальная композиция");
-            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(), "Lyrica не нашёл текст");
+            return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
+                    "Lyrica не нашёл синхронизированный текст");
         }
-        return new Lyrics(uri, LyricsStatus.FOUND, false, plainLines, timed, "Lyrica");
+        return new Lyrics(uri, LyricsStatus.FOUND, false, List.of(), timed, "Lyrica");
     }
 
     private Lyrics fetchLyricsFromBetterLyrics(String uri, String title, String artist,
@@ -1133,20 +1173,19 @@ public final class SpotifyClient {
         String lrc = str(root, "lyrics");
         if (lrc.isBlank()) lrc = str(root, "lrc");
         LrcResult result = parseLrc(lrc);
-        if (result.plainLines().isEmpty() && result.syncedLines().isEmpty()) {
+        if (result.syncedLines().isEmpty()) {
             return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
-                    "Better Lyrics не нашёл текст");
+                    "Better Lyrics не нашёл синхронизированный текст");
         }
         return new Lyrics(uri, LyricsStatus.FOUND, false,
-                result.plainLines(), result.syncedLines(), "Better Lyrics / Kugou");
+                List.of(), result.syncedLines(), "Better Lyrics / Kugou");
     }
 
-    private record LrcResult(List<String> plainLines, List<LyricLine> syncedLines) {}
+    private record LrcResult(List<LyricLine> syncedLines) {}
 
     private static LrcResult parseLrc(String lrc) {
-        if (lrc == null || lrc.isBlank()) return new LrcResult(List.of(), List.of());
+        if (lrc == null || lrc.isBlank()) return new LrcResult(List.of());
         Pattern timestamp = Pattern.compile("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?\\]");
-        java.util.LinkedHashSet<String> plain = new java.util.LinkedHashSet<>();
         List<LyricLine> timed = new ArrayList<>();
         for (String raw : lrc.replace("\r", "").split("\n")) {
             Matcher matcher = timestamp.matcher(raw);
@@ -1171,11 +1210,11 @@ public final class SpotifyClient {
             if (text.isEmpty() || text.startsWith("[ar:") || text.startsWith("[ti:")
                     || text.startsWith("[al:") || text.startsWith("[by:")
                     || text.startsWith("[offset:") || text.startsWith("[length:")) continue;
-            plain.add(text);
+            // Untimed lines are intentionally ignored.
             for (long time : times) timed.add(new LyricLine(time, text));
         }
         timed.sort(java.util.Comparator.comparingLong(LyricLine::timeMs));
-        return new LrcResult(new ArrayList<>(plain), timed);
+        return new LrcResult(timed);
     }
 
     private static List<LyricLine> parseLyricaTimedLines(JsonObject data) {
@@ -1205,29 +1244,19 @@ public final class SpotifyClient {
         return -1L;
     }
 
-    private static List<String> splitLyrics(String text) {
-        List<String> lines = new ArrayList<>();
-        if (text == null || text.isBlank()) return lines;
-        for (String line : text.replace("\r", "").split("\n")) {
-            String clean = line.strip();
-            if (!clean.isEmpty()) lines.add(clean);
-        }
-        return lines;
-    }
-
     /** Fetch and normalize LiriQo's multi-provider response. */
     private Lyrics fetchLyricsFromLiriQo(String uri, String title, String artist,
                                          String album, long durationSeconds) throws Exception {
-        // Full mode waits for every eligible provider within LiriQo's global deadline.
-        // This gives us a chance to find synced lyrics even when the first result is plain text.
+        // Use LiriQo's fast primary result. Lyrica and Better Lyrics are queried in
+        // parallel by the outer provider race; full=1 would make LiriQo wait for every
+        // upstream source and noticeably delay the first usable lyric result.
         String query = "title=" + encodeQuery(title)
                 + "&artist=" + encodeQuery(artist)
-                + "&duration=" + durationSeconds
-                + "&full=1";
+                + "&duration=" + durationSeconds;
         if (!album.isEmpty()) query += "&album=" + encodeQuery(album);
         URI endpoint = URI.create("https://api.liriqo-alfarrizi.my.id/v1/lyrics?" + query);
         HttpRequest request = HttpRequest.newBuilder(endpoint)
-                .timeout(Duration.ofSeconds(35))
+                .timeout(Duration.ofSeconds(14))
                 .header("Accept", "application/json")
                 .header("User-Agent", "SpotifyPanelMod/1.0 (LiriQo lyrics integration)")
                 .GET().build();
@@ -1294,10 +1323,11 @@ public final class SpotifyClient {
                     "Текст для этого трека не найден в LiriQo");
         }
 
-        // Prefer the first candidate with real timestamps; candidates are already
-        // quality-ranked by LiriQo. Only fall back to plain text when none are synced.
+        // LiriQo may return several candidates. Select only one with real timed[] rows;
+        // a plain-only primary candidate must never block a synced candidate or win.
         JsonObject selected = null;
         List<LyricLine> selectedTimed = List.of();
+        JsonObject instrumentalCandidate = null;
         for (JsonObject candidate : candidates) {
             List<LyricLine> timed = parseLiriQoTimedLines(candidate);
             if (!timed.isEmpty()) {
@@ -1305,42 +1335,21 @@ public final class SpotifyClient {
                 selectedTimed = timed;
                 break;
             }
+            if (instrumentalCandidate == null
+                    && (bool(candidate, "instrumental") || bool(candidate, "isInstrumental"))) {
+                instrumentalCandidate = candidate;
+            }
         }
         if (selected == null) {
-            for (JsonObject candidate : candidates) {
-                String plain = str(candidate, "plain");
-                if (!plain.isBlank() || bool(candidate, "instrumental")
-                        || bool(candidate, "isInstrumental")) {
-                    selected = candidate;
-                    break;
-                }
+            if (instrumentalCandidate != null) {
+                return new Lyrics(uri, LyricsStatus.INSTRUMENTAL, true, List.of(), List.of(),
+                        "Инструментальная композиция");
             }
-        }
-        if (selected == null) selected = candidates.get(0);
-
-        boolean instrumental = bool(selected, "instrumental") || bool(selected, "isInstrumental");
-        if (instrumental && selectedTimed.isEmpty()) {
-            return new Lyrics(uri, LyricsStatus.INSTRUMENTAL, true, List.of(), List.of(),
-                    "Инструментальная композиция");
-        }
-
-        List<String> plainLines = new ArrayList<>();
-        String plain = str(selected, "plain");
-        if (!plain.isBlank()) {
-            for (String line : plain.replace("\r", "").split("\n")) {
-                String clean = line.strip();
-                if (!clean.isEmpty()) plainLines.add(clean);
-            }
-        }
-        // Some providers return only timed lines. Use their text as display content too.
-        if (plainLines.isEmpty() && !selectedTimed.isEmpty()) {
-            for (LyricLine line : selectedTimed) plainLines.add(line.text());
-        }
-        if (plainLines.isEmpty() && selectedTimed.isEmpty()) {
             return new Lyrics(uri, LyricsStatus.NOT_FOUND, false, List.of(), List.of(),
-                    "LiriQo не нашёл текст для этого трека");
+                    "LiriQo не нашёл синхронизированный текст");
         }
-        return new Lyrics(uri, LyricsStatus.FOUND, false, plainLines, selectedTimed, "LiriQo");
+
+        return new Lyrics(uri, LyricsStatus.FOUND, false, List.of(), selectedTimed, "LiriQo");
     }
 
     private static List<LyricLine> parseLiriQoTimedLines(JsonObject candidate) {
@@ -1767,7 +1776,15 @@ public final class SpotifyClient {
                 if (!albumId.isEmpty()) albumUri = "spotify:album:" + albumId;
             }
         }
-        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"), uri, albumUri);
+        String coverUrl = "";
+        String albumName = "";
+        if (item.has("album") && item.get("album").isJsonObject()) {
+            JsonObject album = item.getAsJsonObject("album");
+            coverUrl = bestImage(album);
+            albumName = str(album, "name");
+        }
+        return new Item(str(item, "name"), artistsOf(item), lng(item, "duration_ms"),
+                uri, albumUri, coverUrl, albumName);
     }
 
     private void loadLibrary() {
@@ -2698,6 +2715,7 @@ public final class SpotifyClient {
     private void revert() {
         ignorePollUntil = 0;
         lastLocalAt = 0;
+        clearOptimisticTrack();
         exec.submit(this::poll);
     }
 
@@ -2728,8 +2746,7 @@ public final class SpotifyClient {
             if (guarded && !isPlaybackIntentCurrent(guardedIntentId)) return false;
             int sc = r.statusCode();
             if (sc >= 300 && guarded && isPlaybackIntentCurrent(guardedIntentId)) {
-                optimisticTrackUntilMs = 0;
-                optimisticTrackUri = "";
+                clearOptimisticTrack();
             }
             if (sc == 404) {
                 err.accept("Нет активного устройства: открой Spotify и запусти любой трек.");

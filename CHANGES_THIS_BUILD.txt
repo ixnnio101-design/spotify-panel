@@ -120,3 +120,12 @@ LYRICS PROVIDER RACE UPDATE
 - Per-provider Retry-After cooldowns are respected for Lyrica and Better Lyrics; LiriQo retains its existing cooldown handling.
 - No lyrics cache, disk storage, UI, panel geometry, camera, or playback behavior was changed.
 - Public service availability and rate limits remain controlled by the respective providers.
+
+LYRICS SPEED + SYNC PRIORITY UPDATE (23 ноября 2026)
+- LiriQo, Lyrica и Better Lyrics по-прежнему запускаются одновременно; Lyrica явно запрашивает timestamps, Better Lyrics разбирается как LRC, а LiriQo выбирает timed-кандидата, если он есть в быстром ответе.
+- Первый синхронизированный результат немедленно выигрывает независимо от порядка ответов; все остальные незавершённые запросы отменяются.
+- Если первым пришёл plain-текст, он публикуется сразу, не заставляя интерфейс ждать. Провайдеры продолжают короткий 2,5-секундный поиск timed-варианта; найденный в это окно синхронизированный текст заменяет plain-текст.
+- Если за окно upgrade синхронизированный вариант не найден, сохраняется уже показанный plain-текст, оставшиеся запросы отменяются.
+- Весь поиск ограничен 8 секундами, чтобы при отсутствии результата не оставлять интерфейс в состоянии загрузки на полные HTTP timeout провайдеров.
+- Смена трека по-прежнему отменяет прежнюю задачу; временная публикация plain-текста дополнительно проверяет request sequence и URI текущего трека.
+- Кэши, размеры кэшей, UI, 3D-модель, камера и анимации не менялись. Gradle не запускался.
