@@ -99,3 +99,24 @@
 - При отсутствии результата показывается состояние «текст не найден»; резервный сервис в моде не добавлен.
 - Учитывается `Retry-After` при HTTP 429/503. Межтрековый и дисковый кэш не добавлялись.
 - Gradle не запускался.
+
+УЛУЧШЕНИЕ СИНХРОНИЗАЦИИ И ПЛАВНОСТИ ТЕКСТОВ LiriQo
+- Запрос текстов теперь использует `full=1`, чтобы LiriQo собрал все доступные результаты поставщиков в пределах своего общего срока ответа.
+- Если `primary` содержит только обычный текст, клиент перебирает ранжированный `tracks[]` и выбирает первый вариант с валидными временными метками. Если синхронизированных результатов нет, остаётся обычный текст без искусственных таймкодов.
+- Временные метки `timed[].start` продолжают трактоваться как абсолютные миллисекунды; некорректные отдельные строки пропускаются, не отбрасывая весь текст.
+- Устранено двойное сглаживание позиции воспроизведения: `Snapshot.currentProgress()` уже интерполирует прогресс между ответами Spotify по времени получения снимка, поэтому WorldPanel теперь использует это значение напрямую. Это убирает дополнительное запаздывание подсветки на высоких FPS.
+- Переход окна строк сделан немного более собранным (экспоненциальное сглаживание 18 вместо 10), но остаётся плавным и независимым от частоты кадров. Частичная перерисовка области текста допускает обновление до 120 Гц на быстрых дисплеях.
+- Кэши, UI-дизайн, 3D-модель, камера, управление Spotify и отсутствие запасного сервиса не менялись.
+- Gradle не запускался; проверены изменённые участки, отсутствие синтаксических диагностик Java parser и целостность ZIP. Требуется игровая проверка на 60/120/144 Гц.
+
+LYRICS PROVIDER RACE UPDATE
+---------------------------
+- Lyrics are now requested concurrently from LiriQo, Lyrica, and Better Lyrics (Kugou endpoint).
+- The first provider that returns a valid lyrics payload wins and is displayed immediately.
+- Empty responses, HTTP errors, and missing matches do not win the race; the other providers continue.
+- Remaining provider requests are cancelled after a winner is selected or the active track changes.
+- Lyrica line/word-timed JSON and Better Lyrics LRC timestamps are normalized into the existing lyric-line model.
+- Better Lyrics uses its Kugou endpoint, which its documentation lists as not requiring an API key.
+- Per-provider Retry-After cooldowns are respected for Lyrica and Better Lyrics; LiriQo retains its existing cooldown handling.
+- No lyrics cache, disk storage, UI, panel geometry, camera, or playback behavior was changed.
+- Public service availability and rate limits remain controlled by the respective providers.

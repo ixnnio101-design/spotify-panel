@@ -83,7 +83,7 @@ public final class WorldPanel {
     private static final double MODEL_DEPTH_SCALE = MODEL_WIDTH / 22.0;
     private static final double MODEL_Y_SCALE = 1.20 / 13.0;
     private static final double MODEL_HEIGHT = MODEL_Y_SCALE * 14.0;
-    private static final double MODEL_OVERLAY_X = -0.28;
+    private static final double MODEL_OVERLAY_X = -0.82;
     private static final double MODEL_CENTER_Y = 7.0;
 
     // In first person, use the interpolated render-camera position as the anchor point.
@@ -139,7 +139,7 @@ public final class WorldPanel {
     private static List<String> wrappedPlainLyrics = List.of();
     private static final Font LYRICS_NORMAL_FONT = new Font(Font.SANS_SERIF, Font.PLAIN, 11);
     private static final Font LYRICS_ACTIVE_FONT = new Font(Font.SANS_SERIF, Font.BOLD, 14);
-    private static final long LYRICS_ANIMATION_FRAME_NS = 16_666_667L;
+    private static final long LYRICS_ANIMATION_FRAME_NS = 8_333_333L; // up to 120 Hz
     private static long paintedProgressSecond = Long.MIN_VALUE;
     private static long lastProgressRegionPaintNs;
     private static long lastVolumeRegionPaintNs;
@@ -713,9 +713,11 @@ public final class WorldPanel {
             displayedProgressTrackUri = trackUri;
             progressVisualInitialized = true;
         } else {
-            double playheadEase = 1.0 - Math.exp(-dt * 24.0);
-            displayedProgressMs += (targetProgress - displayedProgressMs) * playheadEase;
-            if (Math.abs(targetProgress - displayedProgressMs) < 12.0) displayedProgressMs = targetProgress;
+            // Snapshot.currentProgress() already extrapolates from Spotify's fetchedAtMs
+            // using wall-clock time. Applying another exponential filter here adds latency
+            // to the lyrics at high refresh rates, so follow that interpolated playhead
+            // directly. The renderer still refreshes the lyric region at its own frame cap.
+            displayedProgressMs = targetProgress;
         }
 
         // Smooth and stabilize the confirmed Spotify track URI before animating the row.
@@ -961,9 +963,9 @@ public final class WorldPanel {
             double lyricsDt = Math.max(0.0, Math.min(0.1,
                     (now - lastLyricsAnimationNs) / 1_000_000_000.0));
             lastLyricsAnimationNs = now;
-            // Ease the lyric window over roughly a tenth of a second instead of snapping
-            // by one full row when Spotify's playhead crosses a lyric timestamp.
-            double lyricsEase = 1.0 - Math.exp(-lyricsDt * 10.0);
+            // Keep the movement deliberately crisp, but interpolate in elapsed time so
+            // 60/120/144 Hz displays produce the same transition duration.
+            double lyricsEase = 1.0 - Math.exp(-lyricsDt * 18.0);
             lyricsVisualPosition += (targetLyricsVisualLine - lyricsVisualPosition) * lyricsEase;
             if (Math.abs(targetLyricsVisualLine - lyricsVisualPosition) < 0.008) {
                 lyricsVisualPosition = targetLyricsVisualLine;
