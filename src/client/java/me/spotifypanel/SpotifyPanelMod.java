@@ -13,12 +13,15 @@ public class SpotifyPanelMod implements ClientModInitializer {
     public static Config config;
     public static SpotifyAuth auth;
     public static SpotifyClient spotify;
+    public static CacheManager cacheManager;
 
     @Override
     public void onInitializeClient() {
         config = Config.load();
         auth = new SpotifyAuth(config);
-        spotify = new SpotifyClient(auth);
+        cacheManager = new CacheManager(config);
+        cacheManager.initialize();
+        spotify = new SpotifyClient(auth, cacheManager);
         spotify.start();
 
         SpotifyCommands.register();

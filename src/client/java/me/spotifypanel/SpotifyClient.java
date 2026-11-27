@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -19,6 +20,8 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpHeaders;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.HashSet;
@@ -154,6 +157,7 @@ public final class SpotifyClient {
     }
 
     private final SpotifyAuth auth;
+    private final CacheManager cacheManager;
     private final ScheduledExecutorService exec = Executors.newScheduledThreadPool(4, r -> {
         Thread t = new Thread(r, "spotifypanel");
         t.setDaemon(true);
@@ -230,7 +234,13 @@ public final class SpotifyClient {
     }
     private final java.util.concurrent.atomic.AtomicBoolean playlistsLoading = new java.util.concurrent.atomic.AtomicBoolean();
     private final AtomicBoolean coreLibraryLoading = new AtomicBoolean();
+    private static final int MAX_CACHED_ITEM_RECORDS = 500;
     private final Map<String, List<Item>> items = new ConcurrentHashMap<>();
+    private final Object itemCacheLock = new Object();
+    // Access-ordered key index for the combined item-list cache; the cap is by records,
+    // not by playlist count, because list sizes can vary from a few entries to 1,000.
+    private final LinkedHashMap<String, Boolean> itemCacheLru = new LinkedHashMap<>(16, 0.75f, true);
+    private int cachedItemRecords;
     private final Map<String, String> itemErrors = new ConcurrentHashMap<>();
     private final Map<String, Long> itemsTime = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<List<Item>>> itemLoads = new ConcurrentHashMap<>();
@@ -550,9 +560,14 @@ public final class SpotifyClient {
     }
 
     // обложки
-    private final Map<String, int[]> rawCache = new ConcurrentHashMap<>();
-    private final Map<String, int[]> mosaics = new ConcurrentHashMap<>();
-    private final Map<String, Integer> coverAccents = new ConcurrentHashMap<>();
+    // Pixel arrays are the largest RAM cache. Weighted LRU caps prevent browsing a large
+    // library from retaining every downloaded cover and every generated display size.
+    private final BoundedLruCache<String, int[]> rawCache = new BoundedLruCache<>(
+            64L * 1024L * 1024L, pixels -> (long) pixels.length * Integer.BYTES);
+    private final BoundedLruCache<String, int[]> mosaics = new BoundedLruCache<>(
+            24L * 1024L * 1024L, pixels -> (long) pixels.length * Integer.BYTES);
+    private final BoundedLruCache<String, Integer> coverAccents = new BoundedLruCache<>(
+            512L * 1024L, ignored -> 32L);
     private final Set<String> coverLoading = ConcurrentHashMap.newKeySet();
     // Failed artwork is retried with exponential backoff instead of being marked
     // permanently unavailable. This handles temporary CDN/network/decode failures.
@@ -561,8 +576,9 @@ public final class SpotifyClient {
     // Render thread drains these URLs and repaints only the visible artwork regions.
     private final ConcurrentLinkedQueue<String> completedCoverUrls = new ConcurrentLinkedQueue<>();
 
-    public SpotifyClient(SpotifyAuth auth) {
+    public SpotifyClient(SpotifyAuth auth, CacheManager cacheManager) {
         this.auth = auth;
+        this.cacheManager = cacheManager;
     }
 
     public void start() {
@@ -571,6 +587,8 @@ public final class SpotifyClient {
         // While the panel is visible, revalidate the small core library snapshot every
         // two minutes. Cache-Control and ETag avoid downloading unchanged responses.
         exec.scheduleWithFixedDelay(this::refreshVisibleCoreLibrary, 120, 120, TimeUnit.SECONDS);
+        // Enforce the temporary disk-cache TTL and size limit while SSD caching is enabled.
+        exec.scheduleWithFixedDelay(cacheManager::maintain, 10, 10, TimeUnit.MINUTES);
     }
 
     /** Called once when the in-world panel becomes visible again. */
@@ -621,6 +639,34 @@ public final class SpotifyClient {
     /** Lyrics for the currently playing track only. Previous tracks are never cached. */
     public Lyrics lyrics() { return lyrics; }
 
+    /** Clears bounded in-memory artwork, library-item and HTTP response caches. */
+    public void clearRamCaches() {
+        rawCache.clear();
+        mosaics.clear();
+        coverAccents.clear();
+        coverRetryAtMs.clear();
+        coverAttempts.clear();
+        completedCoverUrls.clear();
+        libraryHttpCache.clear();
+        synchronized (itemCacheLock) {
+            itemErrors.clear();
+            itemsTime.clear();
+            items.clear();
+            itemCacheLru.clear();
+            cachedItemRecords = 0;
+        }
+    }
+
+    public String ramCacheSummary() {
+        double rawMb = rawCache.currentWeight() / (1024.0 * 1024.0);
+        double mosaicMb = mosaics.currentWeight() / (1024.0 * 1024.0);
+        return "Обложки: " + rawCache.size() + " основных / " + mosaics.size()
+                + " уменьшенных, "
+                + String.format(java.util.Locale.ROOT, "%.1f + %.1f МБ", rawMb, mosaicMb)
+                + " из 64 + 24 МБ; записи треков/списков: " + cachedItemRecordCount()
+                + " (LRU-лимит " + MAX_CACHED_ITEM_RECORDS + "; избранное и сохранённые эпизоды закреплены)";
+    }
+
     public List<Playlist> playlists() { return playlists; }
 
     public List<LibraryEntry> library() { return library; }
@@ -629,9 +675,72 @@ public final class SpotifyClient {
 
     public String libraryError() { return playlistsError; }
 
-    public List<Item> items(String key) { return items.get(key); }
+    public List<Item> items(String key) { return cachedItems(key); }
 
-    public List<Item> items(LibraryEntry entry) { return entry == null ? null : items.get(entry.key()); }
+    public List<Item> items(LibraryEntry entry) { return entry == null ? null : cachedItems(entry.key()); }
+
+    private List<Item> cachedItems(String key) {
+        synchronized (itemCacheLock) {
+            List<Item> value = items.get(key);
+            if (value != null) itemCacheLru.get(key); // refresh access order
+            return value;
+        }
+    }
+
+    private List<Item> cachedItemsOrEmpty(String key) {
+        List<Item> value = cachedItems(key);
+        return value == null ? List.of() : value;
+    }
+
+    private void cacheItems(String key, List<Item> value) {
+        cacheItems(key, value, false);
+    }
+
+    private void cacheItemsAndTimestamp(String key, List<Item> value) {
+        cacheItems(key, value, true);
+    }
+
+    private void cacheItems(String key, List<Item> value, boolean refreshTimestamp) {
+        if (key == null || value == null) return;
+        List<Item> stable = List.copyOf(value);
+        synchronized (itemCacheLock) {
+            List<Item> previous = items.put(key, stable);
+            if (previous != null) cachedItemRecords -= Math.max(1, previous.size());
+            cachedItemRecords += Math.max(1, stable.size());
+            itemCacheLru.put(key, Boolean.TRUE);
+            if (refreshTimestamp) itemsTime.put(key, System.currentTimeMillis());
+
+            while (cachedItemRecords > MAX_CACHED_ITEM_RECORDS && !itemCacheLru.isEmpty()) {
+                Iterator<String> iterator = itemCacheLru.keySet().iterator();
+                String oldestKey = null;
+                while (iterator.hasNext()) {
+                    String candidate = iterator.next();
+                    // Favorites and saved episodes are core library sections. Keep them
+                    // available even when their combined size is above the soft LRU cap.
+                    if (!"saved_tracks:liked".equals(candidate)
+                            && !"saved_episodes:episodes".equals(candidate)) {
+                        oldestKey = candidate;
+                        iterator.remove();
+                        break;
+                    }
+                }
+                if (oldestKey == null) break;
+                List<Item> removed = items.remove(oldestKey);
+                if (removed != null) {
+                    cachedItemRecords -= Math.max(1, removed.size());
+                    itemsTime.remove(oldestKey);
+                    itemErrors.remove(oldestKey);
+                    loadedPlaylistSnapshotIds.remove(oldestKey);
+                }
+            }
+        }
+    }
+
+    private int cachedItemRecordCount() {
+        synchronized (itemCacheLock) {
+            return cachedItemRecords;
+        }
+    }
 
     public String itemError(String key) { return itemErrors.getOrDefault(key, ""); }
 
@@ -1588,7 +1697,7 @@ public final class SpotifyClient {
             // immediately reflects recent likes/unlikes without re-downloading hundreds
             // of older tracks on every lightweight two-minute check; the full sync refreshes all pages.
             String likedKey = "saved_tracks:liked";
-            List<Item> oldLiked = items.getOrDefault(likedKey, List.of());
+            List<Item> oldLiked = cachedItemsOrEmpty(likedKey);
             int oldHeadSize = Math.min(50, oldLiked.size());
             Set<String> newLikedUris = new HashSet<>();
             List<Item> mergedLiked = new ArrayList<>(freshLikedHead);
@@ -1600,8 +1709,7 @@ public final class SpotifyClient {
                 }
             }
             List<Item> immutableLiked = List.copyOf(mergedLiked);
-            items.put(likedKey, immutableLiked);
-            itemsTime.put(likedKey, System.currentTimeMillis());
+            cacheItemsAndTimestamp(likedKey, immutableLiked);
             refreshActiveLikedQueue(immutableLiked);
 
             List<LibraryEntry> updatedLibrary = new ArrayList<>();
@@ -1864,8 +1972,7 @@ public final class SpotifyClient {
                 if (cover.isEmpty() && track.has("album") && track.get("album").isJsonObject()) cover = bestImage(track.getAsJsonObject("album"));
             }
             String key = "saved_tracks:liked";
-            items.put(key, liked);
-            itemsTime.put(key, System.currentTimeMillis());
+            cacheItemsAndTimestamp(key, liked);
             all.add(new LibraryEntry("liked", "Любимые треки", "Твоя медиатека", page.total(), cover, "", "saved_tracks"));
         } catch (Exception e) {
             errors.add("любимые треки: " + errText(e));
@@ -1912,8 +2019,7 @@ public final class SpotifyClient {
                 if (cover.isEmpty() && episode.has("show") && episode.get("show").isJsonObject()) cover = bestImage(episode.getAsJsonObject("show"));
             }
             String key = "saved_episodes:episodes";
-            items.put(key, savedEpisodes);
-            itemsTime.put(key, System.currentTimeMillis());
+            cacheItemsAndTimestamp(key, savedEpisodes);
             all.add(new LibraryEntry("episodes", "Сохранённые эпизоды", "Твоя медиатека", page.total(), cover, "", "saved_episodes"));
         } catch (Exception e) {
             errors.add("эпизоды: " + errText(e));
@@ -2044,7 +2150,7 @@ public final class SpotifyClient {
         String key = entry.key();
         long now = System.currentTimeMillis();
         Long cachedAt = itemsTime.get(key);
-        List<Item> cached = items.get(key);
+        List<Item> cached = cachedItems(key);
         if (cached != null) {
             if ("album".equals(entry.kind())) {
                 // Album tracklists are immutable; keep them cached for the entire session.
@@ -2076,7 +2182,7 @@ public final class SpotifyClient {
                 } catch (Exception e) {
                     itemErrors.put(key, "Содержимое: " + errText(e));
                 } finally {
-                    future.complete(items.get(key));
+                    future.complete(cachedItems(key));
                     itemLoads.remove(key, future);
                 }
             });
@@ -2142,15 +2248,14 @@ public final class SpotifyClient {
                     if (item != null) out.add(item);
                 }
             }
-            items.put(key, new ArrayList<>(out));
+            cacheItems(key, new ArrayList<>(out));
             boolean hasNext = page.has("next") && !page.get("next").isJsonNull();
             if (!hasNext || got == 0) break;
             offset += got;
         }
         if (!failed) {
-            items.put(key, List.copyOf(out));
+            cacheItemsAndTimestamp(key, List.copyOf(out));
             itemErrors.remove(key);
-            itemsTime.put(key, System.currentTimeMillis());
             if ("playlist".equals(entry.kind())) {
                 String snapshotNow = playlistSnapshotIds.getOrDefault(entry.id(), "");
                 if (playlistSnapshotAtStart.equals(snapshotNow) && !playlistSnapshotAtStart.isEmpty()) {
@@ -2167,7 +2272,7 @@ public final class SpotifyClient {
         } else if (!out.isEmpty()) {
             // Keep successfully fetched pages visible, but retain the API error and do not
             // mark the incomplete result as a fresh cache entry.
-            items.put(key, List.copyOf(out));
+            cacheItems(key, List.copyOf(out));
         }
     }
 
@@ -2397,21 +2502,45 @@ public final class SpotifyClient {
     private void loadRaw(String url) {
         long serverRetryDelayMs = 0L;
         try {
-            HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(12)).GET().build();
-            HttpResponse<byte[]> r = Net.http().send(req, HttpResponse.BodyHandlers.ofByteArray());
-            if (r.statusCode() != 200) {
-                serverRetryDelayMs = Net.retryAfterDelayMillis(
-                        r.headers().firstValue("Retry-After").orElse(""), 0L, 300_000L);
-                throw new IOException("HTTP " + r.statusCode());
+            int[] raw = null;
+            boolean loadedFromDisk = false;
+
+            // Disk reads happen only on the artwork worker, never on Minecraft's render thread.
+            if (cacheManager.isEnabled()) {
+                byte[] cachedPng = cacheManager.loadCover(url);
+                if (cachedPng != null) {
+                    raw = decodeAwt(cachedPng);
+                    if (raw == null) raw = decodeNative(cachedPng);
+                    loadedFromDisk = raw != null;
+                    if (raw == null) cacheManager.removeCover(url);
+                }
             }
-            int[] raw = decodeAwt(r.body());
-            if (raw == null) raw = decodeNative(r.body());
-            if (raw == null) throw new IOException("Unsupported or invalid artwork image");
+
+            if (raw == null) {
+                HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(12)).GET().build();
+                HttpResponse<byte[]> response = Net.http().send(req, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 200) {
+                    serverRetryDelayMs = Net.retryAfterDelayMillis(
+                            response.headers().firstValue("Retry-After").orElse(""), 0L, 300_000L);
+                    throw new IOException("HTTP " + response.statusCode());
+                }
+                byte[] downloaded = response.body();
+                raw = decodeAwt(downloaded);
+                if (raw == null) raw = decodeNative(downloaded);
+                if (raw == null) throw new IOException("Unsupported or invalid artwork image");
+
+                // Persist only a resized 256x256 PNG, never the original artwork file.
+                if (cacheManager.isEnabled()) {
+                    byte[] resizedPng = encodePng(raw);
+                    cacheManager.storeCover(url, resizedPng);
+                }
+            }
 
             rawCache.put(url, raw);
             coverAccents.put(url, extractAccentColor(raw));
             coverRetryAtMs.remove(url);
             coverAttempts.remove(url);
+            if (loadedFromDisk) LOG.debug("Loaded temporary artwork from SSD cache: {}", url);
             // Publish completion only after the pixel cache is visible to readers.
             completedCoverUrls.add(url);
         } catch (InterruptedException interrupted) {
@@ -2420,6 +2549,15 @@ public final class SpotifyClient {
             scheduleCoverRetry(url, e, serverRetryDelayMs);
         } finally {
             coverLoading.remove(url);
+        }
+    }
+
+    private static byte[] encodePng(int[] pixels) throws IOException {
+        BufferedImage image = new BufferedImage(RAW, RAW, BufferedImage.TYPE_INT_RGB);
+        image.setRGB(0, 0, RAW, RAW, pixels, 0, RAW);
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            if (!ImageIO.write(image, "png", output)) throw new IOException("PNG encoder is unavailable");
+            return output.toByteArray();
         }
     }
 

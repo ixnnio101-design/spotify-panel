@@ -5,7 +5,7 @@
 ## Что отображается
 
 - Обложка альбома и текущий трек берутся из данных Spotify.
-- Текст текущей песни по запросу загружается через LiriQo по названию, основному исполнителю, альбому и длительности трека. LiriQo объединяет несколько поставщиков текстов и возвращает обычный текст и/или синхронизированные строки; если временные метки доступны, текущая строка подсвечивается по прогрессу Spotify. Обычный текст можно прокручивать колёсиком над правой колонкой. В моде используется только endpoint LiriQo, без отдельного запасного сервиса и без API-ключа для стандартных публичных запросов. Текст хранится только в оперативной памяти для текущего трека и очищается при переключении или отсутствии активного трека; отдельный кэш, история и запись текстов на диск не используются. Запрос выполняется один раз при смене трека, в фоне, не блокируя отрисовку. При 429/503 учитывается `Retry-After`; поиск требует подключения к интернету.
+- Текст текущей песни по запросу ищется параллельно через LiriQo, Lyrica и Better Lyrics по названию, исполнителю, альбому и длительности. Принимается первый корректный результат с синхронизированными строками; остальные запросы отменяются, а обычный текст без таймкодов не показывается. Текущая строка подсвечивается по прогрессу Spotify. Текст хранится только в RAM для текущего трека и очищается при переключении или отсутствии активного трека; история и запись текстов на диск не используются. Запросы выполняются в фоне, при ограничениях учитывается `Retry-After`.
 - Название трека, исполнитель, состояние воспроизведения, прогресс и громкость рисуются в динамическую текстуру Java-кодом.
 - Основная форма панели загружается из `assets/spotify-panel/models/panel.bbmodel` — это обновлённая плоская модель Blockbench с 15 отдельными частями, включая широкую подложку `search_corpus` и отдельный корпус ввода `search`.
 - Каждый элемент из Blockbench отрисовывается как плоская поверхность в мировых координатах. Исходные координаты X задают только небольшой разнос слоёв по глубине; искусственная толщина и боковые грани не добавляются.
@@ -29,6 +29,16 @@
 - `/spotify logout`, затем `/spotify login` — заново выдать Spotify дополнительные права после обновления мода.
 - `/spotify proxy <host:port>` — HTTP-прокси; `/spotify proxy off` — выключить.
 - `/spotify play|pause|toggle|next|prev|volume <0-100>` — управление командами.
+- `/spotifycache` — состояние RAM- и SSD-кэша.
+- `/spotifycache ssd on|off` — включить или выключить SSD-кэш; по умолчанию он выключен.
+- `/spotifycache ssd clear` — удалить содержимое SSD-кэша.
+- `/spotifycache ram clear` — очистить RAM-кэш.
+
+## Кэш
+
+RAM-кэш ограничен: до 64 МБ для основных изображений 256×256, до 24 МБ для уменьшенных вариантов и до 500 записей содержимого списков. Для медиатеки избранного и сохранённых эпизодов действует закрепление, чтобы очистка не ломала основные разделы. При достижении лимитов удаляются давно не использовавшиеся обычные списки и обложки.
+
+SSD-кэш создаётся только после `/spotifycache ssd on` в `.minecraft/config/spotify-panel-cache/`. В этой сборке на диск записываются только уменьшенные PNG-обложки; срок хранения — до одного часа, предел — 1500 файлов или 256 МБ. При выключенном SSD-кэше мод не читает и не записывает его файлы. Каталоги `tracks`, `lyrics` и `metadata` предусмотрены структурой, но в этой версии не используются для постоянного хранения данных Spotify.
 
 ## Важное про Spotify API
 
@@ -44,6 +54,6 @@
 Clicking a playlist icon opens the playlist and starts its first available track. Selecting a track in Liked Songs starts it through its album context and exact track offset; the panel's Next/Previous controls then follow the saved-tracks list rather than the album. The volume slider updates locally immediately and coalesces outgoing Spotify API requests to avoid a queue of stale values.
 
 
-### Lyrics provider
+### Lyrics providers
 
-The mod uses the public LiriQo API as its only client-side lyrics endpoint. LiriQo aggregates multiple upstream providers and returns a normalized response with plain and, when available, timestamped lyrics. Standard public requests do not require an API key. The mod does not add a separate fallback service, and lyrics are not cached between tracks or written to disk. Before public distribution, verify the rights and terms needed to display lyrics returned by third-party providers.
+LiriQo, Lyrica and Better Lyrics are queried concurrently. The panel accepts timestamped lines only and keeps the current result in RAM; lyrics are not written to the SSD cache. Before public distribution, verify the rights and terms needed to display lyrics returned by third-party providers.

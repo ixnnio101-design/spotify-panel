@@ -9,8 +9,48 @@ public final class SpotifyCommands {
     private SpotifyCommands() {}
 
     public static void register() {
-        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
-                ClientCommandManager.literal("spotify")
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+            dispatcher.register(ClientCommandManager.literal("spotifycache")
+                    .executes(ctx -> {
+                        SpotifyPanelMod.say(SpotifyPanelMod.cacheManager.statusText());
+                        SpotifyPanelMod.say("RAM-кэш: " + SpotifyPanelMod.spotify.ramCacheSummary());
+                        SpotifyPanelMod.say("Команды: /spotifycache ssd on|off|clear, /spotifycache ram clear");
+                        return 1;
+                    })
+                    .then(ClientCommandManager.literal("ssd")
+                            .executes(ctx -> {
+                                SpotifyPanelMod.say(SpotifyPanelMod.cacheManager.statusText());
+                                return 1;
+                            })
+                            .then(ClientCommandManager.literal("on").executes(ctx -> {
+                                if (SpotifyPanelMod.cacheManager.enable()) {
+                                    SpotifyPanelMod.say("SSD-кэш включён. Временные обложки будут сохраняться в config/spotify-panel-cache/covers.");
+                                    return 1;
+                                }
+                                SpotifyPanelMod.say("Не удалось включить SSD-кэш. Проверь доступ к папке config.");
+                                return 0;
+                            }))
+                            .then(ClientCommandManager.literal("off").executes(ctx -> {
+                                SpotifyPanelMod.cacheManager.disable();
+                                SpotifyPanelMod.say("SSD-кэш выключен. Существующие файлы оставлены, но больше не читаются и не записываются.");
+                                return 1;
+                            }))
+                            .then(ClientCommandManager.literal("clear").executes(ctx -> {
+                                if (SpotifyPanelMod.cacheManager.clear()) {
+                                    SpotifyPanelMod.say("SSD-кэш очищен.");
+                                    return 1;
+                                }
+                                SpotifyPanelMod.say("Не удалось полностью очистить SSD-кэш. Подробности в latest.log.");
+                                return 0;
+                            })))
+                    .then(ClientCommandManager.literal("ram")
+                            .then(ClientCommandManager.literal("clear").executes(ctx -> {
+                                SpotifyPanelMod.spotify.clearRamCaches();
+                                SpotifyPanelMod.say("RAM-кэш очищен. " + SpotifyPanelMod.spotify.ramCacheSummary());
+                                return 1;
+                            }))));
+
+            dispatcher.register(ClientCommandManager.literal("spotify")
                         // /spotify — показать/скрыть панель
                         .executes(ctx -> {
                             Config c = SpotifyPanelMod.config;
@@ -118,6 +158,7 @@ public final class SpotifyCommands {
                                                     SpotifyPanelMod::say);
                                             return 1;
                                         })))
-        ));
+            );
+        });
     }
 }

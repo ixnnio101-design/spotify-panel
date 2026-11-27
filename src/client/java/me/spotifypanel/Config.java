@@ -19,6 +19,8 @@ public final class Config {
     public String clientId = "";
     public String refreshToken = "";
     public boolean visible = true;
+    /** SSD-кэш выключен по умолчанию и включается командой /spotifycache ssd on. */
+    public boolean ssdCacheEnabled = false;
     /** HTTP-прокси "host:port" для запросов к Spotify (пусто = напрямую). */
     public String proxy = "";
     /** ID плейлистов, добавленных по ссылке (/spotify playlist add). */
